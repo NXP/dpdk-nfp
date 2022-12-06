@@ -18,14 +18,6 @@
 #include <unistd.h>
 #include "netwrap_errno.h"
 #include "netwrap_socket.h"
-#if 0
-#include "ofp.h"
-
-union _ofp_sockaddr_storage {
-	struct ofp_sockaddr_in addr_in;
-	struct ofp_sockaddr_in6 addr_in6;
-};
-#endif
 static int setup_socket_wrappers_called;
 static int (*libc_socket)(int, int, int);
 static int (*libc_shutdown)(int, int);

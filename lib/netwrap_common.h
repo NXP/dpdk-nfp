@@ -23,7 +23,7 @@
 		}					\
 	} while (0)
 
-#define OFP_SOCK_NUM_OFFSET 1024
+#define OFP_SOCK_NUM_OFFSET 8192
 #define IS_OFP_SOCKET(_fd) (_fd >= OFP_SOCK_NUM_OFFSET)
 
 #endif /* __NETWRAP_COMMON_H__ */

@@ -11,8 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
-//#include <odp_api.h>
-//#include "ofp.h"
 #include "netwrap_sockopt.h"
 #include "netwrap_errno.h"
 
