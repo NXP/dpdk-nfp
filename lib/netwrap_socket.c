@@ -56,11 +56,12 @@ int socket(int domain, int type, int protocol)
 	printf("%s, socket domain = 0x%x, type = 0x%x, proto = 0x%04x\n",
 			__func__, domain, type, ntohs(protocol));
 	if (setup_socket_wrappers_called) {
-		//if (domain != AF_PACKET) {
-		if (1) {
+		if (domain != AF_PACKET) {
+		//if (1) {
 			sockfd = (*libc_socket)(domain, type, protocol);
 			printf("%s, call libc_socket, sockfd = %d\n", __func__, sockfd);
 		} else {
+			sockfd = OFP_SOCK_NUM_OFFSET;
 #if 0
 			int ofp_domain = domain;
 			int ofp_type, ofp_protocol;

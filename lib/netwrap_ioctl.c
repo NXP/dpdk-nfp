@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <stdarg.h>
+#include <net/if.h>
 #include <sys/ioctl.h>
 #include <stdlib.h>
 #include "netwrap_ioctl.h"
@@ -25,13 +26,22 @@ int ioctl(int fd, unsigned long int request, ...)
 {
 	int ioctl_value;
 	va_list ap;
-	void *p;
+	void *data;
 
 	va_start(ap, request);
-	p = va_arg(ap, void *);
+	data = va_arg(ap, void *);
 	va_end(ap);
 
 	if (IS_OFP_SOCKET(fd)) {
+		if (request == SIOCGIFINDEX) {
+			struct ifreq *ifr = (struct ifreq *)data;
+			ifr->ifr_ifindex = 0;
+			ioctl_value = 0;
+		} else {
+			errno = EINVAL;
+			ioctl_value = -1;
+		}
+
 #if 0
 		int ofp_request;
 
@@ -55,11 +65,11 @@ int ioctl(int fd, unsigned long int request, ...)
 		errno = NETWRAP_ERRNO(ofp_errno);
 #endif
 	} else if (libc_ioctl)
-		ioctl_value = (*libc_ioctl)(fd, request, p);
+		ioctl_value = (*libc_ioctl)(fd, request, data);
 	else {
 		LIBC_FUNCTION(ioctl);
 		if (libc_ioctl)
-			ioctl_value = (*libc_ioctl)(fd, request, p);
+			ioctl_value = (*libc_ioctl)(fd, request, data);
 		else {
 			ioctl_value = -1;
 			errno = EACCES;
