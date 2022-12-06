@@ -3,6 +3,7 @@
 #include "netwrap_socket.h"
 #include "netwrap_sockopt.h"
 #include "netwrap_ioctl.h"
+
 __attribute__((constructor)) static void setup_wrappers(void)
 {
 	setup_socket_wrappers();

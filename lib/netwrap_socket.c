@@ -18,6 +18,8 @@
 #include <unistd.h>
 #include "netwrap_errno.h"
 #include "netwrap_socket.h"
+#include "netwrap_log.h"
+
 static int setup_socket_wrappers_called;
 static int (*libc_socket)(int, int, int);
 static int (*libc_shutdown)(int, int);
@@ -53,13 +55,13 @@ int socket(int domain, int type, int protocol)
 {
 	int sockfd = -1;
 
-	printf("%s, socket domain = 0x%x, type = 0x%x, proto = 0x%04x\n",
-			__func__, domain, type, ntohs(protocol));
+	ECAT_DBG("socket domain = 0x%x, type = 0x%x, proto = 0x%04x\n",
+			domain, type, ntohs(protocol));
 	if (setup_socket_wrappers_called) {
 		if (domain != AF_PACKET) {
 		//if (1) {
 			sockfd = (*libc_socket)(domain, type, protocol);
-			printf("%s, call libc_socket, sockfd = %d\n", __func__, sockfd);
+			ECAT_DBG("call libc_socket, sockfd = %d\n", sockfd);
 		} else {
 			sockfd = OFP_SOCK_NUM_OFFSET;
 #if 0
@@ -103,7 +105,7 @@ int socket(int domain, int type, int protocol)
 		}
 	}
 
-	printf("socket wrapper return: %d\n", sockfd);
+	ECAT_DBG("socket wrapper return: %d\n", sockfd);
 	return sockfd;
 }
 
@@ -169,7 +171,7 @@ int close(int sockfd)
 		}
 	}
 
-	printf("Socket '%d' closed returns:'%d'\n",
+	ECAT_DBG("Socket '%d' closed returns:'%d'\n",
 		sockfd, close_value);
 	return close_value;
 }
@@ -180,7 +182,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 	if (IS_OFP_SOCKET(sockfd)) {
 #if 1
-		printf("%s, this is socket fd:%d bind\n", __func__, sockfd);
+		ECAT_DBG("%s, this is socket fd:%d bind\n", __func__, sockfd);
 		return 0;
 #else
 		struct ofp_sockaddr_in ofp_addr;

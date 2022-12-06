@@ -13,6 +13,7 @@
 #include <errno.h>
 #include "netwrap_sockopt.h"
 #include "netwrap_errno.h"
+#include "netwrap_log.h"
 
 static int (*libc_setsockopt)(int, int, int, const void*, socklen_t);
 static int (*libc_getsockopt)(int, int, int, void*, socklen_t*);
@@ -30,7 +31,7 @@ int setsockopt(int sockfd, int level, int opt_name, const void *opt_val,
 
 	if (IS_OFP_SOCKET(sockfd)) {
 #if 1
-		printf("%s, socket fd = %d, level = %d, optname = %d\n", __func__,
+		ECAT_DBG("socket fd = %d, level = %d, optname = %d\n",
 				sockfd, level, opt_name);
 		return 0;
 #else
