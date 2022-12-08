@@ -41,9 +41,6 @@
 
 static volatile bool force_quit;
 
-/* MAC updating enabled by default */
-static int mac_updating = 1;
-
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
 
 #define MAX_PKT_BURST 32
@@ -65,27 +62,8 @@ static struct rte_ether_addr l2fwd_ports_eth_addr[RTE_MAX_ETHPORTS];
 /* mask of enabled ports */
 static uint32_t l2fwd_enabled_port_mask = 0;
 
-/* list of enabled ports */
-static uint32_t l2fwd_dst_ports[RTE_MAX_ETHPORTS];
-
-struct port_pair_params {
-#define NUM_PORTS	2
-	uint16_t port[NUM_PORTS];
-} __rte_cache_aligned;
-
-static struct port_pair_params port_pair_params_array[RTE_MAX_ETHPORTS / 2];
-static struct port_pair_params *port_pair_params;
-static uint16_t nb_port_pair_params;
-
-static unsigned int l2fwd_rx_queue_per_lcore = 1;
-
 #define MAX_RX_QUEUE_PER_LCORE 16
 #define MAX_TX_QUEUE_PER_PORT 16
-struct lcore_queue_conf {
-	unsigned n_rx_port;
-	unsigned rx_port_list[MAX_RX_QUEUE_PER_LCORE];
-} __rte_cache_aligned;
-struct lcore_queue_conf lcore_queue_conf[RTE_MAX_LCORE];
 
 static struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS];
 
@@ -107,10 +85,6 @@ struct l2fwd_port_statistics {
 	uint64_t dropped;
 } __rte_cache_aligned;
 struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
-
-#define MAX_TIMER_PERIOD 86400 /* 1 day max */
-/* A tsc-based timer responsible for triggering statistics printout */
-static uint64_t timer_period = 10; /* default period is 10 seconds */
 
 /* Print out statistics on packets dropped */
 static void
@@ -160,41 +134,6 @@ print_stats(void)
 	fflush(stdout);
 }
 
-static void
-l2fwd_mac_updating(struct rte_mbuf *m, unsigned dest_portid)
-{
-	struct rte_ether_hdr *eth;
-	void *tmp;
-
-	eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-
-	/* 02:00:00:00:00:xx */
-	tmp = &eth->d_addr.addr_bytes[0];
-	*((uint64_t *)tmp) = 0x000000000002 + ((uint64_t)dest_portid << 40);
-
-	/* src addr */
-	rte_ether_addr_copy(&l2fwd_ports_eth_addr[dest_portid], &eth->s_addr);
-}
-
-static void
-l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
-{
-	unsigned dst_port;
-	int sent;
-	struct rte_eth_dev_tx_buffer *buffer;
-
-	//dst_port = l2fwd_dst_ports[portid];
-	dst_port = 0;
-
-	if (mac_updating)
-		l2fwd_mac_updating(m, dst_port);
-
-	buffer = tx_buffer[dst_port];
-	sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
-	if (sent)
-		port_statistics[dst_port].tx += sent;
-}
-
 /* main processing loop */
 static void
 l2fwd_main_loop_simple(void)
@@ -229,392 +168,10 @@ l2fwd_main_loop_simple(void)
 	}
 }
 
-/* main processing loop */
-static void
-l2fwd_main_loop(void)
-{
-	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
-	struct rte_mbuf *m;
-	int sent;
-	unsigned lcore_id;
-	uint64_t prev_tsc, diff_tsc, cur_tsc, timer_tsc;
-	unsigned i, j, portid, nb_rx;
-	struct lcore_queue_conf *qconf;
-	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S *
-			BURST_TX_DRAIN_US;
-	struct rte_eth_dev_tx_buffer *buffer;
-
-	prev_tsc = 0;
-	timer_tsc = 0;
-
-	lcore_id = rte_lcore_id();
-	qconf = &lcore_queue_conf[lcore_id];
-
-	if (qconf->n_rx_port == 0) {
-		RTE_LOG(INFO, L2FWD, "lcore %u has nothing to do\n", lcore_id);
-		return;
-	}
-
-	RTE_LOG(INFO, L2FWD, "entering main loop on lcore %u\n", lcore_id);
-
-	for (i = 0; i < qconf->n_rx_port; i++) {
-
-		portid = qconf->rx_port_list[i];
-		RTE_LOG(INFO, L2FWD, " -- lcoreid=%u portid=%u\n", lcore_id,
-			portid);
-
-	}
-
-	while (!force_quit) {
-
-		cur_tsc = rte_rdtsc();
-
-		/*
-		 * TX burst queue drain
-		 */
-		diff_tsc = cur_tsc - prev_tsc;
-		if (unlikely(diff_tsc > drain_tsc)) {
-
-			for (i = 0; i < qconf->n_rx_port; i++) {
-
-				//portid = l2fwd_dst_ports[qconf->rx_port_list[i]];
-				portid = 0;
-				buffer = tx_buffer[portid];
-
-				sent = rte_eth_tx_buffer_flush(portid, 0, buffer);
-				if (sent)
-					port_statistics[portid].tx += sent;
-
-			}
-			/* if timer is enabled */
-			if (timer_period > 0) {
-
-				/* advance the timer */
-				timer_tsc += diff_tsc;
-
-				/* if timer has reached its timeout */
-				if (unlikely(timer_tsc >= timer_period)) {
-
-					/* do this only on main core */
-					if (lcore_id == rte_get_main_lcore()) {
-						print_stats();
-						/* reset the timer */
-						timer_tsc = 0;
-					}
-				}
-			}
-
-			prev_tsc = cur_tsc;
-		}
-
-		/*
-		 * Read packet from RX queues
-		 */
-		for (i = 0; i < qconf->n_rx_port; i++) {
-
-			//portid = qconf->rx_port_list[i];
-			portid = 0;
-			nb_rx = rte_eth_rx_burst(portid, 0,
-						 pkts_burst, max_burst_size);
-
-			port_statistics[portid].rx += nb_rx;
-
-			for (j = 0; j < nb_rx; j++) {
-				m = pkts_burst[j];
-				rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-#if 0
-				l2fwd_simple_forward(m, portid);
-#else
-				buffer = tx_buffer[0];
-				sent = rte_eth_tx_buffer(0, 0, buffer, m);
-				if (sent)
-					port_statistics[0].tx += sent;
-#endif
-			}
-		}
-	}
-}
-
 static int
 l2fwd_launch_one_lcore(__rte_unused void *dummy)
 {
-#if 0
-	l2fwd_main_loop();
-#else
 	l2fwd_main_loop_simple();
-#endif
-	return 0;
-}
-
-/* display usage */
-static void
-l2fwd_usage(const char *prgname)
-{
-	printf("%s [EAL options] -- -p PORTMASK [-q NQ]\n"
-	       "  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
-	       "  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
-	       "  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to disable, 10 default, 86400 maximum)\n"
-	       "  --[no-]mac-updating: Enable or disable MAC addresses updating (enabled by default)\n"
-	       "      When enabled:\n"
-	       "       - The source MAC address is replaced by the TX port MAC address\n"
-	       "       - The destination MAC address is replaced by 02:00:00:00:00:TX_PORT_ID\n"
-	       "  -b NUM: burst size for receive packet (default is 32)\n"
-	       "  --portmap: Configure forwarding port pair mapping\n"
-	       "	      Default: alternate port pairs\n\n",
-	       prgname);
-}
-
-static int
-l2fwd_parse_portmask(const char *portmask)
-{
-	char *end = NULL;
-	unsigned long pm;
-
-	/* parse hexadecimal string */
-	pm = strtoul(portmask, &end, 16);
-	if ((portmask[0] == '\0') || (end == NULL) || (*end != '\0'))
-		return 0;
-
-	return pm;
-}
-
-static int
-l2fwd_parse_port_pair_config(const char *q_arg)
-{
-	enum fieldnames {
-		FLD_PORT1 = 0,
-		FLD_PORT2,
-		_NUM_FLD
-	};
-	unsigned long int_fld[_NUM_FLD];
-	const char *p, *p0 = q_arg;
-	char *str_fld[_NUM_FLD];
-	unsigned int size;
-	char s[256];
-	char *end;
-	int i;
-
-	nb_port_pair_params = 0;
-
-	while ((p = strchr(p0, '(')) != NULL) {
-		++p;
-		p0 = strchr(p, ')');
-		if (p0 == NULL)
-			return -1;
-
-		size = p0 - p;
-		if (size >= sizeof(s))
-			return -1;
-
-		memcpy(s, p, size);
-		s[size] = '\0';
-		if (rte_strsplit(s, sizeof(s), str_fld,
-				 _NUM_FLD, ',') != _NUM_FLD)
-			return -1;
-		for (i = 0; i < _NUM_FLD; i++) {
-			errno = 0;
-			int_fld[i] = strtoul(str_fld[i], &end, 0);
-			if (errno != 0 || end == str_fld[i] ||
-			    int_fld[i] >= RTE_MAX_ETHPORTS)
-				return -1;
-		}
-		if (nb_port_pair_params >= RTE_MAX_ETHPORTS/2) {
-			printf("exceeded max number of port pair params: %hu\n",
-				nb_port_pair_params);
-			return -1;
-		}
-		port_pair_params_array[nb_port_pair_params].port[0] =
-				(uint16_t)int_fld[FLD_PORT1];
-		port_pair_params_array[nb_port_pair_params].port[1] =
-				(uint16_t)int_fld[FLD_PORT2];
-		++nb_port_pair_params;
-	}
-	port_pair_params = port_pair_params_array;
-	return 0;
-}
-
-static unsigned int
-l2fwd_parse_nqueue(const char *q_arg)
-{
-	char *end = NULL;
-	unsigned long n;
-
-	/* parse hexadecimal string */
-	n = strtoul(q_arg, &end, 10);
-	if ((q_arg[0] == '\0') || (end == NULL) || (*end != '\0'))
-		return 0;
-	if (n == 0)
-		return 0;
-	if (n >= MAX_RX_QUEUE_PER_LCORE)
-		return 0;
-
-	return n;
-}
-
-static int
-l2fwd_parse_timer_period(const char *q_arg)
-{
-	char *end = NULL;
-	int n;
-
-	/* parse number string */
-	n = strtol(q_arg, &end, 10);
-	if ((q_arg[0] == '\0') || (end == NULL) || (*end != '\0'))
-		return -1;
-	if (n >= MAX_TIMER_PERIOD)
-		return -1;
-
-	return n;
-}
-
-static const char short_options[] =
-	"p:"  /* portmask */
-	"q:"  /* number of queues */
-	"T:"  /* timer period */
-	"b:"  /* burst size */
-	;
-
-#define CMD_LINE_OPT_MAC_UPDATING "mac-updating"
-#define CMD_LINE_OPT_NO_MAC_UPDATING "no-mac-updating"
-#define CMD_LINE_OPT_PORTMAP_CONFIG "portmap"
-
-enum {
-	/* long options mapped to a short option */
-
-	/* first long only option value must be >= 256, so that we won't
-	 * conflict with short options */
-	CMD_LINE_OPT_MIN_NUM = 256,
-	CMD_LINE_OPT_PORTMAP_NUM,
-};
-
-static const struct option lgopts[] = {
-	{ CMD_LINE_OPT_MAC_UPDATING, no_argument, &mac_updating, 1},
-	{ CMD_LINE_OPT_NO_MAC_UPDATING, no_argument, &mac_updating, 0},
-	{ CMD_LINE_OPT_PORTMAP_CONFIG, 1, 0, CMD_LINE_OPT_PORTMAP_NUM},
-	{NULL, 0, 0, 0}
-};
-
-/* Parse the argument given in the command line of the application */
-static int
-l2fwd_parse_args(int argc, char **argv)
-{
-	int opt, ret, timer_secs, burst_size;
-	char **argvopt;
-	int option_index;
-	char *prgname = argv[0];
-
-	argvopt = argv;
-	port_pair_params = NULL;
-
-	while ((opt = getopt_long(argc, argvopt, short_options,
-				  lgopts, &option_index)) != EOF) {
-
-		switch (opt) {
-		/* portmask */
-		case 'p':
-			l2fwd_enabled_port_mask = l2fwd_parse_portmask(optarg);
-			if (l2fwd_enabled_port_mask == 0) {
-				printf("invalid portmask\n");
-				l2fwd_usage(prgname);
-				return -1;
-			}
-			break;
-
-		/* nqueue */
-		case 'q':
-			l2fwd_rx_queue_per_lcore = l2fwd_parse_nqueue(optarg);
-			if (l2fwd_rx_queue_per_lcore == 0) {
-				printf("invalid queue number\n");
-				l2fwd_usage(prgname);
-				return -1;
-			}
-			break;
-
-		/* timer period */
-		case 'T':
-			timer_secs = l2fwd_parse_timer_period(optarg);
-			if (timer_secs < 0) {
-				printf("invalid timer period\n");
-				l2fwd_usage(prgname);
-				return -1;
-			}
-			timer_period = timer_secs;
-			break;
-
-		/* max_burst_size */
-		case 'b':
-			burst_size = (unsigned int)atoi(optarg);
-			if (burst_size < 0 || burst_size > max_burst_size) {
-				printf("invalid burst size\n");
-				l2fwd_usage(prgname);
-				return -1;
-			}
-			max_burst_size = burst_size;
-			break;
-
-		/* long options */
-		case CMD_LINE_OPT_PORTMAP_NUM:
-			ret = l2fwd_parse_port_pair_config(optarg);
-			if (ret) {
-				fprintf(stderr, "Invalid config\n");
-				l2fwd_usage(prgname);
-				return -1;
-			}
-			break;
-
-		default:
-			l2fwd_usage(prgname);
-			return -1;
-		}
-	}
-
-	if (optind >= 0)
-		argv[optind-1] = prgname;
-
-	ret = optind-1;
-	optind = 1; /* reset getopt lib */
-	return ret;
-}
-
-/*
- * Check port pair config with enabled port mask,
- * and for valid port pair combinations.
- */
-static int
-check_port_pair_config(void)
-{
-	uint32_t port_pair_config_mask = 0;
-	uint32_t port_pair_mask = 0;
-	uint16_t index, i, portid;
-
-	for (index = 0; index < nb_port_pair_params; index++) {
-		port_pair_mask = 0;
-
-		for (i = 0; i < NUM_PORTS; i++)  {
-			portid = port_pair_params[index].port[i];
-			if ((l2fwd_enabled_port_mask & (1 << portid)) == 0) {
-				printf("port %u is not enabled in port mask\n",
-				       portid);
-				return -1;
-			}
-			if (!rte_eth_dev_is_valid_port(portid)) {
-				printf("port %u is not present on the board\n",
-				       portid);
-				return -1;
-			}
-
-			port_pair_mask |= 1 << portid;
-		}
-
-		if (port_pair_config_mask & port_pair_mask) {
-			printf("port %u is used in other port pairs\n", portid);
-			return -1;
-		}
-		port_pair_config_mask |= port_pair_mask;
-	}
-
-	l2fwd_enabled_port_mask &= port_pair_config_mask;
-
 	return 0;
 }
 
@@ -696,14 +253,13 @@ __attribute__((destructor)) static void netwrap_main_dtor(void);
 
 __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 {
-	struct lcore_queue_conf *qconf;
 	int ret;
 	uint16_t nb_ports;
 	uint16_t nb_ports_available = 0;
-	uint16_t portid, last_port;
-	unsigned lcore_id, rx_lcore_id;
+	uint16_t portid;
+	unsigned lcore_id;
 	unsigned nb_ports_in_mask = 0;
-	unsigned int nb_lcores = 0;
+	unsigned int nb_lcores = 1;
 	unsigned int nb_mbufs;
 	int dpdk_argc;
 	char *dpdk_env;
@@ -733,110 +289,22 @@ __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 	ret = rte_eal_init(dpdk_argc, dpdk_argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
-#if 0
-	dpdk_argc -= ret;
-	dpdk_argv += ret;
-#endif
 
 	force_quit = false;
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
-#if 0
-	/* parse application arguments (after the EAL ones) */
-	ret = l2fwd_parse_args(dpdk_argc, dpdk_argv);
-	if (ret < 0)
-		rte_exit(EXIT_FAILURE, "Invalid L2FWD arguments\n");
-#else
+
 	l2fwd_enabled_port_mask = 0x1;
-	l2fwd_rx_queue_per_lcore = 0x1;
-	timer_period = 0;
-#endif
-
-	printf("MAC updating %s\n", mac_updating ? "enabled" : "disabled");
-
-	/* convert to number of cycles */
-	timer_period *= rte_get_timer_hz();
 
 	nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
 	ECAT_DBG("%d Ethernet ports found.", nb_ports);
 
-	if (port_pair_params != NULL) {
-		if (check_port_pair_config() < 0)
-			rte_exit(EXIT_FAILURE, "Invalid port pair config\n");
-	}
-
 	/* check port mask to possible port mask */
 	if (l2fwd_enabled_port_mask & ~((1 << nb_ports) - 1))
 		rte_exit(EXIT_FAILURE, "Invalid portmask; possible (0x%x)\n",
 			(1 << nb_ports) - 1);
-
-	/* reset l2fwd_dst_ports */
-	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++)
-		l2fwd_dst_ports[portid] = 0;
-	last_port = 0;
-
-	/* populate destination port details */
-	if (port_pair_params != NULL) {
-		uint16_t idx, p;
-
-		for (idx = 0; idx < (nb_port_pair_params << 1); idx++) {
-			p = idx & 1;
-			portid = port_pair_params[idx >> 1].port[p];
-			l2fwd_dst_ports[portid] =
-				port_pair_params[idx >> 1].port[p ^ 1];
-		}
-	} else {
-		RTE_ETH_FOREACH_DEV(portid) {
-			/* skip ports that are not enabled */
-			if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
-				continue;
-
-			if (nb_ports_in_mask % 2) {
-				l2fwd_dst_ports[portid] = last_port;
-				l2fwd_dst_ports[last_port] = portid;
-			} else {
-				last_port = portid;
-			}
-
-			nb_ports_in_mask++;
-		}
-		if (nb_ports_in_mask % 2) {
-			printf("Notice: odd number of ports in portmask.\n");
-			l2fwd_dst_ports[last_port] = last_port;
-		}
-	}
-
-	rx_lcore_id = 0;
-	qconf = NULL;
-
-	/* Initialize the port/queue configuration of each logical core */
-	RTE_ETH_FOREACH_DEV(portid) {
-		/* skip ports that are not enabled */
-		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
-			continue;
-
-		/* get the lcore_id for this port */
-		while (rte_lcore_is_enabled(rx_lcore_id) == 0 ||
-		       lcore_queue_conf[rx_lcore_id].n_rx_port ==
-		       l2fwd_rx_queue_per_lcore) {
-			rx_lcore_id++;
-			if (rx_lcore_id >= RTE_MAX_LCORE)
-				rte_exit(EXIT_FAILURE, "Not enough cores\n");
-		}
-
-		if (qconf != &lcore_queue_conf[rx_lcore_id]) {
-			/* Assigned a new logical core in the loop above. */
-			qconf = &lcore_queue_conf[rx_lcore_id];
-			nb_lcores++;
-		}
-
-		qconf->rx_port_list[qconf->n_rx_port] = portid;
-		qconf->n_rx_port++;
-		printf("Lcore %u: RX port %u TX port %u\n", rx_lcore_id,
-		       portid, l2fwd_dst_ports[portid]);
-	}
 
 	nb_mbufs = RTE_MAX(nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST +
 		nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
