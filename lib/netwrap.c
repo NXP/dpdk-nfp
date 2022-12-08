@@ -4,7 +4,7 @@
 #include "netwrap_sockopt.h"
 #include "netwrap_ioctl.h"
 
-__attribute__((constructor)) static void setup_wrappers(void)
+__attribute__((constructor(65535))) static void setup_wrappers(void)
 {
 	setup_socket_wrappers();
 	setup_sockopt_wrappers();

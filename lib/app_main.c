@@ -53,7 +53,7 @@ signal_handler(int signum)
 
 __attribute__((destructor)) static void netwrap_main_dtor(void);
 
-__attribute__((constructor(65535))) static void netwrap_main_ctor(void)
+__attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 {
 	int dpdk_argc;
 	char *dpdk_env;
