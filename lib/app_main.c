@@ -179,9 +179,10 @@ int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
 
 	buffer = tx_buffer[0];
 	sent = rte_eth_tx_buffer(portid, 0, buffer, m);
-	if (sent)
+	if (sent) {
+		rte_pktmbuf_free(m);
 		return len;
-	else
+	} else
 		return -1;
 }
 
