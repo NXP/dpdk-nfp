@@ -658,6 +658,12 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags)
 	return recv_value;
 }
 
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+		struct sockaddr *src_addr, socklen_t *addrlen)
+{
+	return recv(sockfd, buf, len, flags);
+}
+
 ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 {
 	ssize_t send_value;
@@ -705,4 +711,10 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 	}
 
 	return send_value;
+}
+
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+		const struct sockaddr *dest_addr, socklen_t addrlen)
+{
+	return send(sockfd, buf, len, flags);
 }
