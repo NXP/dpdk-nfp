@@ -134,6 +134,75 @@ print_stats(void)
 	fflush(stdout);
 }
 
+void hexdump(char *addr, int len)
+{
+        int i = 0;
+        for(i = 0; i < len; i++) {
+                if(!(i%16))
+                        printf("%4x: ", addr);
+                printf("%02x ", *(addr + i));
+                if(!((i + 1)%16))
+                        printf("\n");
+        }
+}
+
+int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
+{
+	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
+	unsigned int portid, nb_rx;
+
+	portid = 0;
+
+	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, 1);
+	if (nb_rx == 1) {
+		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), rte_pktmbuf_pkt_len(pkts_burst[0]));
+		return rte_pktmbuf_pkt_len(pkts_burst[0]);
+	}
+
+	return 0;
+}
+
+int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
+{
+	struct rte_eth_dev_tx_buffer *buffer;
+	struct rte_mbuf *m;
+	int sent;
+	unsigned int portid = 0;
+
+	m = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
+	rte_memcpy(rte_pktmbuf_mtod(m, void *), buf, len);
+	m->nb_segs = 1;
+	m->data_off = 0;
+	m->next = NULL;
+	m->pkt_len = len;
+	m->data_len = len;
+
+	buffer = tx_buffer[0];
+	sent = rte_eth_tx_buffer(portid, 0, buffer, m);
+	if (sent)
+		return len;
+	else
+		return -1;
+}
+
+/* main processing loop */
+static void
+l2fwd_main_loop_simple2(void)
+{
+	int len;
+	char buf[2048];
+
+	while (!force_quit) {
+		len = dpdk_recv(0, buf, 2048, 0);
+		if (len) {
+			printf("%s, recv %d frames\n", __func__, len);
+			hexdump(buf, len);
+			len = dpdk_send(0, buf, len, 0);
+			printf("%s, send %d frames\n", __func__, len);
+		}
+	}
+}
+
 /* main processing loop */
 static void
 l2fwd_main_loop_simple(void)
@@ -171,7 +240,11 @@ l2fwd_main_loop_simple(void)
 static int
 l2fwd_launch_one_lcore(__rte_unused void *dummy)
 {
+#if 0
 	l2fwd_main_loop_simple();
+#else
+	l2fwd_main_loop_simple2();
+#endif
 	return 0;
 }
 
@@ -441,7 +514,7 @@ __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 	}
 
 	check_all_ports_link_status(l2fwd_enabled_port_mask);
-
+#if 1
 	ret = 0;
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(l2fwd_launch_one_lcore, NULL, CALL_MAIN);
@@ -467,6 +540,7 @@ __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 	/* clean up the EAL */
 	rte_eal_cleanup();
 	printf("Bye...\n");
+#endif
 }
 
 __attribute__((destructor)) static void netwrap_main_dtor(void)
