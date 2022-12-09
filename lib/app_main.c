@@ -514,7 +514,7 @@ __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 	}
 
 	check_all_ports_link_status(l2fwd_enabled_port_mask);
-#if 1
+#if 0
 	ret = 0;
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(l2fwd_launch_one_lcore, NULL, CALL_MAIN);

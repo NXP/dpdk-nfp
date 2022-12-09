@@ -34,6 +34,9 @@ static ssize_t (*libc_write)(int, const void*, size_t);
 static ssize_t (*libc_recv)(int, void*, size_t, int);
 static ssize_t (*libc_send)(int, const void*, size_t, int);
 
+int dpdk_recv(int sockfd, void *buf, size_t len, int flags);
+int dpdk_send(int sockfd, const void *buf, size_t len, int flags);
+
 void setup_socket_wrappers(void)
 {
 	LIBC_FUNCTION(socket);
@@ -635,6 +638,9 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags)
 
 		recv_value = ofp_recv(sockfd, buf, len, ofp_flags);
 		errno = NETWRAP_ERRNO(ofp_errno);
+#else
+		recv_value = dpdk_recv(sockfd, buf, len, flags);
+		errno = 0;
 #endif
 	} else if (libc_recv)
 		recv_value = (*libc_recv)(sockfd, buf, len, flags);
@@ -681,6 +687,9 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 
 		send_value = ofp_send(sockfd, buf, len, ofp_flags);
 		errno = NETWRAP_ERRNO(ofp_errno);
+#else
+		send_value = dpdk_send(sockfd, buf, len, flags);
+		errno = 0;
 #endif
 	} else if (libc_send)
 		send_value = (*libc_send)(sockfd, buf, len, flags);

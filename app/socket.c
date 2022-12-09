@@ -15,7 +15,7 @@
 
 #define BUFFSIZE 1024
 
-#define DEBUG
+#undef DEBUG
 #ifdef DEBUG
 void hexdump(uint8_t *addr, int len)
 {
