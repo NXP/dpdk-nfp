@@ -60,7 +60,7 @@ static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 static struct rte_ether_addr l2fwd_ports_eth_addr[RTE_MAX_ETHPORTS];
 
 /* mask of enabled ports */
-static uint32_t l2fwd_enabled_port_mask = 0;
+static uint32_t l2fwd_enabled_port_mask = 0x1;
 
 #define MAX_RX_QUEUE_PER_LCORE 16
 #define MAX_TX_QUEUE_PER_PORT 16
@@ -146,12 +146,39 @@ void hexdump(char *addr, int len)
         }
 }
 
+void dpdk_quit(void)
+{
+	uint16_t portid;
+	int ret;
+
+	RTE_ETH_FOREACH_DEV(portid) {
+		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
+			continue;
+		printf("Closing port %d...", portid);
+		ret = rte_eth_dev_stop(portid);
+		if (ret != 0)
+			printf("rte_eth_dev_stop: err=%d, port=%d\n",
+					ret, portid);
+		rte_eth_dev_close(portid);
+		printf(" Done\n");
+	}
+
+	/* clean up the EAL */
+	rte_eal_cleanup();
+	printf("Bye...\n");
+}
+
 int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned int portid, nb_rx;
 
 	portid = 0;
+
+	if (force_quit) {
+		dpdk_quit();
+		return -1;
+	}
 
 	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, 1);
 	if (nb_rx == 1) {
@@ -168,6 +195,11 @@ int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
 	struct rte_mbuf *m;
 	int sent;
 	unsigned int portid = 0;
+
+	if (force_quit) {
+		dpdk_quit();
+		return -1;
+	}
 
 	m = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
 	rte_memcpy(rte_pktmbuf_mtod(m, void *), buf, len);
@@ -368,8 +400,6 @@ __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 
-	l2fwd_enabled_port_mask = 0x1;
-
 	nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
@@ -546,5 +576,5 @@ __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 
 __attribute__((destructor)) static void netwrap_main_dtor(void)
 {
-
+	dpdk_quit();
 }

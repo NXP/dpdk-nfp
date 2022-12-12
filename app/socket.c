@@ -79,15 +79,26 @@ int main(int argc, char *argv[])
 #endif
 	while(1) {
 
-		//while((n = recvfrom(sockfd, buff, BUFFSIZE, MSG_DONTWAIT, NULL, NULL)) <= 0);
-		while((n = recv(sockfd, buff, BUFFSIZE, MSG_DONTWAIT)) <= 0);
+		//while((n = recvfrom(sockfd, buff, BUFFSIZE, MSG_DONTWAIT, NULL, NULL)) == 0);
+		while((n = recv(sockfd, buff, BUFFSIZE, MSG_DONTWAIT)) == 0);
+		if (n == -1) {
+			perror("recv error");
+			close(sockfd);
+			return -1;
+		}
 
 #ifdef DEBUG
 		count++;
 		printf("rcv %d frames, len = %d, and echo back\n", count, n);
 		hexdump(buff, n);
 #endif
-		//sendto(sockfd, buff, n, 0, NULL, 0);
-		send(sockfd, buff, n, 0);
+		//n == sendto(sockfd, buff, n, 0, NULL, 0);
+		n == send(sockfd, buff, n, 0);
+		if (n == -1) {
+			perror("send error");
+			close(sockfd);
+			return -1;
+		}
 	}
+	close(sockfd);
 }
