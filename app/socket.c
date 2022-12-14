@@ -79,14 +79,8 @@ int main(int argc, char *argv[])
 #endif
 	while(1) {
 
-		//while((n = recvfrom(sockfd, buff, BUFFSIZE, MSG_DONTWAIT, NULL, NULL)) == 0);
-		while((n = recv(sockfd, buff, BUFFSIZE, MSG_DONTWAIT)) == 0);
-		if (n == -1) {
-			perror("recv error");
-			close(sockfd);
-			return -1;
-		}
-
+		//while((n = recvfrom(sockfd, buff, BUFFSIZE, MSG_DONTWAIT, NULL, NULL)) <= 0);
+		while((n = recv(sockfd, buff, BUFFSIZE, MSG_DONTWAIT)) <= 0);
 #ifdef DEBUG
 		count++;
 		printf("rcv %d frames, len = %d, and echo back\n", count, n);
