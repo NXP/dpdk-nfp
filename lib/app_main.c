@@ -166,6 +166,7 @@ void dpdk_quit(void)
 	/* clean up the EAL */
 	rte_eal_cleanup();
 	printf("Bye...\n");
+	exit(0);
 }
 
 int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
@@ -357,7 +358,8 @@ signal_handler(int signum)
 
 __attribute__((destructor)) static void netwrap_main_dtor(void);
 
-__attribute__((constructor(65531))) static void netwrap_main_ctor(void)
+//__attribute__((constructor(65531))) static void netwrap_main_ctor(void)
+int netwrap_main_ctor(void)
 {
 	int ret;
 	uint16_t nb_ports;
@@ -544,7 +546,9 @@ __attribute__((constructor(65531))) static void netwrap_main_ctor(void)
 			"All available ports are disabled. Please set portmask.\n");
 	}
 
-	check_all_ports_link_status(l2fwd_enabled_port_mask);
+	//check_all_ports_link_status(l2fwd_enabled_port_mask);
+
+	return 1;
 #if 0
 	ret = 0;
 	/* launch per-lcore init on every lcore */
