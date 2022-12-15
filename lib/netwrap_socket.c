@@ -32,7 +32,11 @@ static int (*libc_connect)(int, const struct sockaddr*, socklen_t);
 static ssize_t (*libc_read)(int, void*, size_t);
 static ssize_t (*libc_write)(int, const void*, size_t);
 static ssize_t (*libc_recv)(int, void*, size_t, int);
+static ssize_t (*libc_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 static ssize_t (*libc_send)(int, const void*, size_t, int);
+static ssize_t (*libc_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+static ssize_t (*libc_recvmsg)(int, struct msghdr *, int);
+static ssize_t (*libc_sendmsg)(int, const struct msghdr *, int);
 
 int dpdk_recv(int sockfd, void *buf, size_t len, int flags);
 int dpdk_send(int sockfd, const void *buf, size_t len, int flags);
@@ -50,7 +54,9 @@ void setup_socket_wrappers(void)
 	LIBC_FUNCTION(read);
 	LIBC_FUNCTION(write);
 	LIBC_FUNCTION(recv);
+	LIBC_FUNCTION(recvfrom);
 	LIBC_FUNCTION(send);
+	LIBC_FUNCTION(sendto);
 	setup_socket_wrappers_called = 1;
 }
 
@@ -58,15 +64,16 @@ int socket(int domain, int type, int protocol)
 {
 	int sockfd = -1;
 
-	ECAT_DBG("socket domain = 0x%x, type = 0x%x, proto = 0x%04x\n",
-			domain, type, ntohs(protocol));
 	if (setup_socket_wrappers_called) {
 		if (domain != AF_PACKET) {
 		//if (1) {
 			sockfd = (*libc_socket)(domain, type, protocol);
-			ECAT_DBG("call libc_socket, sockfd = %d\n", sockfd);
+			ECAT_DBG("libc_socket domain = 0x%x, type = 0x%x, proto = 0x%04x\n",
+					domain, type, ntohs(protocol));
 		} else {
 			sockfd = OFP_SOCK_NUM_OFFSET;
+			ECAT_DBG("DPDK Socket domain = 0x%x, type = 0x%x, proto = 0x%04x\n",
+					domain, type, ntohs(protocol));
 #if 0
 			int ofp_domain = domain;
 			int ofp_type, ofp_protocol;
@@ -108,7 +115,7 @@ int socket(int domain, int type, int protocol)
 		}
 	}
 
-	ECAT_DBG("socket wrapper return: %d\n", sockfd);
+	//ECAT_DBG("socket wrapper return: %d\n", sockfd);
 	return sockfd;
 }
 
@@ -117,6 +124,7 @@ int shutdown(int sockfd, int how)
 	int shutdown_value;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d shutdown\n", __func__, sockfd);
 #if 0
 		int ofp_how;
 
@@ -157,6 +165,7 @@ int close(int sockfd)
 	int close_value;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d close\n", __func__, sockfd);
 #if 0
 		close_value = ofp_close(sockfd);
 		errno = NETWRAP_ERRNO(ofp_errno);
@@ -173,9 +182,10 @@ int close(int sockfd)
 			errno = EACCES;
 		}
 	}
-
+#if 0
 	ECAT_DBG("Socket '%d' closed returns:'%d'\n",
 		sockfd, close_value);
+#endif
 	return close_value;
 }
 
@@ -185,7 +195,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 	if (IS_OFP_SOCKET(sockfd)) {
 #if 1
-		ECAT_DBG("%s, this is socket fd:%d bind\n", __func__, sockfd);
+		ECAT_DBG("DPDP socket fd:%d bind\n", __func__, sockfd);
 		return 0;
 #else
 		struct ofp_sockaddr_in ofp_addr;
@@ -240,6 +250,7 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 	int accept_value = -1;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d accept\n", __func__, sockfd);
 #if 0
 		union _ofp_sockaddr_storage ofp_addr_local;
 		struct ofp_sockaddr *ofp_addr;
@@ -336,6 +347,7 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags)
 	int accept_value = -1;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d accept4\n", __func__, sockfd);
 #if 0
 		union _ofp_sockaddr_storage ofp_addr_local;
 		struct ofp_sockaddr *ofp_addr;
@@ -443,6 +455,8 @@ int listen(int sockfd, int backlog)
 	int listen_value = -1;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d listen\n", __func__, sockfd);
+		return 0;
 #if 0
 		listen_value = ofp_listen(sockfd, backlog);
 		errno = NETWRAP_ERRNO(ofp_errno);
@@ -470,6 +484,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	int connect_value;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d connect\n", __func__, sockfd);
 #if 0
 		union _ofp_sockaddr_storage ofp_addr_local;
 		struct ofp_sockaddr *ofp_addr;
@@ -567,6 +582,7 @@ ssize_t read(int sockfd, void *buf, size_t len)
 	ssize_t read_value;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d read\n", __func__, sockfd);
 #if 0
 		read_value = ofp_recv(sockfd, buf, len, 0);
 		errno = NETWRAP_ERRNO(ofp_errno);
@@ -592,6 +608,7 @@ ssize_t write(int sockfd, const void *buf, size_t len)
 	ssize_t write_value;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d write\n", __func__, sockfd);
 #if 0
 		write_value = ofp_send(sockfd, buf, len, 0);
 		errno = NETWRAP_ERRNO(ofp_errno);
@@ -616,6 +633,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags)
 	ssize_t recv_value;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d recv\n", __func__, sockfd);
 #if 0
 		int ofp_flags = 0;
 
@@ -642,14 +660,14 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags)
 		recv_value = dpdk_recv(sockfd, buf, len, flags);
 		errno = 0;
 #endif
-	} else if (libc_recv)
+	} else if (libc_recv) {
 		recv_value = (*libc_recv)(sockfd, buf, len, flags);
-	else { /* pre init*/
+	} else { /* pre init*/
 		LIBC_FUNCTION(recv);
 
-		if (libc_recv)
+		if (libc_recv) {
 			recv_value = (*libc_recv)(sockfd, buf, len, flags);
-		else {
+		} else {
 			recv_value = -1;
 			errno = EACCES;
 		}
@@ -661,6 +679,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags)
 ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 		struct sockaddr *src_addr, socklen_t *addrlen)
 {
+	ECAT_DBG("DPDP socket fd:%d recvfrom\n", __func__, sockfd);
 	return recv(sockfd, buf, len, flags);
 }
 
@@ -669,6 +688,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 	ssize_t send_value;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDP socket fd:%d send\n", __func__, sockfd);
 #if 0
 		int ofp_flags = 0;
 
@@ -697,14 +717,14 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 		send_value = dpdk_send(sockfd, buf, len, flags);
 		errno = 0;
 #endif
-	} else if (libc_send)
+	} else if (libc_send) {
 		send_value = (*libc_send)(sockfd, buf, len, flags);
-	else {
+	} else {
 		LIBC_FUNCTION(send);
 
-		if (libc_send)
+		if (libc_send) {
 			send_value = (*libc_send)(sockfd, buf, len, flags);
-		else {
+		} else {
 			send_value = -1;
 			errno = EACCES;
 		}
@@ -716,5 +736,6 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
 		const struct sockaddr *dest_addr, socklen_t addrlen)
 {
+	ECAT_DBG("DPDP socket fd:%d sendto\n", __func__, sockfd);
 	return send(sockfd, buf, len, flags);
 }

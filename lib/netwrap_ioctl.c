@@ -12,8 +12,10 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "netwrap_ioctl.h"
 #include "netwrap_errno.h"
+#include "netwrap_log.h"
 
 static int (*libc_ioctl)(int, unsigned long int, ...);
 
@@ -33,6 +35,8 @@ int ioctl(int fd, unsigned long int request, ...)
 	va_end(ap);
 
 	if (IS_OFP_SOCKET(fd)) {
+		ECAT_DBG("DPDK IOCTL fd = %d, request = 0x%x\n",
+				fd, request);
 		if (request == SIOCGIFINDEX) {
 			struct ifreq *ifr = (struct ifreq *)data;
 			ifr->ifr_ifindex = 0;

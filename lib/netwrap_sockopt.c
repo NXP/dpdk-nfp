@@ -31,9 +31,8 @@ int setsockopt(int sockfd, int level, int opt_name, const void *opt_val,
 
 	if (IS_OFP_SOCKET(sockfd)) {
 #if 1
-		ECAT_DBG("socket fd = %d, level = %d, optname = %d\n",
+		ECAT_DBG("DPDK setsockopt fd = %d, level = %d, optname = %d\n",
 				sockfd, level, opt_name);
-		return 0;
 #else
 		int ofp_level;
 		int ofp_opt_name;
@@ -150,6 +149,8 @@ int getsockopt(int sockfd, int level, int opt_name, void *opt_val,
 	int getsockopt_value = -1;
 
 	if (IS_OFP_SOCKET(sockfd)) {
+		ECAT_DBG("DPDK getsockopt fd = %d, level = %d, optname = %d\n",
+				sockfd, level, opt_name);
 #if 0
 		int ofp_level;
 		int ofp_opt_name;
