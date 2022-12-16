@@ -34,12 +34,14 @@ int ioctl(int fd, unsigned long int request, ...)
 	data = va_arg(ap, void *);
 	va_end(ap);
 
-	if (IS_OFP_SOCKET(fd)) {
+	if (IS_USECT_SOCKET(fd)) {
 		ECAT_DBG("DPDK IOCTL fd = %d, request = 0x%x\n",
 				fd, request);
 		if (request == SIOCGIFINDEX) {
 			struct ifreq *ifr = (struct ifreq *)data;
 			ifr->ifr_ifindex = 0;
+			ioctl_value = 0;
+		} else if (request == FIONBIO) {
 			ioctl_value = 0;
 		} else {
 			errno = EINVAL;
@@ -68,10 +70,14 @@ int ioctl(int fd, unsigned long int request, ...)
 		ioctl_value = ofp_ioctl(fd, ofp_request, p);
 		errno = NETWRAP_ERRNO(ofp_errno);
 #endif
-	} else if (libc_ioctl)
+	} else if (libc_ioctl) {
+		ECAT_DBG("libc_ioctl fd = %d, request = 0x%x\n",
+				fd, request);
 		ioctl_value = (*libc_ioctl)(fd, request, data);
-	else {
+	} else {
 		LIBC_FUNCTION(ioctl);
+		ECAT_DBG("libc_ioctl fd = %d, request = 0x%x\n",
+				fd, request);
 		if (libc_ioctl)
 			ioctl_value = (*libc_ioctl)(fd, request, data);
 		else {

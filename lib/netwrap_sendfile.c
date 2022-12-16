@@ -23,7 +23,7 @@ ssize_t sendfile64(int out_fd, int in_fd, off64_t *offset, size_t count)
 {
 	ssize_t sendfile_value = -1;
 
-	if (IS_OFP_SOCKET(out_fd)) {
+	if (IS_USECT_SOCKET(out_fd)) {
 		ECAT_DBG("DPDK sendfile\n");
 #if 0
 		off_t orig = 0;

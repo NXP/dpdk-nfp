@@ -28,7 +28,7 @@ enum log_level_s loglevel;
 			##__VA_ARGS__);                             \
 } while (0)
 
-#define ECAT_DEBUG
+//#define ECAT_DEBUG
 #if defined(ECAT_DEBUG)
 #define ECAT_DBG(fmt, ...) \
         _ECAT_LOG(LOG_DEBUG, fmt, ##__VA_ARGS__)

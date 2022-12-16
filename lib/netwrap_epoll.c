@@ -53,7 +53,7 @@ int epoll_create(int size)
 
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 {
-	if (IS_OFP_SOCKET(epfd)) {
+	if (IS_USECT_SOCKET(epfd)) {
 		ECAT_DBG("DPDK epoll ctl\n");
 #if 0
 		struct ofp_epoll_event ofp_event = { event->events, { .u64 = event->data.u64 } };
@@ -79,7 +79,7 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
-	if (IS_OFP_SOCKET(epfd)) {
+	if (IS_USECT_SOCKET(epfd)) {
 		ECAT_DBG("DPDK epoll wait\n");
 #if 0
 		struct ofp_epoll_event ofp_events[maxevents];

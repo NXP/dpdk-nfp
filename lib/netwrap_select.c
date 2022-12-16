@@ -22,7 +22,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 {
 	int select_value;
 
-	if (IS_OFP_SOCKET((nfds - 1))) {
+	if (IS_USECT_SOCKET((nfds - 1))) {
 		ECAT_DBG("DPDK select\n");
 #if 0
 		ofp_fd_set ofp_readfds, ofp_readfds_bku;

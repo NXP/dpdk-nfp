@@ -27,7 +27,7 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
 	ssize_t writev_value = -1;
 
-	if (IS_OFP_SOCKET(fd)) {
+	if (IS_USECT_SOCKET(fd)) {
 		ECAT_DBG("DPDK writev\n");
 #if 0
 		int i;

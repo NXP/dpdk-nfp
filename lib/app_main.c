@@ -184,6 +184,10 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, 1);
 	if (nb_rx == 1) {
 		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), rte_pktmbuf_pkt_len(pkts_burst[0]));
+#if 0
+		printf("%s... rcv %d frames\n", __func__, rte_pktmbuf_pkt_len(pkts_burst[0]));
+		hexdump(buf, rte_pktmbuf_pkt_len(pkts_burst[0]));
+#endif
 		return rte_pktmbuf_pkt_len(pkts_burst[0]);
 	}
 
@@ -201,11 +205,14 @@ int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
 		dpdk_quit();
 		return -1;
 	}
-
+#if 0
+	printf("%s...%d frames\n", __func__, len);
+	hexdump(buf, len);
+#endif
 	m = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
 	rte_memcpy(rte_pktmbuf_mtod(m, void *), buf, len);
 	m->nb_segs = 1;
-	m->data_off = 0;
+	m->data_off = RTE_PKTMBUF_HEADROOM;
 	m->next = NULL;
 	m->pkt_len = len;
 	m->data_len = len;
