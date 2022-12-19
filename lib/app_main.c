@@ -151,6 +151,21 @@ void dpdk_quit(void)
 	uint16_t portid;
 	int ret;
 
+	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+		/* skip disabled ports */
+		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
+			continue;
+		printf("\nStatistics for port %u ------------------------------"
+				"\nPackets sent: %24"PRIu64
+				"\nPackets received: %20"PRIu64
+				"\nPackets dropped: %21"PRIu64,
+				portid,
+				port_statistics[portid].tx,
+				port_statistics[portid].rx,
+				port_statistics[portid].dropped);
+		printf("\n");
+	}
+
 	RTE_ETH_FOREACH_DEV(portid) {
 		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
 			continue;
@@ -184,6 +199,7 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, 1);
 	if (nb_rx == 1) {
 		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), rte_pktmbuf_pkt_len(pkts_burst[0]));
+		port_statistics[portid].rx++;
 #if 0
 		printf("%s... rcv %d frames\n", __func__, rte_pktmbuf_pkt_len(pkts_burst[0]));
 		hexdump(buf, rte_pktmbuf_pkt_len(pkts_burst[0]));
@@ -220,6 +236,7 @@ int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
 	buffer = tx_buffer[0];
 	sent = rte_eth_tx_buffer(portid, 0, buffer, m);
 	if (sent) {
+		port_statistics[portid].tx++;
 		rte_pktmbuf_free(m);
 		return len;
 	} else
