@@ -570,7 +570,7 @@ int netwrap_main_ctor(void)
 			"All available ports are disabled. Please set portmask.\n");
 	}
 
-	//check_all_ports_link_status(l2fwd_enabled_port_mask);
+	check_all_ports_link_status(l2fwd_enabled_port_mask);
 
 	return 1;
 #if 0
