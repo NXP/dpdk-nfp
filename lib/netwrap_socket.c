@@ -585,6 +585,8 @@ ssize_t read(int sockfd, void *buf, size_t len)
 
 	if (IS_USECT_SOCKET(sockfd)) {
 		ECAT_DBG("DPDP socket fd:%d read\n", sockfd);
+		read_value = dpdk_recv(sockfd, buf, len, 0);
+		errno = 0;
 #if 0
 		read_value = ofp_recv(sockfd, buf, len, 0);
 		errno = NETWRAP_ERRNO(ofp_errno);
@@ -613,6 +615,8 @@ ssize_t write(int sockfd, const void *buf, size_t len)
 
 	if (IS_USECT_SOCKET(sockfd)) {
 		ECAT_DBG("DPDP socket fd:%d write\n", sockfd);
+		write_value = dpdk_send(sockfd, buf, len, 0);
+		errno = 0;
 #if 0
 		write_value = ofp_send(sockfd, buf, len, 0);
 		errno = NETWRAP_ERRNO(ofp_errno);
