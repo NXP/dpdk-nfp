@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <linux/if_packet.h>
 #include <sys/ioctl.h>
+#include <signal.h>
+#include <time.h>
 
 #define BUFFSIZE 1024
 
@@ -32,6 +34,42 @@ void hexdump(uint8_t *addr, int len)
 }
 #endif
 
+int count = 0;
+int count_old = 0;
+int count_pps = 0;
+timer_t gTimerSTd;
+void timer_status_callback(int sig)
+{
+	count_pps = count - count_old;
+	printf("count_pps = %d, counter = %d\n", count_pps, count);
+	count_old = count;
+}
+
+void stat_timer(void)
+{
+        struct itimerspec value;
+        struct sigevent evp;
+        struct timespec now;
+
+        evp.sigev_value.sival_ptr = &gTimerSTd;
+        evp.sigev_notify = SIGEV_SIGNAL;
+        evp.sigev_signo = SIGUSR1;
+        signal(evp.sigev_signo, timer_status_callback);
+        clock_gettime(CLOCK_REALTIME, &now);
+        now.tv_sec += 2;
+        now.tv_nsec = 0;
+
+        value.it_value = now;//waits for 5 seconds before sending timer signal
+
+        value.it_interval.tv_sec = 1;//sends timer signal every 5 seconds
+        value.it_interval.tv_nsec = 0;
+
+        printf("start timer \n");
+        timer_create(CLOCK_REALTIME, &evp, &gTimerSTd);
+
+        timer_settime(gTimerSTd, TIMER_ABSTIME, &value, NULL);
+}
+
 int main(int argc, char *argv[])
 {
 	char *name = NULL;
@@ -40,7 +78,6 @@ int main(int argc, char *argv[])
 	struct sockaddr_ll addr;
 	unsigned char buff[BUFFSIZE];
 	int n;
-	int count = 0;
 
 	if (argc != 2) {
 		fprintf(stderr, "USAGE: server <interface>\n");
@@ -77,13 +114,15 @@ int main(int argc, char *argv[])
 		printf("SO_BINDTODEVICE failed\n");
 		exit(1);
 	}
+
+	stat_timer();
+
 #endif
 	while(1) {
 
 		//while((n = recvfrom(sockfd, buff, BUFFSIZE, MSG_DONTWAIT, NULL, NULL)) <= 0);
 		while((n = recv(sockfd, buff, BUFFSIZE, MSG_DONTWAIT)) <= 0);
 #ifdef DEBUG
-		count++;
 		printf("rcv %d frames, len = %d, and echo back\n", count, n);
 		hexdump(buff, n);
 #endif
@@ -94,6 +133,7 @@ int main(int argc, char *argv[])
 			close(sockfd);
 			return -1;
 		}
+		count++;
 	}
 	close(sockfd);
 }
