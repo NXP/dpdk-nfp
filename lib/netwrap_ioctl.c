@@ -1,10 +1,3 @@
-/* Copyright (c) 2016, ENEA Software AB
- * Copyright (c) 2016, Nokia
- * All rights reserved.
- *
- * SPDX-License-Identifier:     BSD-3-Clause
- */
-
 #include "netwrap_common.h"
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -47,29 +40,6 @@ int ioctl(int fd, unsigned long int request, ...)
 			errno = EINVAL;
 			ioctl_value = -1;
 		}
-
-#if 0
-		int ofp_request;
-
-		if (request == FIONREAD)
-			ofp_request = OFP_FIONREAD;
-		else if (request == FIONBIO)
-			ofp_request = OFP_FIONBIO;
-		else if (request == FIOASYNC)
-			ofp_request = OFP_FIOASYNC;
-		else if (request == SIOCGIFINDEX)
-			ofp_request = OFP_SIOCGIFINDEX;
-		/*else if (request == FIONWRITE)
-			ofp_request = OFP_FIONWRITE;
-		else if (request == FIONSPACE)
-			ofp_request = OFP_FIONSPACE;*/
-		else {
-			errno = EINVAL;
-			return -1;
-		}
-		ioctl_value = ofp_ioctl(fd, ofp_request, p);
-		errno = NETWRAP_ERRNO(ofp_errno);
-#endif
 	} else if (libc_ioctl) {
 		ECAT_DBG("libc_ioctl fd = %d, request = 0x%x\n",
 				fd, request);

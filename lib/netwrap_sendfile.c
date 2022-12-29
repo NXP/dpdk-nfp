@@ -25,57 +25,6 @@ ssize_t sendfile64(int out_fd, int in_fd, off64_t *offset, size_t count)
 
 	if (IS_USECT_SOCKET(out_fd)) {
 		ECAT_DBG("DPDK sendfile\n");
-#if 0
-		off_t orig = 0;
-		size_t data_processed = 0;
-		char buff[BUF_SIZE];
-		ssize_t data_read;
-		ofp_ssize_t ofp_data_sent;
-		ofp_ssize_t ofp_data_sent_sum;
-
-		if (offset != NULL) {
-			orig = lseek(in_fd, 0, SEEK_CUR);
-			if (orig == (off_t)-1)
-				return -1;
-			if (lseek(in_fd, *offset, SEEK_SET) == -1)
-				return -1;
-		}
-
-		while (data_processed < count) {
-			data_read = (*libc_read)(in_fd, buff, BUF_SIZE);
-			if (data_read < 0)
-				return -1;
-			else if (data_read == 0)   /*EOF*/
-				break;
-
-			ofp_data_sent_sum = 0;
-			while (ofp_data_sent_sum < data_read) {
-				ofp_data_sent = ofp_send(out_fd,
-					buff + ofp_data_sent_sum,
-					data_read - ofp_data_sent_sum, 0);
-				if (ofp_data_sent < 0) {
-					if (ofp_errno == OFP_EWOULDBLOCK) {
-						usleep(100);
-						continue;
-					}
-					errno = NETWRAP_ERRNO(ofp_errno);
-					return -1;
-				}
-				ofp_data_sent_sum += ofp_data_sent;
-			}
-			data_processed += data_read;
-		}
-
-		sendfile_value = data_processed;
-
-		if (offset != NULL) {
-			*offset = lseek(in_fd, 0, SEEK_CUR);
-			if (*offset == -1)
-				return -1;
-			if (lseek(in_fd, orig, SEEK_SET) == -1)
-				return -1;
-		}
-#endif
 	} else if (libc_sendfile64)
 		sendfile_value = (*libc_sendfile64)(out_fd, in_fd,
 				offset, count);

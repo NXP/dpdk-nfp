@@ -1,10 +1,3 @@
-/* Copyright (c) 2016, ENEA Software AB
- * Copyright (c) 2016, Nokia
- * All rights reserved.
- *
- * SPDX-License-Identifier:     BSD-3-Clause
- */
-
 #include "netwrap_common.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -22,46 +15,12 @@ void setup_uio_wrappers(void)
 	LIBC_FUNCTION(writev);
 }
 
-
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
 	ssize_t writev_value = -1;
 
 	if (IS_USECT_SOCKET(fd)) {
 		ECAT_DBG("DPDK writev\n");
-#if 0
-		int i;
-		ssize_t writev_sum = 0;
-		ssize_t iov_len;
-		ssize_t iov_snt;
-		char *iov_base;
-		ofp_ssize_t ofp_send_res;
-
-
-		for (i = 0; i < iovcnt; i++) {
-			iov_len = iov[i].iov_len;
-			iov_snt = 0;
-			iov_base = (char *)iov[i].iov_base;
-
-			while (iov_snt < iov_len) {
-				ofp_send_res = ofp_send(fd, iov_base + iov_snt,
-					iov_len - iov_snt, 0);
-
-				if (ofp_send_res <= 0) {
-					if (ofp_send_res == 0 ||
-						ofp_errno == OFP_EAGAIN) {
-						usleep(100);
-						continue;
-					}
-					errno = NETWRAP_ERRNO(ofp_errno);
-					return -1;
-				}
-				iov_snt += ofp_send_res;
-			}
-			writev_sum += iov_len;
-		}
-		writev_value = writev_sum;
-#endif
 	} else if (libc_writev)
 		writev_value = (*libc_writev)(fd, iov, iovcnt);
 	else {
