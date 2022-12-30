@@ -15,6 +15,7 @@
 
 static int setup_socket_wrappers_called;
 static int setup_dpdk_called = 0;
+int usect_sockfd = 0;
 static int (*libc_socket)(int, int, int);
 static int (*libc_shutdown)(int, int);
 static int (*libc_close)(int);
@@ -71,13 +72,15 @@ int socket(int domain, int type, int protocol)
 				if (ret) {
 					setup_dpdk_called = 1;
 				}
+			}
+			if (usect_sockfd == 0) {
+				sockfd = (*libc_socket)(domain, type, protocol);
+				usect_sockfd = sockfd;
 			} else {
-				ECAT_DBG("Only 1 DPDK Socket is supported\n");
+				printf("Only 1 DPDK Socket is supported\n");
 				exit(0);
 			}
-			sockfd = (*libc_socket)(domain, type, protocol);
-			usect_sockfd = sockfd;
-			ECAT_DBG("DPDK Socket domain = 0x%x, type = 0x%x, proto = 0x%04x, sockfd = %d\n",
+			printf("DPDK Socket domain = 0x%x, type = 0x%x, proto = 0x%04x, sockfd = %d\n",
 					domain, type, ntohs(protocol), usect_sockfd);
 		}
 	} else { /* pre init*/
@@ -103,7 +106,8 @@ int shutdown(int sockfd, int how)
 
 	if (IS_USECT_SOCKET(sockfd)) {
 		shutdown_value = (*libc_shutdown)(sockfd, how);
-		ECAT_DBG("DPDP socket fd:%d shutdown\n", sockfd);
+		usect_sockfd = 0;
+		printf("DPDP socket fd:%d shutdown\n", sockfd);
 	} else if (libc_shutdown) {
 		ECAT_DBG("libc_shutdown socket fd:%d shutdown\n", sockfd);
 		shutdown_value = (*libc_shutdown)(sockfd, how);
@@ -127,8 +131,9 @@ int close(int sockfd)
 	int close_value;
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		ECAT_DBG("DPDP socket fd:%d close\n", sockfd);
+		printf("DPDP socket fd:%d close\n", sockfd);
 		close_value = (*libc_close)(sockfd);
+		usect_sockfd = 0;
 	} else if (libc_close) {
 		ECAT_DBG("libc_close socket fd:%d close\n", sockfd);
 		close_value = (*libc_close)(sockfd);
@@ -155,7 +160,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	int bind_value = -1;
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		ECAT_DBG("DPDP socket fd:%d bind\n", sockfd);
+		printf("DPDP socket fd:%d bind\n", sockfd);
 		return 0;
 	} else if (libc_bind) {
 		ECAT_DBG("libc_bind socket fd:%d bind\n", sockfd);
@@ -184,7 +189,7 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 	int accept_value = -1;
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		ECAT_DBG("DPDP socket fd:%d accept\n", sockfd);
+		printf("DPDP socket fd:%d accept\n", sockfd);
 	} else if (libc_accept) {
 		ECAT_DBG("libc_accept socket fd:%d accept\n", sockfd);
 		accept_value = (*libc_accept)(sockfd, addr, addrlen);
@@ -237,7 +242,7 @@ int listen(int sockfd, int backlog)
 	int listen_value = -1;
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		ECAT_DBG("DPDP socket fd:%d listen\n", sockfd);
+		printf("DPDP socket fd:%d listen\n", sockfd);
 		return 0;
 	} else if (libc_listen) {
 		ECAT_DBG("libc_socket fd:%d listen\n", sockfd);
@@ -264,7 +269,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	int connect_value;
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		ECAT_DBG("DPDP socket fd:%d connect\n", sockfd);
+		printf("DPDP socket fd:%d connect\n", sockfd);
 		connect_value = 0;
 	} else if (libc_connect) {
 		ECAT_DBG("libc_connect fd:%d connect\n", sockfd);

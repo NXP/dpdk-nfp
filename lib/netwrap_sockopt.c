@@ -23,7 +23,7 @@ int setsockopt(int sockfd, int level, int opt_name, const void *opt_val,
 	int setsockopt_value;
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		ECAT_DBG("DPDK setsockopt fd = %d, level = %d, optname = %d\n",
+		printf("DPDK setsockopt fd = %d, level = %d, optname = %d\n",
 				sockfd, level, opt_name);
 	} else if (libc_setsockopt)
 		setsockopt_value = (*libc_setsockopt)(sockfd, level, opt_name,
@@ -49,7 +49,7 @@ int getsockopt(int sockfd, int level, int opt_name, void *opt_val,
 	int getsockopt_value = -1;
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		ECAT_DBG("DPDK getsockopt fd = %d, level = %d, optname = %d\n",
+		printf("DPDK getsockopt fd = %d, level = %d, optname = %d\n",
 				sockfd, level, opt_name);
 	} else if (libc_getsockopt) {
 		ECAT_DBG("libc_getsockopt fd = %d, level = %d, optname = %d\n",
