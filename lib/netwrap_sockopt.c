@@ -20,11 +20,12 @@ void setup_sockopt_wrappers(void)
 int setsockopt(int sockfd, int level, int opt_name, const void *opt_val,
 	socklen_t opt_len)
 {
-	int setsockopt_value;
+	int setsockopt_value = -1;
 
 	if (IS_USECT_SOCKET(sockfd)) {
 		printf("DPDK setsockopt fd = %d, level = %d, optname = %d\n",
 				sockfd, level, opt_name);
+		setsockopt_value = 0;
 	} else if (libc_setsockopt)
 		setsockopt_value = (*libc_setsockopt)(sockfd, level, opt_name,
 			opt_val, opt_len);
