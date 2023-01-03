@@ -45,7 +45,7 @@ void timer_status_callback(int sig)
 	count_old = count;
 }
 
-void stat_timer(void)
+void stat_timer(int interval)
 {
         struct itimerspec value;
         struct sigevent evp;
@@ -61,7 +61,7 @@ void stat_timer(void)
 
         value.it_value = now;//waits for 5 seconds before sending timer signal
 
-        value.it_interval.tv_sec = 1;//sends timer signal every 5 seconds
+        value.it_interval.tv_sec = interval;//sends timer signal every 5 seconds
         value.it_interval.tv_nsec = 0;
 
         printf("start timer \n");
@@ -73,17 +73,23 @@ void stat_timer(void)
 int main(int argc, char *argv[])
 {
 	char *name = NULL;
+	int interval;
 	struct ifreq device;
 	int sockfd;
 	struct sockaddr_ll addr;
 	unsigned char buff[BUFFSIZE];
 	int n;
 
-	if (argc != 2) {
-		fprintf(stderr, "USAGE: server <interface>\n");
+	if (argc != 3) {
+		fprintf(stderr, "USAGE: server <interface> <interval>\n");
 		exit(1);
 	}
 	name = argv[1];
+	interval = atoi(argv[2]);
+	if(interval < 0) {
+		fprintf(stderr, "invalid statistic interval\n");
+		exit(1);
+	}
 
 	sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 	//sockfd = socket(PF_PACKET, SOCK_RAW, IPPROTO_RAW);
@@ -115,7 +121,8 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	stat_timer();
+	if (interval > 0)
+		stat_timer(interval);
 
 #endif
 	while(1) {
