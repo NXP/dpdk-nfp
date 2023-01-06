@@ -42,7 +42,7 @@
 static volatile bool force_quit;
 
 /* MAC updating enabled by default */
-static int mac_updating = 1;
+static int mac_updating = 0;
 
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
 
@@ -243,10 +243,16 @@ void dpdk_quit(void)
 	exit(0);
 }
 
+#define lsinic_invalidate(p) \
+        { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
+
 int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned int portid, nb_rx;
+	int length;
+	char *data;
+	int i;
 
 	portid = 0;
 
@@ -257,14 +263,19 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 
 	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, 1);
 	if (nb_rx == 1) {
-		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), rte_pktmbuf_pkt_len(pkts_burst[0]));
+		data = rte_pktmbuf_mtod(pkts_burst[0], char *);
+		length = rte_pktmbuf_pkt_len(pkts_burst[0]);
+		for(i = 0; i < length; i += 64)
+			lsinic_invalidate(data + i);
+
+		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), length);
 		port_statistics[portid].rx++;
 #if 0
 		printf("%s... rcv %d frames\n", __func__, rte_pktmbuf_pkt_len(pkts_burst[0]));
 		hexdump(buf, rte_pktmbuf_pkt_len(pkts_burst[0]));
 #endif
 		rte_pktmbuf_free(pkts_burst[0]);
-		return rte_pktmbuf_pkt_len(pkts_burst[0]);
+		return length;
 	}
 
 	return 0;
@@ -1124,7 +1135,7 @@ int dpdk_test(void)
 
 	//check_all_ports_link_status(l2fwd_enabled_port_mask);
 
-	return 1;
+	//return 1;
 
 	ret = 0;
 	/* launch per-lcore init on every lcore */

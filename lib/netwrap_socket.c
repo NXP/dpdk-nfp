@@ -56,6 +56,9 @@ void setup_socket_wrappers(void)
 }
 
 int netwrap_main_ctor(void);
+#ifdef DPDK_TEST
+int dpdk_test(void);
+#endif
 int socket(int domain, int type, int protocol)
 {
 	int sockfd = -1;
@@ -68,7 +71,11 @@ int socket(int domain, int type, int protocol)
 		} else {
 			int ret;
 			if (!setup_dpdk_called) {
+#ifdef DPDK_TEST
+				ret = dpdk_test();
+#else
 				ret = netwrap_main_ctor();
+#endif
 				if (ret) {
 					setup_dpdk_called = 1;
 				}
