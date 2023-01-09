@@ -242,17 +242,16 @@ void dpdk_quit(void)
 	printf("Bye...\n");
 	exit(0);
 }
-
+#if 0
 #define dccivac(p) \
         { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
-
+#endif
 int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned int portid, nb_rx;
 	int length;
 	char *data;
-	int i;
 
 	portid = 0;
 
@@ -265,9 +264,11 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 	if (likely(nb_rx == 1)) {
 		data = rte_pktmbuf_mtod(pkts_burst[0], char *);
 		length = rte_pktmbuf_pkt_len(pkts_burst[0]);
+#if 0
+		int i;
 		for(i = 0; i < length; i += 64)
 			dccivac(data + i);
-
+#endif
 		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), length);
 		port_statistics[portid].rx++;
 #if 0
