@@ -198,7 +198,7 @@ void hexdump(char *addr, int len)
         int i = 0;
         for(i = 0; i < len; i++) {
                 if(!(i%16))
-                        printf("%4x: ", addr);
+                        printf("%p: ", (addr + i));
                 printf("%02x ", *(addr + i));
                 if(!((i + 1)%16))
                         printf("\n");
@@ -243,7 +243,7 @@ void dpdk_quit(void)
 	exit(0);
 }
 
-#define lsinic_invalidate(p) \
+#define dccivac(p) \
         { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
 
 int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
@@ -256,17 +256,17 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 
 	portid = 0;
 
-	if (force_quit) {
+	if (unlikely((force_quit))) {
 		dpdk_quit();
 		return -1;
 	}
 
 	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, 1);
-	if (nb_rx == 1) {
+	if (likely(nb_rx == 1)) {
 		data = rte_pktmbuf_mtod(pkts_burst[0], char *);
 		length = rte_pktmbuf_pkt_len(pkts_burst[0]);
 		for(i = 0; i < length; i += 64)
-			lsinic_invalidate(data + i);
+			dccivac(data + i);
 
 		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), length);
 		port_statistics[portid].rx++;
@@ -288,7 +288,7 @@ int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
 	int sent;
 	unsigned int portid = 0;
 
-	if (force_quit) {
+	if (unlikely((force_quit))) {
 		dpdk_quit();
 		return -1;
 	}
@@ -303,9 +303,6 @@ int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
 	m->next = NULL;
 	m->pkt_len = len;
 	m->data_len = len;
-
-	if (mac_updating)
-		l2fwd_mac_updating(m, 0);
 
 	buffer = tx_buffer[0];
 	sent = rte_eth_tx_buffer(portid, 0, buffer, m);
