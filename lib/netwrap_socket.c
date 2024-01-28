@@ -64,7 +64,7 @@ int socket(int domain, int type, int protocol)
 	int sockfd = -1;
 
 	if (setup_socket_wrappers_called) {
-		if (domain != AF_PACKET) {
+		if (!((domain == AF_INET) && (type == SOCK_DGRAM))) {
 			sockfd = (*libc_socket)(domain, type, protocol);
 			ECAT_DBG("libc_socket domain = 0x%x, type = 0x%x, proto = 0x%04x, sockfd = %d\n",
 					domain, type, ntohs(protocol), sockfd);
