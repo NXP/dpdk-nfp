@@ -38,6 +38,7 @@
 #include <rte_mbuf.h>
 #include <rte_string_fns.h>
 #include "netwrap_log.h"
+#include "netwrap_common.h"
 
 static volatile bool force_quit;
 
@@ -109,6 +110,13 @@ struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 10; /* default period is 10 seconds */
+
+#define IP_DEFTTL       64
+#define IP_VERSION      0x40
+#define IP_HDRLEN       0x05
+#define IP_VHL_DEF      (IP_VERSION | IP_HDRLEN)
+
+extern struct packet_info pinfo;
 
 /* Print out statistics on packets dropped */
 static void
@@ -248,8 +256,9 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned int portid, nb_rx;
-	int length;
-	char *data;
+	int i, length, total_bytes = 0;
+	char *pkt, *pdata;
+	struct rte_udp_hdr *udp_hdr;
 
 	portid = 0;
 
@@ -258,53 +267,103 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags)
 		return -1;
 	}
 
-	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, 1);
-	if (likely(nb_rx == 1)) {
-		data = rte_pktmbuf_mtod(pkts_burst[0], char *);
-		length = rte_pktmbuf_pkt_len(pkts_burst[0]);
-#if 0
-		int i;
-		for(i = 0; i < length; i += 64)
-			dccivac(data + i);
-#endif
-		rte_memcpy(buf, rte_pktmbuf_mtod(pkts_burst[0], void *), length);
-		port_statistics[portid].rx++;
-#if 0
-		printf("%s... rcv %d frames\n", __func__, rte_pktmbuf_pkt_len(pkts_burst[0]));
-		hexdump(buf, rte_pktmbuf_pkt_len(pkts_burst[0]));
-#endif
-		rte_pktmbuf_free(pkts_burst[0]);
-		return length;
-	}
+	/* Workaround for rte_lcore_id return -1 due to changed pid. */
+	RTE_PER_LCORE(_lcore_id) = 0;
 
-	return 0;
+	int offset = sizeof(struct rte_ether_hdr) +
+		sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
+	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, MAX_PKT_BURST);
+	for (i = 0, pdata = buf, total_bytes = 0; i < nb_rx; i++) {
+		pkt = rte_pktmbuf_mtod(pkts_burst[i], char *);
+		udp_hdr = (struct rte_udp_hdr *)(pkt
+			+ sizeof(struct rte_ether_hdr)
+			+ sizeof(struct rte_ipv4_hdr));
+		length = rte_be_to_cpu_16(udp_hdr->dgram_len)
+				- sizeof(struct rte_udp_hdr);
+
+		if (len >= length) {
+			rte_memcpy(pdata, pkt + offset, length);
+			pdata += length;
+			len -= length;
+			total_bytes += length;
+		}
+		port_statistics[portid].rx++;
+
+		/* rte_pktmbuf_free(pkts_burst[i]); */
+	}
+	rte_pktmbuf_free_bulk(pkts_burst, nb_rx);
+
+	return total_bytes;
 }
 
 int dpdk_send(int sockfd, const void *buf, size_t len, int flags)
 {
-	struct rte_eth_dev_tx_buffer *buffer;
+	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	struct rte_mbuf *m;
-	int sent;
+	int sent, cnt;
 	unsigned int portid = 0;
+	void *udp_data;
+	struct rte_ether_hdr *eth_hdr;
+	struct rte_ipv4_hdr *ip_hdr;
+	struct rte_udp_hdr *udp_hdr;
 
 	if (unlikely((force_quit))) {
 		dpdk_quit();
 		return -1;
 	}
-#if 0
-	printf("%s...%d frames\n", __func__, len);
-	hexdump(buf, len);
-#endif
-	m = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
+
+#define ALLOC_RETRY_COUNT 10
+	for (cnt = 0; cnt < ALLOC_RETRY_COUNT; cnt++) {
+		m = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
+		if (m)
+			break;
+	}
+	if (cnt == ALLOC_RETRY_COUNT) {
+		printf("Sendto failed to allocate mbuf, cnt=%d\n", cnt);
+		return -1;
+	}
+
+	/* Initialize the Ethernet header */
+	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+	memcpy(eth_hdr->src_addr.addr_bytes, pinfo.src_mac, sizeof(pinfo.src_mac));
+	memcpy(eth_hdr->dst_addr.addr_bytes, pinfo.dst_mac, sizeof(pinfo.dst_mac));
+	eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+	/* Initialize the IP header*/
+	ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+	memset(ip_hdr, 0, sizeof(*ip_hdr));
+	ip_hdr->version_ihl = IP_VHL_DEF;
+	ip_hdr->type_of_service = 0;
+	ip_hdr->fragment_offset = 0;
+	ip_hdr->time_to_live = IP_DEFTTL;
+	ip_hdr->next_proto_id = IPPROTO_UDP;
+	ip_hdr->packet_id = 0;
+	ip_hdr->src_addr = pinfo.src_ip;
+	ip_hdr->dst_addr = pinfo.dst_ip;
+	ip_hdr->total_length = rte_cpu_to_be_16(
+			len + sizeof(*ip_hdr) + sizeof(*udp_hdr));
+	ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+
+	/* Initialize the UDP header */
+	udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+	udp_hdr->src_port = pinfo.src_port;
+	udp_hdr->dst_port = pinfo.dst_port;
+	/* UDP checksum is optional */
+	udp_hdr->dgram_cksum = 0;
+	udp_hdr->dgram_len = rte_cpu_to_be_16(len + sizeof(*udp_hdr));
+
+	udp_data = (void *)(udp_hdr + 1);
+	rte_memcpy(udp_data, buf, len);
 	m->data_off = RTE_PKTMBUF_HEADROOM;
-	rte_memcpy(rte_pktmbuf_mtod(m, void *), buf, len);
 	m->nb_segs = 1;
 	m->next = NULL;
-	m->pkt_len = len;
-	m->data_len = len;
+	m->data_len = len + sizeof(*eth_hdr) + sizeof(*ip_hdr) + sizeof(*udp_hdr);
+	if (m->data_len < 60)
+		m->data_len = 60;
+	m->pkt_len = m->data_len;
 
-	buffer = tx_buffer[0];
-	sent = rte_eth_tx_buffer(portid, 0, buffer, m);
+	sent = rte_eth_tx_burst(portid, 0, &m, 1);
 	if (sent) {
 		port_statistics[portid].tx++;
 		return len;

@@ -7,6 +7,19 @@
 #endif
 #endif
 #include <dlfcn.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+/* record packet related info */
+struct packet_info {
+	bool flag;
+	uint16_t src_port;
+	uint16_t dst_port;
+	uint32_t src_ip;
+	uint32_t dst_ip;
+	uint8_t src_mac[6];
+	uint8_t dst_mac[6];
+};
 
 #define LIBC_FUNCTION(func) do {			\
 		libc_##func = dlsym(RTLD_NEXT, #func);	\
