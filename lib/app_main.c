@@ -39,6 +39,7 @@
 #include <rte_string_fns.h>
 #include "netwrap_log.h"
 #include "netwrap_common.h"
+#include "rte_dpaa2_mux_demo.h"
 
 static volatile bool force_quit;
 
@@ -1440,6 +1441,28 @@ int netwrap_main_ctor(void)
 	rte_eal_cleanup();
 	printf("Bye...\n");
 #endif
+}
+
+int netwrap_create_mux_flow(void)
+{
+	int ret;
+	char *epid;
+
+	s_mux_type = TRAFFIC_SPLIT_UDP_DST_PORT;
+	epid = getenv("MUX_EP_ID");
+	if (epid)
+		s_mux_ep_id = atoi(epid);
+	else {
+		/* s_mux_ep_id = 2; */
+		printf("Please set s_mux_ep_id by 'export MUX_EP_ID'.\n");
+	}
+
+	s_mux_val = rte_be_to_cpu_16(pinfo.src_port);
+	ret = rte_dpaa2_mux_demo_config_split_traffic();
+	if (ret)
+		printf("DPDK split traffic fail ret=%x\n", ret);
+
+	return ret;
 }
 
 __attribute__((destructor)) static void netwrap_main_dtor(void)

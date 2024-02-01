@@ -42,6 +42,7 @@ int dpdk_recv(int sockfd, void *buf, size_t len, int flags);
 int dpdk_send(int sockfd, const void *buf, size_t len, int flags);
 int netwrap_get_local_hw(int sockfd);
 int netwrap_get_dst_hw(int sockfd, struct sockaddr_in *ia);
+int netwrap_create_mux_flow(void);
 
 void setup_socket_wrappers(void)
 {
@@ -279,6 +280,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 				sa->sin_addr.s_addr);
 			if (sa->sin_family == AF_INET) {
 				netwrap_collect_info(sockfd);
+				netwrap_create_mux_flow();
 			}
 		}
 	} else if (libc_bind) {
@@ -404,6 +406,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 				sa->sin_addr.s_addr);
 			if (sa->sin_family == AF_INET) {
 				netwrap_collect_info(sockfd);
+				netwrap_create_mux_flow();
 			}
 		}
 	} else if (libc_connect) {
