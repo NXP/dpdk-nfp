@@ -24,6 +24,8 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
 	if (IS_USECT_SOCKET((nfds - 1))) {
 		ECAT_DBG("DPDK select\n");
+		select_value = (*libc_select)(nfds, readfds, writefds,
+			exceptfds, timeout);
 	} else if (libc_select)
 		select_value = (*libc_select)(nfds, readfds, writefds,
 			exceptfds, timeout);

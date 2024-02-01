@@ -25,6 +25,8 @@ ssize_t sendfile64(int out_fd, int in_fd, off64_t *offset, size_t count)
 
 	if (IS_USECT_SOCKET(out_fd)) {
 		ECAT_DBG("DPDK sendfile\n");
+		sendfile_value = (*libc_sendfile64)(out_fd, in_fd,
+				offset, count);
 	} else if (libc_sendfile64)
 		sendfile_value = (*libc_sendfile64)(out_fd, in_fd,
 				offset, count);

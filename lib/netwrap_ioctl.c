@@ -30,17 +30,7 @@ int ioctl(int fd, unsigned long int request, ...)
 	if (IS_USECT_SOCKET(fd)) {
 		printf("DPDK IOCTL fd = %d, request = 0x%x\n",
 				fd, request);
-		if (request == SIOCGIFINDEX) {
-			struct ifreq *ifr = (struct ifreq *)data;
-			ifr->ifr_ifindex = 0;
-			ioctl_value = 0;
-		} else if (request == FIONBIO) {
-			ioctl_value = 0;
-		} else {
-			//errno = EINVAL;
-			//ioctl_value = -1;
-			ioctl_value = 0;
-		}
+		ioctl_value = (*libc_ioctl)(fd, request, data);
 	} else if (libc_ioctl) {
 		ECAT_DBG("libc_ioctl fd = %d, request = 0x%x\n",
 				fd, request);
