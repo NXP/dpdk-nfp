@@ -1,4 +1,4 @@
-set(ENV{PKG_CONFIG_PATH} /mnt/dpdk/install/lib/pkgconfig)
+set(ENV{PKG_CONFIG_PATH} ${DPDK_INSTALL}/lib/pkgconfig)
 find_package(PkgConfig REQUIRED)
 if (PKG_CONFIG_FOUND)
 	pkg_check_modules(DPDK REQUIRED "libdpdk")
@@ -7,16 +7,13 @@ if (PKG_CONFIG_FOUND)
 	endif()
 	add_definitions(${DPDK_STATIC_CFLAGS})
 	include_directories(${DPDK_INCLUDE_DIRS})
+	include_directories(${DPDK_INSTALL}/share/dpdk/examples/common/)
 	link_libraries(${DPDK_STATIC_LDFLAGS})
 endif()
 
 AUX_SOURCE_DIRECTORY(. SRC_LIST)
 
 ADD_LIBRARY(usect SHARED ${SRC_LIST})
-#TARGET_LINK_LIBRARIES(usect ${CMAKE_DL_LIBS} ${CMAKE_DPDK_LIB})
-#TARGET_INCLUDE_DIRECTORIES(usect PUBLIC ${CMAKE_DPDK_LIB_INCLUDE_DIRS})
 
 ADD_LIBRARY(usect_static STATIC ${SRC_LIST})
-#TARGET_LINK_LIBRARIES(usect_static ${CMAKE_DL_LIBS} ${CMAKE_DPDK_LIB})
-#TARGET_INCLUDE_DIRECTORIES(usect_static PUBLIC ${CMAKE_DPDK_LIB_INCLUDE_DIRS})
 SET_TARGET_PROPERTIES(usect_static PROPERTIES OUTPUT_NAME "usect")
