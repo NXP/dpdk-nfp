@@ -18,17 +18,6 @@
 
 #define RTE_LOGTYPE_pre_ld RTE_LOGTYPE_USER1
 
-/* record packet related info */
-struct packet_info {
-	bool flag;
-	rte_be16_t src_port;
-	rte_be16_t dst_port;
-	rte_be32_t src_ip;
-	rte_be32_t dst_ip;
-	uint8_t src_mac[RTE_ETHER_ADDR_LEN];
-	uint8_t dst_mac[RTE_ETHER_ADDR_LEN];
-};
-
 #ifndef RTLD_NEXT
 #define RTLD_NEXT	((void *) -1l)
 #endif
@@ -43,9 +32,17 @@ struct packet_info {
 		}					\
 	} while (0)
 
-#define OFP_SOCK_NUM_OFFSET 8192
-#define IS_OFP_SOCKET(_fd) (_fd >= OFP_SOCK_NUM_OFFSET)
-
-#define IS_USECT_SOCKET(_fd) (_fd == s_usect_sockfd)
+#define IS_USECT_SOCKET(_fd) \
+({ \
+	int usr_fd_found = 0, i; \
+	\
+	for (i = 0; i < (s_usr_fd_num); i++) { \
+		if (_fd == s_fd_usr[i]) { \
+			usr_fd_found = 1; \
+			break; \
+		} \
+	} \
+	usr_fd_found; \
+})
 
 #endif /* __NETWRAP_COMMON_H__ */
