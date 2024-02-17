@@ -65,7 +65,7 @@ static int s_eal_inited;
 static pthread_mutex_t s_eal_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *s_dpdmux_ep_name;
-static int s_dpdmux_id;
+static int s_dpdmux_id = -1;
 static int s_dpdmux_ep_id;
 
 static const char *s_eal_file_prefix;
@@ -216,6 +216,8 @@ static int s_pre_ld_quit;
 static uint16_t s_rx_port;
 static uint16_t s_tx_port;
 
+static int s_dpdmux_entry_index = -1;
+
 #define MAX_DEFAULT_FLOW_NUM 8
 struct rte_flow *s_default_flow[MAX_DEFAULT_FLOW_NUM];
 static uint16_t s_default_flow_num;
@@ -251,6 +253,22 @@ convert_ip_addr_to_str(char *str,
 	return 0;
 }
 
+static int
+eal_destroy_dpaa2_mux_flow(void)
+{
+	int ret;
+
+	if (s_dpdmux_entry_index < 0 || s_dpdmux_id < 0)
+		return 0;
+
+	ret = rte_pmd_dpaa2_mux_flow_destroy(s_dpdmux_id,
+		s_dpdmux_entry_index);
+	if (!ret)
+		s_dpdmux_entry_index = -1;
+
+	return ret;
+}
+
 static void eal_quit(void)
 {
 	uint16_t portid;
@@ -259,6 +277,11 @@ static void eal_quit(void)
 	s_pre_ld_quit = 1;
 	sleep(1);
 
+	ret = eal_destroy_dpaa2_mux_flow();
+	if (ret) {
+		RTE_LOG(INFO, pre_ld, "Destroy mux flow failed(%d)",
+			ret);
+	}
 	RTE_ETH_FOREACH_DEV(portid) {
 		RTE_LOG(INFO, pre_ld, "Closing port %d...", portid);
 		ret = rte_eth_dev_stop(portid);
@@ -1047,6 +1070,8 @@ eal_create_dpaa2_mux_flow(int dpdmux_id,
 		RTE_LOG(ERR, pre_ld,
 			"%s: MUX flow create failed(%d)\n",
 			__func__, ret);
+	} else {
+		s_dpdmux_entry_index = ret;
 	}
 
 	return ret >= 0 ? 0 : ret;
