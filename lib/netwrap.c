@@ -92,7 +92,6 @@ static int s_max_usr_fd = INVALID_SOCKFD;
 #define IPv4_HDR_LEN \
 	(sizeof(struct rte_ipv4_hdr) + UDP_HDR_LEN)
 
-
 static int (*libc_socket)(int, int, int);
 static int (*libc_shutdown)(int, int);
 static int (*libc_close)(int);
@@ -118,17 +117,22 @@ static int s_socket_dbg;
 /*
  * Configurable number of RX/TX ring descriptors
  */
+#define RTE_DPAA2_RX_DESC_MAX 8192
+
 #define RTE_TEST_RX_DESC_DEFAULT 1024
 #define RTE_TEST_TX_DESC_DEFAULT 1024
-static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
-static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
+static uint16_t s_dpaa2_nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
+static uint16_t s_nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
+static uint16_t s_nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 
-#define MAX_RX_QUEUE_PER_LCORE 16
-#define MAX_TX_QUEUE_PER_PORT 16
-
+#define MAX_QUEUES_PER_PORT 16
 static struct rte_eth_dev_tx_buffer *pre_tx_buf[RTE_MAX_ETHPORTS];
+static struct rte_ring *s_port_rxq_rings[RTE_MAX_ETHPORTS];
+static struct rte_ring *s_port_txq_rings[RTE_MAX_ETHPORTS];
+static uint16_t s_rxq_ids[RTE_MAX_ETHPORTS][MAX_QUEUES_PER_PORT];
+static uint16_t s_txq_ids[RTE_MAX_ETHPORTS][MAX_QUEUES_PER_PORT];
 
-static struct rte_eth_conf port_conf = {
+static struct rte_eth_conf s_port_conf = {
 	.rxmode = {0},
 	.txmode = {
 		.mq_mode = RTE_ETH_MQ_TX_NONE,
@@ -195,6 +199,10 @@ static void eal_quit(void)
 				ret, portid);
 		}
 		rte_eth_dev_close(portid);
+		rte_ring_free(s_port_rxq_rings[portid]);
+		s_port_rxq_rings[portid] = NULL;
+		rte_ring_free(s_port_txq_rings[portid]);
+		s_port_txq_rings[portid] = NULL;
 		RTE_LOG(INFO, pre_ld, " Done\n");
 	}
 
@@ -211,17 +219,23 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 	size_t length, offset;
 	char *pkt, *pdata;
 	struct rte_udp_hdr *udp_hdr;
+	uint16_t rxq_id;
 
 	RTE_SET_USED(sockfd);
 	RTE_SET_USED(flags);
 	portid = 0;
+
+	if (unlikely(!s_fd_desc[sockfd].rxq_id))
+		return 0;
+	rxq_id = *s_fd_desc[sockfd].rxq_id;
 
 	/* Workaround for rte_lcore_id return -1 due to changed pid. */
 	RTE_PER_LCORE(_lcore_id) = 0;
 
 	offset = sizeof(struct rte_ether_hdr) +
 		sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
-	nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, MAX_PKT_BURST);
+	nb_rx = rte_eth_rx_burst(portid, rxq_id,
+		pkts_burst, MAX_PKT_BURST);
 	for (i = 0, pdata = buf, total_bytes = 0; i < nb_rx; i++) {
 		pkt = rte_pktmbuf_mtod(pkts_burst[i], char *);
 		udp_hdr = (struct rte_udp_hdr *)(pkt
@@ -255,9 +269,14 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ip_hdr;
 	struct rte_udp_hdr *udp_hdr;
+	uint16_t txq_id;
 
 	RTE_SET_USED(sockfd);
 	RTE_SET_USED(flags);
+
+	if (unlikely(!s_fd_desc[sockfd].txq_id))
+		return 0;
+	txq_id = *s_fd_desc[sockfd].txq_id;
 
 #define ALLOC_RETRY_COUNT 10
 	for (cnt = 0; cnt < ALLOC_RETRY_COUNT; cnt++) {
@@ -266,9 +285,9 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 			break;
 	}
 	if (cnt == ALLOC_RETRY_COUNT) {
-		RTE_LOG(ERR, pre_ld,
-			"Sendto failed to allocate mbuf, cnt=%d\n", cnt);
-		return -1;
+		RTE_LOG(WARNING, pre_ld,
+			"Failed to allocate TX mbuf\n");
+		return 0;
 	}
 
 	/* Initialize the Ethernet header */
@@ -296,14 +315,14 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 		m->data_len = 60;
 	m->pkt_len = m->data_len;
 
-	sent = rte_eth_tx_burst(portid, 0, &m, 1);
+	sent = rte_eth_tx_burst(portid, txq_id, &m, 1);
 	if (likely(sent == 1)) {
 		s_pre_ld_stat[portid].tx++;
 		return len;
 	}
 
 	rte_pktmbuf_free(m);
-	return -1;
+	return 0;
 }
 
 #define MAX_ARGV_NUM 32
@@ -313,7 +332,9 @@ static int main_ctor(void)
 	int ret;
 	uint16_t nb_ports;
 	uint16_t nb_ports_available = 0;
-	uint16_t portid;
+	uint16_t portid, dpaa2_rxqs = 0;
+	struct rte_eth_conf port_conf[RTE_MAX_ETHPORTS];
+	struct rte_eth_dev_info dev_info[RTE_MAX_ETHPORTS];
 	size_t i, eal_argc;
 	char *eal_argv[MAX_ARGV_NUM];
 	const char *ep_name;
@@ -346,7 +367,7 @@ static int main_ctor(void)
 	if (!nb_ports)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
 
-	RTE_LOG(INFO, pre_ld, "%d Ethernet ports found.", nb_ports);
+	RTE_LOG(INFO, pre_ld, "%d Ethernet ports found.\n", nb_ports);
 
 	/* create the mbuf pool */
 	s_pre_ld_pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool",
@@ -355,41 +376,71 @@ static int main_ctor(void)
 	if (!s_pre_ld_pktmbuf_pool)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
-	/* Initialise each port */
+	for (i = 0; i < RTE_MAX_ETHPORTS; i++) {
+		rte_memcpy(&port_conf[i], &s_port_conf,
+			sizeof(s_port_conf));
+		memset(&dev_info[i], 0, sizeof(struct rte_eth_dev_info));
+	}
+
 	RTE_ETH_FOREACH_DEV(portid) {
-		struct rte_eth_rxconf rxq_conf;
-		struct rte_eth_txconf txq_conf;
-		struct rte_eth_conf local_port_conf = port_conf;
-		struct rte_eth_dev_info dev_info;
+		char ring_nm[RTE_MEMZONE_NAMESIZE];
 
 		nb_ports_available++;
 
 		/* init port */
 		RTE_LOG(INFO, pre_ld,
-			"Initializing port %u... ", portid);
+			"Configuring port %u... ", portid);
 
-		ret = rte_eth_dev_info_get(portid, &dev_info);
+		ret = rte_eth_dev_info_get(portid, &dev_info[portid]);
 		if (ret) {
 			rte_exit(EXIT_FAILURE,
 				"Error during getting device (port %u) info: %s\n",
 				portid, strerror(-ret));
 		}
 
-		if (dev_info.tx_offload_capa &
+		if (dev_info[portid].tx_offload_capa &
 			RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
-			local_port_conf.txmode.offloads |=
+			port_conf[portid].txmode.offloads |=
 				RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 		}
-		ret = rte_eth_dev_configure(portid, 1, 1,
-			&local_port_conf);
+		ret = rte_eth_dev_configure(portid,
+			dev_info[portid].max_rx_queues,
+			dev_info[portid].max_tx_queues,
+			&port_conf[portid]);
 		if (ret < 0) {
 			rte_exit(EXIT_FAILURE,
 				"Cannot configure device: err=%d, port=%u\n",
 				ret, portid);
 		}
+		if (rte_pmd_dpaa2_dev_is_dpaa2(portid))
+			dpaa2_rxqs += dev_info[portid].max_rx_queues;
+		RTE_LOG(INFO, pre_ld, "done:\n");
+	}
 
-		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &nb_rxd,
-				&nb_txd);
+	if (!nb_ports_available)
+		rte_exit(EXIT_FAILURE, "no port available\n");
+
+	if (dpaa2_rxqs &&
+		s_dpaa2_nb_rxd >= RTE_DPAA2_RX_DESC_MAX / dpaa2_rxqs)
+		s_dpaa2_nb_rxd = RTE_DPAA2_RX_DESC_MAX / dpaa2_rxqs;
+
+	/* Initialise each port */
+	RTE_ETH_FOREACH_DEV(portid) {
+		struct rte_eth_rxconf rxq_conf;
+		struct rte_eth_txconf txq_conf;
+		char ring_nm[RTE_MEMZONE_NAMESIZE];
+		uint16_t rxd;
+
+		/* init port */
+		RTE_LOG(INFO, pre_ld,
+			"Initializing port %u... ", portid);
+		if (rte_pmd_dpaa2_dev_is_dpaa2(portid))
+			rxd = s_dpaa2_nb_rxd;
+		else
+			rxd = s_nb_rxd;
+
+		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &rxd,
+				&s_nb_txd);
 		if (ret < 0) {
 			rte_exit(EXIT_FAILURE,
 				 "Adjust descriptors: err=%d, port=%u\n",
@@ -397,28 +448,32 @@ static int main_ctor(void)
 		}
 
 		/* init one RX queue */
-		rxq_conf = dev_info.default_rxconf;
-		rxq_conf.offloads = local_port_conf.rxmode.offloads;
-		ret = rte_eth_rx_queue_setup(portid, 0, nb_rxd,
-				rte_eth_dev_socket_id(portid),
-				&rxq_conf,
-				s_pre_ld_pktmbuf_pool);
-		if (ret < 0) {
-			rte_exit(EXIT_FAILURE,
-				"rte_eth_rx_queue_setup:err=%d, port=%u\n",
-				ret, portid);
+		rxq_conf = dev_info[portid].default_rxconf;
+		rxq_conf.offloads = port_conf[portid].rxmode.offloads;
+		for (i = 0; i < dev_info[portid].max_rx_queues; i++) {
+			ret = rte_eth_rx_queue_setup(portid, i, rxd,
+					rte_eth_dev_socket_id(portid),
+					&rxq_conf,
+					s_pre_ld_pktmbuf_pool);
+			if (ret < 0) {
+				rte_exit(EXIT_FAILURE,
+					"setup port%d:rxq[%d] failed(%d)\n",
+					portid, (int)i, ret);
+			}
 		}
 
 		/* init one TX queue on each port */
-		txq_conf = dev_info.default_txconf;
-		txq_conf.offloads = local_port_conf.txmode.offloads;
-		ret = rte_eth_tx_queue_setup(portid, 0, nb_txd,
-				rte_eth_dev_socket_id(portid),
-				&txq_conf);
-		if (ret < 0) {
-			rte_exit(EXIT_FAILURE,
-				"rte_eth_tx_queue_setup:err=%d, port=%u\n",
-				ret, portid);
+		txq_conf = dev_info[portid].default_txconf;
+		txq_conf.offloads = port_conf[portid].txmode.offloads;
+		for (i = 0; i < dev_info[portid].max_tx_queues; i++) {
+			ret = rte_eth_tx_queue_setup(portid, i, s_nb_txd,
+					rte_eth_dev_socket_id(portid),
+					&txq_conf);
+			if (ret < 0) {
+				rte_exit(EXIT_FAILURE,
+					"setup port%d:txq[%d] failed(%d)\n",
+					portid, (int)i, ret);
+			}
 		}
 
 		/* Initialize TX buffers */
@@ -468,6 +523,48 @@ static int main_ctor(void)
 
 		/* initialize port stats */
 		memset(&s_pre_ld_stat, 0, sizeof(s_pre_ld_stat));
+
+		sprintf(ring_nm, "port%d_rxq_ring",
+			portid);
+		s_port_rxq_rings[portid] = rte_ring_create(ring_nm,
+			MAX_USR_FD_NUM, 0, 0);
+		if (!s_port_rxq_rings[portid]) {
+			rte_exit(EXIT_FAILURE,
+				 "create %s with %d elems failed\n",
+				 ring_nm, dev_info[portid].max_rx_queues);
+		}
+		for (i = 0; i < dev_info[portid].max_rx_queues; i++) {
+			s_rxq_ids[portid][i] = i;
+			ret = rte_ring_enqueue(s_port_rxq_rings[portid],
+				&s_rxq_ids[portid][i]);
+			if (ret) {
+				RTE_LOG(ERR, pre_ld,
+					"eq s_rxq_ids[%d][%d] to %s failed\n",
+					portid, (int)i, ring_nm);
+				return ret;
+			}
+		}
+
+		sprintf(ring_nm, "port%d_txq_ring",
+			portid);
+		s_port_txq_rings[portid] = rte_ring_create(ring_nm,
+			MAX_USR_FD_NUM, 0, 0);
+		if (!s_port_txq_rings[portid]) {
+			rte_exit(EXIT_FAILURE,
+				 "create %s with %d elems failed\n",
+				 ring_nm, dev_info[portid].max_tx_queues);
+		}
+		for (i = 0; i < dev_info[portid].max_tx_queues; i++) {
+			s_txq_ids[portid][i] = i;
+			ret = rte_ring_enqueue(s_port_txq_rings[portid],
+				&s_txq_ids[portid][i]);
+			if (ret) {
+				RTE_LOG(ERR, pre_ld,
+					"eq s_txq_ids[%d][%d] to %s failed\n",
+					portid, (int)i, ring_nm);
+				return ret;
+			}
+		}
 
 		ep_name = rte_pmd_dpaa2_ep_name(portid);
 		if (ep_name) {
@@ -519,63 +616,46 @@ static int main_ctor(void)
 		s_downlink = NULL;
 	}
 
-	if (!nb_ports_available)
-		rte_exit(EXIT_FAILURE, "no port available\n");
-
 	return 0;
 }
 
 static int
-eal_create_dpaa2_mux_flow(int dpdmux_id,
-	int dpdmux_ep_id, const char *prot,
-	const char *field, uint64_t key)
+eal_create_flow_pattern(const char *prot,
+	const char *field, uint64_t key,
+	struct rte_flow_item pattern[],
+	void *spec, void *mask)
 {
-	int ret;
+	struct rte_flow_item_udp *udp_item = spec;
+	struct rte_flow_item_gtp *gtp_item = spec;
+	struct rte_flow_item_udp *udp_mask = mask;
+	struct rte_flow_item_gtp *gtp_mask = mask;
 	uint16_t key_16;
 	uint32_t key_32;
-	struct rte_flow_item pattern[2];
-	struct rte_flow_action actions[1];
-	struct rte_flow_action_vf vf;
-
-	struct rte_flow_item_udp udp_item;
-	struct rte_flow_item_gtp gtp_item;
-	struct rte_flow_item_udp udp_mask;
-	struct rte_flow_item_gtp gtp_mask;
-
-	memset(pattern, 0, sizeof(pattern));
-	memset(actions, 0, sizeof(actions));
-	memset(&vf, 0, sizeof(vf));
-	memset(&udp_item, 0, sizeof(udp_item));
-	memset(&gtp_item, 0, sizeof(gtp_item));
-	memset(&udp_mask, 0, sizeof(udp_mask));
-	memset(&gtp_mask, 0, sizeof(gtp_mask));
-
-	vf.id = dpdmux_ep_id;
 
 	if (prot && !strcmp(prot, "udp")) {
 		pattern[0].type = RTE_FLOW_ITEM_TYPE_UDP;
-		if (field && !strcmp(field, "dst")) {
-			pattern[0].spec = &udp_item;
-			pattern[0].mask = &udp_mask;
+		if (field && !strcmp(field, "src")) {
+			pattern[0].spec = udp_item;
+			pattern[0].mask = udp_mask;
 			key_16 = key;
-			udp_item.hdr.dst_port =
+			udp_item->hdr.src_port =
 				rte_cpu_to_be_16(key_16);
-			udp_mask.hdr.dst_port = 0xffff;
+			udp_mask->hdr.src_port = 0xffff;
 		} else if (field) {
 			RTE_LOG(WARNING, pre_ld,
-				"MUX UDP field(%s) not support\n",
+				"UDP field(%s) not support\n",
 				field);
 			return -ENOTSUP;
 		}
 	} else if (prot && !strcmp(prot, "gtp")) {
 		pattern[0].type = RTE_FLOW_ITEM_TYPE_GTP;
 		if (field && strcmp(field, "teid")) {
-			pattern[0].spec = &gtp_item;
-			pattern[0].mask = &gtp_mask;
+			pattern[0].spec = gtp_item;
+			pattern[0].mask = gtp_mask;
 			key_32 = key;
-			gtp_item.teid =
+			gtp_item->teid =
 				rte_cpu_to_be_32(key_32);
-			gtp_mask.teid = 0xffffffff;
+			gtp_mask->teid = 0xffffffff;
 		} else if (field) {
 			RTE_LOG(WARNING, pre_ld,
 				"MUX GTP field(%s) not support\n",
@@ -612,6 +692,43 @@ eal_create_dpaa2_mux_flow(int dpdmux_id,
 
 	pattern[1].type = RTE_FLOW_ITEM_TYPE_END;
 
+	return 0;
+}
+
+static int
+eal_create_dpaa2_mux_flow(int dpdmux_id,
+	int dpdmux_ep_id, const char *prot,
+	const char *field, uint64_t key)
+{
+	int ret;
+	uint16_t key_16;
+	uint32_t key_32;
+	struct rte_flow_item pattern[2];
+	struct rte_flow_action actions[1];
+	struct rte_flow_action_vf vf;
+
+	uint8_t spec[RTE_MAX(sizeof(struct rte_flow_item_udp),
+		sizeof(struct rte_flow_item_gtp)) + 16];
+	uint8_t mask[RTE_MAX(sizeof(struct rte_flow_item_udp),
+		sizeof(struct rte_flow_item_gtp)) + 16];
+
+	memset(pattern, 0, sizeof(pattern));
+	memset(actions, 0, sizeof(actions));
+	memset(&vf, 0, sizeof(vf));
+	memset(spec, 0, sizeof(spec));
+	memset(mask, 0, sizeof(mask));
+
+	vf.id = dpdmux_ep_id;
+
+	ret = eal_create_flow_pattern(prot, field, key,
+		pattern, spec, mask);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: flow pattern create failed(%d)\n",
+			__func__, ret);
+		return ret;
+	}
+
 	actions[0].type = RTE_FLOW_ACTION_TYPE_VF;
 	actions[0].conf = &vf;
 
@@ -627,12 +744,77 @@ eal_create_dpaa2_mux_flow(int dpdmux_id,
 }
 
 static int
-eal_create_flow(const char *prot,
-	const char *field, uint64_t key)
+eal_create_local_flow(int sockfd, uint16_t port_id,
+	const char *prot, const char *field, uint64_t key,
+	uint16_t rxq_id)
+{
+	int ret;
+	uint16_t key_16;
+	uint32_t key_32;
+	struct rte_flow_item pattern[2];
+	struct rte_flow_action actions[1];
+	struct rte_flow_action_queue ingress_queue;
+	struct rte_flow_action flow_action[2];
+	struct rte_flow_attr attr;
+	struct rte_flow *flow;
+
+	uint8_t spec[RTE_MAX(sizeof(struct rte_flow_item_udp),
+		sizeof(struct rte_flow_item_gtp)) + 16];
+	uint8_t mask[RTE_MAX(sizeof(struct rte_flow_item_udp),
+		sizeof(struct rte_flow_item_gtp)) + 16];
+
+	memset(pattern, 0, sizeof(pattern));
+	memset(actions, 0, sizeof(actions));
+	memset(spec, 0, sizeof(spec));
+	memset(mask, 0, sizeof(mask));
+
+	ret = eal_create_flow_pattern(prot, field, key,
+		pattern, spec, mask);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: flow pattern create failed(%d)\n",
+			__func__, ret);
+		return ret;
+	}
+
+	memset(&ingress_queue, 0,
+		sizeof(struct rte_flow_action_queue));
+	ingress_queue.index = rxq_id;
+	flow_action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+	flow_action[0].conf = &ingress_queue;
+	flow_action[1].type = RTE_FLOW_ACTION_TYPE_END;
+
+	attr.group = 0;
+	attr.priority = rxq_id;
+	attr.ingress = 1;
+	attr.egress = 0;
+
+	flow = rte_flow_create(port_id, &attr, pattern,
+			flow_action, NULL);
+	if (!flow) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: flow create failed\n", __func__);
+		return -EIO;
+	}
+
+	s_fd_desc[sockfd].flow = flow;
+
+	return 0;
+}
+
+static int
+eal_create_flow(int sockfd, uint16_t port_id,
+	const char *prot, const char *field, uint64_t key)
 {
 	char config_str[256];
 	int ret;
+	uint16_t rxq_id;
 	static int created;
+
+	if (!s_fd_desc[sockfd].rxq_id)
+		return -EIO;
+
+	rxq_id = *s_fd_desc[sockfd].rxq_id;
 
 	if (created) {
 		RTE_LOG(WARNING, pre_ld,
@@ -641,10 +823,19 @@ eal_create_flow(const char *prot,
 		return 0;
 	}
 
-	if (s_dpdmux_ep_name) {
-		return eal_create_dpaa2_mux_flow(s_dpdmux_id,
-				s_dpdmux_ep_id, prot, field, key);
+	if (s_dpdmux_ep_name && !created) {
+		ret = eal_create_dpaa2_mux_flow(s_dpdmux_id,
+				s_dpdmux_ep_id, prot, NULL, 0);
+		if (ret)
+			return ret;
+
+		created = 1;
+
+		goto create_local_flow;
 	}
+
+	if (created)
+		goto create_local_flow;
 
 	if (!s_uplink) {
 		RTE_LOG(ERR, pre_ld,
@@ -660,15 +851,26 @@ eal_create_flow(const char *prot,
 	}
 
 	sprintf(config_str,
-		"(%s, %s, %s, %s, 0x%lx)",
-		s_uplink, s_downlink, prot, field, key);
+		"(%s, %s, %s)", s_uplink, s_downlink, prot);
 
 	ret = rte_remote_direct_parse_config(config_str, 1);
 	if (ret)
 		return ret;
 	ret = rte_remote_direct_traffic(RTE_REMOTE_DIR_REQ);
-	if (!ret)
-		created = 1;
+	if (ret)
+		return ret;
+
+	created = 1;
+
+create_local_flow:
+
+	ret = eal_create_local_flow(sockfd, port_id,
+		prot, field, key, rxq_id);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"Port(%d) flow create failed(%d)\n",
+			port_id, ret);
+	}
 
 	return ret;
 }
@@ -718,6 +920,26 @@ usr_socket_fd_desc_init(int sockfd, int portid)
 	s_fd_desc[sockfd].fd = sockfd;
 	socket_hdr_init(&s_fd_desc[sockfd].hdr);
 
+	ret = rte_ring_dequeue(s_port_rxq_rings[portid],
+		(void **)&s_fd_desc[sockfd].rxq_id);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"port%d: No RXQ available for socket(%d)\n",
+			portid, sockfd);
+
+		goto quit;
+	}
+
+	ret = rte_ring_dequeue(s_port_txq_rings[portid],
+		(void **)&s_fd_desc[sockfd].txq_id);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"port%d: No RXQ available for socket(%d)\n",
+			portid, sockfd);
+
+		goto quit;
+	}
+
 	s_fd_usr[s_usr_fd_num] = sockfd;
 	s_usr_fd_num++;
 	if (s_max_usr_fd < 0)
@@ -738,6 +960,44 @@ usr_socket_fd_release(int sockfd, int portid)
 
 	pthread_mutex_lock(&s_fd_mutex);
 	s_fd_desc[sockfd].fd = INVALID_SOCKFD;
+
+	if (s_fd_desc[sockfd].rxq_id) {
+		ret_tmp = rte_ring_enqueue(s_port_rxq_rings[portid],
+					s_fd_desc[sockfd].rxq_id);
+		if (ret_tmp) {
+			RTE_LOG(ERR, pre_ld,
+				"%s release *s_fd_desc[%d].rxq_id(%d) failed(%d)\n",
+				__func__, sockfd,
+				*s_fd_desc[sockfd].rxq_id, ret_tmp);
+			ret = ret_tmp;
+		}
+	}
+	s_fd_desc[sockfd].rxq_id = NULL;
+
+	if (s_fd_desc[sockfd].txq_id) {
+		ret_tmp = rte_ring_enqueue(s_port_txq_rings[portid],
+					s_fd_desc[sockfd].txq_id);
+		if (ret_tmp) {
+			RTE_LOG(ERR, pre_ld,
+				"%s release *s_fd_desc[%d].txq_id(%d) failed(%d)\n",
+				__func__, sockfd,
+				*s_fd_desc[sockfd].txq_id, ret_tmp);
+			ret = ret_tmp;
+		}
+	}
+	s_fd_desc[sockfd].txq_id = NULL;
+
+	if (s_fd_desc[sockfd].flow) {
+		ret_tmp = rte_flow_destroy(portid,
+				s_fd_desc[sockfd].flow, NULL);
+		if (ret_tmp) {
+			RTE_LOG(ERR, pre_ld,
+				"%s free s_fd_desc[%d].flow(%p) failed(%d)\n",
+				__func__, sockfd,
+				s_fd_desc[sockfd].flow, ret_tmp);
+			ret = ret_tmp;
+		}
+	}
 
 	for (i = 0; i < s_usr_fd_num; i++) {
 		if (s_fd_usr[i] == sockfd &&
@@ -941,8 +1201,8 @@ close(int sockfd)
 		ret = usr_socket_fd_release(sockfd, 0);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
-				"%s Failed(%d) release socket fd:%d\n",
-				__func__, ret, sockfd);
+				"%s release sockfd(%d) failed\n",
+				__func__, sockfd);
 		}
 	} else if (libc_close) {
 		close_value = (*libc_close)(sockfd);
@@ -1213,7 +1473,8 @@ bind(int sockfd, const struct sockaddr *addr,
 				ntohs(sa->sin_port), ipaddr_str);
 
 			netwrap_collect_info(sockfd);
-			bind_value = eal_create_flow("udp", "dst",
+			bind_value = eal_create_flow(sockfd, 0,
+				"udp", "src",
 				ntohs(sa->sin_port));
 		}
 	} else if (libc_bind) {
@@ -1306,7 +1567,8 @@ connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 				ntohs(sa->sin_port), ipaddr_str);
 
 			netwrap_collect_info(sockfd);
-			connect_value = eal_create_flow("udp", "dst",
+			connect_value = eal_create_flow(sockfd, 0,
+				"udp", "src",
 				ntohs(sa->sin_port));
 		}
 	} else if (libc_connect) {
@@ -1485,13 +1747,41 @@ ioctl(int fd, unsigned long request, ...)
 	return ioctl_value;
 }
 
+static int usr_fd_is_set(fd_set *fds)
+{
+	int i;
+
+	for (i = 0; i < s_usr_fd_num; i++) {
+		if (FD_ISSET(s_fd_usr[i], fds))
+			return true;
+	}
+
+	return false;
+}
+
+static int usr_fd_set(fd_set *fds)
+{
+	int i;
+
+	for (i = 0; i < s_usr_fd_num; i++)
+		FD_SET(s_fd_usr[i], fds);
+}
+
 int select(int nfds, fd_set *readfds, fd_set *writefds,
 	fd_set *exceptfds, struct timeval *timeout)
 {
 	int select_value;
 
-	if ((s_max_usr_fd >= 0 && s_max_usr_fd < nfds) &&
-		readfds && FD_ISSET(s_max_usr_fd, readfds)) {
+	if (s_socket_dbg) {
+		RTE_LOG(INFO, pre_ld,
+			"%s starts: nfds:%d, libc_select:%p\n",
+			__func__, nfds, libc_select);
+		dump_usr_fd(__func__);
+	}
+
+	if ((s_max_usr_fd >= 0
+		&& s_max_usr_fd < nfds) &&
+		readfds && usr_fd_is_set(readfds)) {
 		if (!libc_select) {
 			LIBC_FUNCTION(select);
 			if (!libc_select) {
@@ -1504,12 +1794,12 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 		select_value = (*libc_select)(nfds, readfds, writefds,
 			exceptfds, timeout);
 		if (select_value > 0) {
-			FD_SET(s_max_usr_fd, readfds);
+			usr_fd_set(readfds);
 
 			return select_value;
 		}
 		if (readfds)
-			FD_SET(s_max_usr_fd, readfds);
+			usr_fd_set(readfds);
 		/* Here assume there is always data arriving. */
 		select_value = 1;
 	} else if (libc_select)
