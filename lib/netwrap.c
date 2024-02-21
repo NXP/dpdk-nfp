@@ -150,7 +150,8 @@ static struct rte_eth_conf s_port_conf = {
 	},
 };
 
-struct rte_mempool *s_pre_ld_pktmbuf_pool;
+static struct rte_mempool *s_pre_ld_rx_pool;
+static struct rte_mempool *s_pre_ld_tx_pool;
 
 enum pre_ld_port_type {
 	NULL_TYPE = 0,
@@ -219,7 +220,7 @@ static uint16_t s_tx_port;
 static int s_dpdmux_entry_index = -1;
 
 #define MAX_DEFAULT_FLOW_NUM 8
-struct rte_flow *s_default_flow[MAX_DEFAULT_FLOW_NUM];
+static struct rte_flow *s_default_flow[MAX_DEFAULT_FLOW_NUM];
 static uint16_t s_default_flow_num;
 
 static inline int
@@ -371,7 +372,7 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 
 #define ALLOC_RETRY_COUNT 10
 	for (cnt = 0; cnt < ALLOC_RETRY_COUNT; cnt++) {
-		m = rte_pktmbuf_alloc(s_pre_ld_pktmbuf_pool);
+		m = rte_pktmbuf_alloc(s_pre_ld_tx_pool);
 		if (m)
 			break;
 	}
@@ -748,11 +749,18 @@ static int eal_main(void)
 	RTE_LOG(INFO, pre_ld, "%d Ethernet ports found.\n", nb_ports);
 
 	/* create the mbuf pool */
-	s_pre_ld_pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool",
+	s_pre_ld_rx_pool = rte_pktmbuf_pool_create("rx_pool",
 		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE, 0,
 		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-	if (!s_pre_ld_pktmbuf_pool)
-		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+	if (!s_pre_ld_rx_pool)
+		rte_exit(EXIT_FAILURE, "Cannot init rx pool\n");
+
+	s_pre_ld_tx_pool = rte_pktmbuf_pool_create_by_ops("tx_pool",
+		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE, 0,
+		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id(),
+		RTE_MBUF_DEFAULT_MEMPOOL_OPS);
+	if (!s_pre_ld_tx_pool)
+		rte_exit(EXIT_FAILURE, "Cannot init tx pool\n");
 
 	for (i = 0; i < RTE_MAX_ETHPORTS; i++) {
 		rte_memcpy(&port_conf[i], &s_port_conf,
@@ -851,7 +859,7 @@ static int eal_main(void)
 			ret = rte_eth_rx_queue_setup(portid, i, rxd,
 					rte_eth_dev_socket_id(portid),
 					&rxq_conf,
-					s_pre_ld_pktmbuf_pool);
+					s_pre_ld_rx_pool);
 			if (ret < 0) {
 				rte_exit(EXIT_FAILURE,
 					"setup port%d:rxq[%d] failed(%d)\n",
@@ -1568,7 +1576,9 @@ socket(int domain, int type, int protocol)
 		}
 	}
 
-	RTE_LOG(INFO, pre_ld, "Socket FD(%d) created.\n", sockfd);
+	RTE_LOG(INFO, pre_ld,
+		"Socket FD(%d) created, domain=%d, type=%d, protocol=%d\n",
+		sockfd, domain, type, protocol);
 
 	return sockfd;
 }
@@ -2233,10 +2243,10 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 			usr_fd_set(readfds);
 		/* Here assume there is always data arriving. */
 		select_value = 1;
-	} else if (libc_select)
+	} else if (libc_select) {
 		select_value = (*libc_select)(nfds, readfds, writefds,
 			exceptfds, timeout);
-	else {
+	} else {
 		LIBC_FUNCTION(select);
 
 		if (libc_select) {
