@@ -64,6 +64,9 @@ static int s_socket_pre_set;
 static int s_eal_inited;
 static pthread_mutex_t s_eal_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static uint16_t s_cpu_start = 1;
+#define SYS_CORE_ID 0
+
 static const char *s_dpdmux_ep_name;
 static int s_dpdmux_id = -1;
 static int s_dpdmux_ep_id;
@@ -72,6 +75,8 @@ static const char *s_eal_file_prefix;
 static const char *s_uplink;
 static const char *s_slow_if;
 static const char *s_downlink;
+
+static pthread_t s_main_td;
 
 #define MAX_USR_FD_NUM 1024
 
@@ -83,6 +88,8 @@ struct eth_ipv4_udp_hdr {
 
 struct fd_desc {
 	int fd;
+	int cpu;
+	pthread_t thread;
 	struct eth_ipv4_udp_hdr hdr;
 	uint16_t rx_port;
 	uint16_t *rxq_id;
@@ -305,6 +312,63 @@ static void eal_quit(void)
 }
 
 static int
+eal_data_path_thread_register(struct fd_desc *desc)
+{
+	int ret, cpu, new_cpu, lcore;
+	rte_cpuset_t cpuset;
+	pthread_t thread = pthread_self();
+
+	cpu = sched_getcpu();
+	if (likely((desc->cpu == cpu &&
+		thread == desc->thread) ||
+		thread == s_main_td))
+		return 0;
+
+register_again:
+	ret = rte_thread_register();
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"Register thread(%ld) of FD(%d) Failed(%d)\n",
+			pthread_self(), desc->fd, ret);
+			return ret;
+	}
+
+	lcore = rte_lcore_id();
+	if (lcore == SYS_CORE_ID ||
+		lcore == s_data_path_core) {
+		RTE_LOG(WARNING, pre_ld,
+			"Skip core%d = sys core(%d) or data core(%d)\n",
+			lcore, SYS_CORE_ID, s_data_path_core);
+		goto register_again;
+	}
+	CPU_ZERO(&cpuset);
+	CPU_SET(rte_lcore_id(), &cpuset);
+	ret = pthread_setaffinity_np(pthread_self(),
+		sizeof(cpu_set_t), &cpuset);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"Set affinity(TD(%ld) FD(%d)) Failed(%d)\n",
+			pthread_self(), desc->fd, ret);
+		return ret;
+	}
+	new_cpu = sched_getcpu();
+	if (new_cpu != (int)rte_lcore_id()) {
+		RTE_LOG(ERR, pre_ld,
+			"Register thread(%ld) of FD(%d) cpu(%d) != RTE cpu(%d)\n",
+			pthread_self(), desc->fd, new_cpu, rte_lcore_id());
+
+		return -EINVAL;
+	}
+	desc->cpu = new_cpu;
+	desc->thread = pthread_self();
+	RTE_LOG(INFO, pre_ld,
+		"Register thread(%ld) of FD(%d) from cpu(%d) to cpu(%d)\n",
+		pthread_self(), desc->fd, cpu, desc->cpu);
+
+	return 0;
+}
+
+static int
 eal_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
@@ -313,13 +377,14 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 	char *pkt, *pdata;
 	struct rte_udp_hdr *udp_hdr;
 	uint16_t rxq_id;
+	int ret;
 
 	RTE_SET_USED(sockfd);
 	RTE_SET_USED(flags);
 
-	if (unlikely(!s_fd_desc[sockfd].rxq_id))
-		return 0;
-	rxq_id = *s_fd_desc[sockfd].rxq_id;
+	ret = eal_data_path_thread_register(&s_fd_desc[sockfd]);
+	if (ret)
+		return ret;
 
 	offset = sizeof(struct rte_ether_hdr) +
 		sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
@@ -327,6 +392,9 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 		nb_rx = rte_ring_dequeue_burst(s_fd_desc[sockfd].rx_ring,
 				(void **)pkts_burst, MAX_PKT_BURST, NULL);
 	} else {
+		if (unlikely(!s_fd_desc[sockfd].rxq_id))
+			return -EIO;
+		rxq_id = *s_fd_desc[sockfd].rxq_id;
 		nb_rx = rte_eth_rx_burst(s_fd_desc[sockfd].rx_port,
 				rxq_id, pkts_burst, MAX_PKT_BURST);
 	}
@@ -356,7 +424,7 @@ static int
 eal_send(int sockfd, const void *buf, size_t len, int flags)
 {
 	struct rte_mbuf *m;
-	int sent, cnt;
+	int sent, cnt, ret;
 	void *udp_data;
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ip_hdr;
@@ -366,9 +434,9 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 	RTE_SET_USED(sockfd);
 	RTE_SET_USED(flags);
 
-	if (unlikely(!s_fd_desc[sockfd].txq_id))
-		return 0;
-	txq_id = *s_fd_desc[sockfd].txq_id;
+	ret = eal_data_path_thread_register(&s_fd_desc[sockfd]);
+	if (ret)
+		return ret;
 
 #define ALLOC_RETRY_COUNT 10
 	for (cnt = 0; cnt < ALLOC_RETRY_COUNT; cnt++) {
@@ -412,12 +480,16 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 		if (!sent)
 			sent = 1;
 	} else {
+		if (unlikely(!s_fd_desc[sockfd].txq_id))
+			goto send_err;
+		txq_id = *s_fd_desc[sockfd].txq_id;
 		sent = rte_eth_tx_burst(s_fd_desc[sockfd].tx_port,
 			txq_id, &m, 1);
 	}
 	if (likely(sent == 1))
 		return len;
 
+send_err:
 	rte_pktmbuf_free(m);
 	return 0;
 }
@@ -706,24 +778,22 @@ static int eal_main(void)
 	char func_nm[64], s_cpu[32], s_cpu_mask[32];
 	char s_file_prefix[32], s_file_prefix_val[32];
 	uint16_t ext_id = 0, ul_id = 0, dl_id = 0, tap_id = 0;
-	uint32_t cpu, cpu_mask;
-
-	RTE_LOG(INFO, pre_ld, "%s: Start!\n", __func__);
+	uint32_t cpu_mask;
 
 	sprintf(func_nm, "%s", __func__);
 	eal_argv[eal_argc] = func_nm;
 	eal_argc++;
-	cpu = sched_getcpu();
-	if (is_cpu_detected(cpu + 1))
-		cpu_mask = (1 << cpu) | (1 << (cpu + 1));
-	else
-		cpu_mask = (1 << (cpu - 1)) | (1 << cpu);
+	/** One is main and another is data path thread probably.*/
+	cpu_mask = (1 << s_cpu_start) | (1 << (s_cpu_start + 1));
+
 	sprintf(s_cpu, "-c");
 	eal_argv[eal_argc] = s_cpu;
 	eal_argc++;
+
 	sprintf(s_cpu_mask, "0x%x", cpu_mask);
 	eal_argv[eal_argc] = s_cpu_mask;
 	eal_argc++;
+
 	if (s_eal_file_prefix) {
 		sprintf(s_file_prefix, "--file-prefix");
 		eal_argv[eal_argc] = s_file_prefix;
@@ -738,9 +808,12 @@ static int eal_main(void)
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
 
+	s_main_td = pthread_self();
+
 	RTE_LOG(INFO, pre_ld,
-		"start from core%d, eal main core is %d\n",
-		cpu, rte_get_main_lcore());
+		"Main core%d, current core%d, CPU mask is 0x%08x\n",
+		rte_get_main_lcore(), sched_getcpu(),
+		cpu_mask);
 
 	nb_ports = rte_eth_dev_count_avail();
 	if (!nb_ports)
@@ -755,10 +828,16 @@ static int eal_main(void)
 	if (!s_pre_ld_rx_pool)
 		rte_exit(EXIT_FAILURE, "Cannot init rx pool\n");
 
-	s_pre_ld_tx_pool = rte_pktmbuf_pool_create_by_ops("tx_pool",
-		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE, 0,
-		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id(),
-		RTE_MBUF_DEFAULT_MEMPOOL_OPS);
+	if (getenv("TX_FROM_RX_POOL")) {
+		s_pre_ld_tx_pool = s_pre_ld_rx_pool;
+		RTE_LOG(INFO, pre_ld,
+			"Using single pool for TX/RX\n");
+	} else {
+		s_pre_ld_tx_pool = rte_pktmbuf_pool_create_by_ops("tx_pool",
+			MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE, 0,
+			RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id(),
+			RTE_MBUF_DEFAULT_MEMPOOL_OPS);
+	}
 	if (!s_pre_ld_tx_pool)
 		rte_exit(EXIT_FAILURE, "Cannot init tx pool\n");
 
@@ -1317,6 +1396,7 @@ usr_socket_fd_desc_init(int sockfd,
 		s_max_usr_fd = sockfd;
 
 	s_fd_desc[sockfd].fd = sockfd;
+	s_fd_desc[sockfd].cpu = -1;
 
 quit:
 	if (ret) {
@@ -2271,25 +2351,36 @@ __attribute__((destructor)) static void netwrap_main_dtor(void)
 
 __attribute__((constructor(65535))) static void setup_wrappers(void)
 {
-	char *pre_ld_env = getenv("PRE_LOAD_WAPPERS");
-	char *log_env = getenv("NET_WRAP_LOG");
+	char *env;
 	int i;
 
 	s_uplink = getenv("uplink_name");
 	s_eal_file_prefix = getenv("file_prefix");
 	s_slow_if = getenv("eth_name");
 	if (!s_slow_if) {
-		RTE_LOG(ERR, pre_ld,
+		rte_exit(EXIT_FAILURE,
 			"slow interface(kernel) not specified!\n");
-
-		exit(EXIT_FAILURE);
 	}
 
-	RTE_LOG(INFO, pre_ld, "%s: pre_ld_env:%p\n",
-		__func__, pre_ld_env);
-
-	if (log_env)
+	if (getenv("NET_WRAP_LOG"))
 		s_socket_dbg = 1;
+
+	env = getenv("PRE_LOAD_WRAP_CPU_START");
+	if (env)
+		s_cpu_start = atoi(env);
+
+	if (!is_cpu_detected(s_cpu_start) ||
+		!is_cpu_detected(s_cpu_start + 1)) {
+		rte_exit(EXIT_FAILURE,
+			"CPUs(%d, %d) not detected!\n",
+			s_cpu_start, s_cpu_start + 1);
+	}
+	if (s_cpu_start == SYS_CORE_ID ||
+		(s_cpu_start + 1) == SYS_CORE_ID) {
+		rte_exit(EXIT_FAILURE,
+			"CPUs(%d, %d) conflict with sys core(%d)!\n",
+			s_cpu_start, s_cpu_start + 1, SYS_CORE_ID);
+	}
 
 	s_fd_desc = malloc(sizeof(struct fd_desc) * MAX_USR_FD_NUM);
 	if (!s_fd_desc) {
@@ -2305,9 +2396,6 @@ __attribute__((constructor(65535))) static void setup_wrappers(void)
 		s_fd_desc[i].txq_id = NULL;
 		s_fd_desc[i].flow = NULL;
 	}
-
-	if (!pre_ld_env)
-		return;
 
 	LIBC_FUNCTION(socket);
 	LIBC_FUNCTION(shutdown);
