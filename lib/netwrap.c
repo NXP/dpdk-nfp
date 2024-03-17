@@ -92,6 +92,13 @@ struct eth_ipv4_udp_hdr {
 	struct rte_udp_hdr udp_hdr;
 } __rte_packed;
 
+struct pre_ld_rx_pool {
+	struct rte_mbuf **rx_bufs;
+	uint16_t max_num;
+	uint16_t head;
+	uint16_t tail;
+};
+
 struct fd_desc {
 	int fd;
 	int cpu;
@@ -105,11 +112,17 @@ struct fd_desc {
 	struct rte_ring *tx_ring;
 	void *flow;
 	struct rte_mempool *tx_pool;
+	struct pre_ld_rx_pool rx_buffer;
 
 	uint64_t tx_count;
 	uint64_t tx_pkts;
 	uint64_t tx_oh_bytes;
 	uint64_t tx_usr_bytes;
+
+	uint64_t rx_count;
+	uint64_t rx_pkts;
+	uint64_t rx_oh_bytes;
+	uint64_t rx_usr_bytes;
 };
 
 pthread_mutex_t s_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -268,6 +281,11 @@ static uint16_t s_default_flow_num;
 
 static int s_data_path_core = -1;
 
+struct pre_ld_udp_desc {
+	uint16_t offset;
+	uint16_t length;
+} __rte_packed;
+
 static inline int
 convert_ip_addr_to_str(char *str,
 	const void *_addr, uint8_t len)
@@ -413,51 +431,176 @@ register_again:
 }
 
 static int
+pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
+{
+	int ret;
+	uint8_t l4_offset = 0;
+	struct rte_udp_hdr *udp_hdr;
+	uint16_t length;
+	struct pre_ld_udp_desc *desc;
+	struct rte_udp_hdr *flow_hdr = &s_fd_desc[sockfd].hdr.udp_hdr;
+
+	ret = rte_pmd_dpaa2_rx_get_offset(mbuf,
+			NULL, &l4_offset, NULL);
+	if (unlikely(ret))
+		return ret;
+
+	if (unlikely(l4_offset != offsetof(struct eth_ipv4_udp_hdr,
+		udp_hdr))) {
+		RTE_LOG(WARNING, pre_ld,
+			"UDP offset = %d, IPV6 or tunnel frame?\n",
+			l4_offset);
+	}
+
+	udp_hdr = rte_pktmbuf_mtod_offset(mbuf, void *, l4_offset);
+	if (unlikely(udp_hdr->src_port != flow_hdr->dst_port ||
+		udp_hdr->dst_port != flow_hdr->src_port)) {
+		RTE_LOG(WARNING, pre_ld,
+			"UDP RX ERR(src %04x!=%04x, dst %04x!=%04x).\n",
+			udp_hdr->src_port, flow_hdr->src_port,
+			udp_hdr->dst_port, flow_hdr->dst_port);
+	}
+	length = rte_be_to_cpu_16(udp_hdr->dgram_len) -
+		sizeof(struct rte_udp_hdr);
+	desc = (struct pre_ld_udp_desc *)udp_hdr - 1;
+	desc->offset = sizeof(struct pre_ld_udp_desc) +
+		sizeof(struct rte_udp_hdr);
+	desc->length = length;
+	mbuf->data_off = (uint16_t)((uint8_t *)desc -
+		(uint8_t *)mbuf->buf_addr);
+
+	return 0;
+}
+
+static int
 eal_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
-	uint32_t nb_rx, i, total_bytes = 0;
-	size_t length, offset;
-	char *pkt, *pdata;
-	struct rte_udp_hdr *udp_hdr;
+	struct rte_mbuf *free_burst[MAX_PKT_BURST];
+	struct rte_mbuf *mbuf;
+	uint32_t nb_rx, i, total_bytes = 0, j;
+	size_t length, remain = len;
+	struct pre_ld_udp_desc *desc;
 	uint16_t rxq_id;
 	int ret;
+	uint8_t *buf_u8 = buf, *pkt;
+	struct pre_ld_rx_pool *rx_pool = &s_fd_desc[sockfd].rx_buffer;
 
-	RTE_SET_USED(sockfd);
 	RTE_SET_USED(flags);
 
 	ret = eal_data_path_thread_register(&s_fd_desc[sockfd]);
 	if (ret)
 		return ret;
 
-	offset = sizeof(struct rte_ether_hdr) +
-		sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
+	i = 0;
+	while (rx_pool->head != rx_pool->tail &&
+		total_bytes < len) {
+		mbuf = rx_pool->rx_bufs[rx_pool->head];
+		desc = rte_pktmbuf_mtod(mbuf, void *);
+		length = desc->length;
+		pkt = ((uint8_t *)desc + desc->offset);
+		if (length <= remain) {
+			rte_memcpy(&buf_u8[total_bytes], pkt, length);
+			s_fd_desc[sockfd].rx_usr_bytes += length;
+			remain -= length;
+			total_bytes += length;
+			free_burst[i] = mbuf;
+			i++;
+			rx_pool->rx_bufs[rx_pool->head] = NULL;
+			rx_pool->head = (rx_pool->head + 1) &
+				(rx_pool->max_num - 1);
+		} else {
+			rte_memcpy(&buf_u8[total_bytes], pkt, remain);
+			s_fd_desc[sockfd].rx_usr_bytes += remain;
+			remain = 0;
+			total_bytes += remain;
+			desc->offset += remain;
+			desc->length -= remain;
+		}
+		if (i == MAX_PKT_BURST) {
+			rte_pktmbuf_free_bulk(free_burst, i);
+			i = 0;
+		}
+	}
+
+	if (i > 0)
+		rte_pktmbuf_free_bulk(free_burst, i);
+
+	if (!remain)
+		goto finsh_recv;
+
 	if (s_fd_desc[sockfd].rx_ring) {
 		nb_rx = rte_ring_dequeue_burst(s_fd_desc[sockfd].rx_ring,
 				(void **)pkts_burst, MAX_PKT_BURST, NULL);
 	} else {
-		if (unlikely(!s_fd_desc[sockfd].rxq_id))
+		if (unlikely(!s_fd_desc[sockfd].rxq_id)) {
+			RTE_LOG(ERR, pre_ld,
+				"Socket(%d): rxq not initialized!\n", sockfd);
 			return -EIO;
+		}
 		rxq_id = *s_fd_desc[sockfd].rxq_id;
 		nb_rx = rte_eth_rx_burst(s_fd_desc[sockfd].rx_port,
 				rxq_id, pkts_burst, MAX_PKT_BURST);
 	}
-	for (i = 0, pdata = buf, total_bytes = 0; i < nb_rx; i++) {
-		pkt = rte_pktmbuf_mtod(pkts_burst[i], char *);
-		udp_hdr = (struct rte_udp_hdr *)(pkt
-			+ sizeof(struct rte_ether_hdr)
-			+ sizeof(struct rte_ipv4_hdr));
-		length = rte_be_to_cpu_16(udp_hdr->dgram_len)
-				- sizeof(struct rte_udp_hdr);
-
-		if (len >= length) {
-			rte_memcpy(pdata, pkt + offset, length);
-			pdata += length;
-			len -= length;
+	for (i = 0; i < nb_rx; i++) {
+		s_fd_desc[sockfd].rx_oh_bytes +=
+			pkts_burst[i]->pkt_len +
+			RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+	}
+	s_fd_desc[sockfd].rx_pkts += nb_rx;
+	s_fd_desc[sockfd].rx_count++;
+	if (!nb_rx)
+		goto finsh_recv;
+	j = 0;
+	for (i = 0; i < nb_rx; i++) {
+		ret = pre_ld_adjust_rx_l4_info(sockfd, pkts_burst[i]);
+		if (unlikely(ret))
+			break;
+		desc = rte_pktmbuf_mtod(pkts_burst[i], void *);
+		pkt = (uint8_t *)desc + desc->offset;
+		length = desc->length;
+		if (remain >= length) {
+			rte_memcpy(&buf_u8[total_bytes], pkt, length);
+			s_fd_desc[sockfd].rx_usr_bytes += length;
+			remain -= length;
 			total_bytes += length;
+			free_burst[j] = pkts_burst[i];
+			j++;
+		} else {
+			rte_memcpy(&buf_u8[total_bytes], pkt, remain);
+			s_fd_desc[sockfd].rx_usr_bytes += remain;
+			remain = 0;
+			total_bytes += remain;
+			desc->offset += remain;
+			desc->length -= remain;
+			rx_pool->rx_bufs[rx_pool->tail] = pkts_burst[i];
+			rx_pool->tail = (rx_pool->tail + 1) &
+				(rx_pool->max_num - 1);
+			i++;
+
+			break;
 		}
 	}
-	rte_pktmbuf_free_bulk(pkts_burst, nb_rx);
+	rte_pktmbuf_free_bulk(free_burst, j);
+	while (i != nb_rx) {
+		if (unlikely(((rx_pool->tail + 1) &
+			(rx_pool->max_num - 1)) == rx_pool->head)) {
+			RTE_LOG(ERR, pre_ld,
+				"RX pool is too small?\n");
+			rte_pktmbuf_free_bulk(&pkts_burst[i], nb_rx - i);
+			break;
+		}
+		/** Remove Header.*/
+		ret = pre_ld_adjust_rx_l4_info(sockfd, pkts_burst[i]);
+		if (unlikely(ret))
+			break;
+		rx_pool->rx_bufs[rx_pool->tail] = pkts_burst[i];
+		rx_pool->tail = (rx_pool->tail + 1) &
+			(rx_pool->max_num - 1);
+		i++;
+	}
+
+finsh_recv:
 
 	return total_bytes;
 }
@@ -1561,6 +1704,20 @@ usr_socket_fd_desc_init(int sockfd,
 
 	socket_hdr_init(&s_fd_desc[sockfd].hdr);
 
+	s_fd_desc[sockfd].rx_buffer.head = 0;
+	s_fd_desc[sockfd].rx_buffer.tail = 0;
+	s_fd_desc[sockfd].rx_buffer.rx_bufs = rte_malloc(NULL,
+		sizeof(void *) * MAX_PKT_BURST * 2,
+		RTE_CACHE_LINE_SIZE);
+	if (!s_fd_desc[sockfd].rx_buffer.rx_bufs) {
+		RTE_LOG(ERR, pre_ld,
+			"port%d: RX pool init failed for socket(%d)\n",
+			rx_port, sockfd);
+
+		goto fd_init_quit;
+	}
+	s_fd_desc[sockfd].rx_buffer.max_num = MAX_PKT_BURST * 2;
+
 	ret = rte_ring_dequeue(s_port_rxq_rings[rx_port],
 		(void **)&s_fd_desc[sockfd].rxq_id);
 	if (ret) {
@@ -1570,11 +1727,10 @@ usr_socket_fd_desc_init(int sockfd,
 
 		goto fd_init_quit;
 	}
-	RTE_LOG(ERR, pre_ld,
+	RTE_LOG(INFO, pre_ld,
 		"port%d: RXQ[%d] allocated for socket(%d)\n",
 		tx_port, *s_fd_desc[sockfd].rxq_id, sockfd);
 
-	/** Always use TXQ0.*/
 	if (!s_dir_traffic_cfg.valid) {
 		ret = rte_ring_dequeue(s_port_txq_rings[tx_port],
 				(void **)&s_fd_desc[sockfd].txq_id);
@@ -1585,7 +1741,7 @@ usr_socket_fd_desc_init(int sockfd,
 
 			goto fd_init_quit;
 		}
-		RTE_LOG(ERR, pre_ld,
+		RTE_LOG(INFO, pre_ld,
 			"port%d: TXQ[%d] allocated for socket(%d)\n",
 			tx_port, *s_fd_desc[sockfd].txq_id, sockfd);
 	} else {
@@ -2551,30 +2707,26 @@ ioctl(int fd, unsigned long request, ...)
 	return ioctl_value;
 }
 
-static int usr_fd_is_set(fd_set *fds)
+static int usr_fd_set_num(fd_set *fds,
+	int fd_set[])
 {
-	int i;
+	int i, num = 0;
 
 	for (i = 0; i < s_usr_fd_num; i++) {
-		if (FD_ISSET(s_fd_usr[i], fds))
-			return true;
+		if (FD_ISSET(s_fd_usr[i], fds)) {
+			fd_set[num] = s_fd_usr[i];
+			num++;
+		}
 	}
 
-	return false;
-}
-
-static void usr_fd_set(fd_set *fds)
-{
-	int i;
-
-	for (i = 0; i < s_usr_fd_num; i++)
-		FD_SET(s_fd_usr[i], fds);
+	return num;
 }
 
 int select(int nfds, fd_set *readfds, fd_set *writefds,
 	fd_set *exceptfds, struct timeval *timeout)
 {
-	int select_value;
+	int select_value, ret, usr_fd[s_max_usr_fd], i, fd_num;
+	fd_set _readfds;
 
 	if (s_socket_dbg) {
 		RTE_LOG(INFO, pre_ld,
@@ -2583,10 +2735,8 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 		dump_usr_fd(__func__);
 	}
 
-	if ((s_max_usr_fd >= 0
-		&& s_max_usr_fd < nfds) &&
-		readfds && usr_fd_is_set(readfds)) {
-		if (!libc_select) {
+	if (s_max_usr_fd >= 0 && readfds) {
+		if (unlikely(!libc_select)) {
 			LIBC_FUNCTION(select);
 			if (!libc_select) {
 				select_value = -1;
@@ -2595,17 +2745,29 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 				return select_value;
 			}
 		}
+		fd_num = usr_fd_set_num(readfds, usr_fd);
+		if (!fd_num) {
+			return (*libc_select)(nfds, readfds, writefds,
+				exceptfds, timeout);
+		}
+		memset(&_readfds, 0, sizeof(fd_set));
+		for (i = 0; i < fd_num; i++)
+			FD_SET(usr_fd[i], &_readfds);
+		ret = memcmp(&_readfds, readfds, sizeof(fd_set));
+		if (likely(!ret)) {
+			/**User FD select only.*/
+			return fd_num;
+		}
+
+		RTE_LOG(WARNING, pre_ld,
+			"Select mix of user FDs and system FDs\n");
 		select_value = (*libc_select)(nfds, readfds, writefds,
 			exceptfds, timeout);
-		if (select_value > 0) {
-			usr_fd_set(readfds);
-
-			return select_value;
+		if (select_value >= 0) {
+			for (i = 0; i < fd_num; i++)
+				FD_SET(usr_fd[i], readfds);
+			select_value += fd_num;
 		}
-		if (readfds)
-			usr_fd_set(readfds);
-		/* Here assume there is always data arriving. */
-		select_value = 1;
 	} else if (libc_select) {
 		select_value = (*libc_select)(nfds, readfds, writefds,
 			exceptfds, timeout);
@@ -2619,6 +2781,11 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 			select_value = -1;
 			errno = EACCES;
 		}
+	}
+
+	if (select_value < 0) {
+		RTE_LOG(ERR, pre_ld,
+			"Select system FDs err(%d)\n", select_value);
 	}
 
 	return select_value;
