@@ -1,56 +1,70 @@
---------------------------------------------
-Introduction to iperf3 test with PRELOAD
---------------------------------------------
+---------------------
+NXP fast path network
+---------------------
 
-This is a sample code for running iperf3 client with PRELOAD.
+NXP fast path solution is used to improve performance of socket-based network application by
+taking advantage of NXP network hardware virtualization.
+Existing user application is supposed to have no change to adapt this solution to get performance
+improved significantly.
 
-
-Compilation of PRELOAD library
+Build:
 --------------------------------------------
   $ cmake . -Bbuild -DCMAKE_BUILD_TYPE=release -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DDPDK_INSTALL=/your/dpdk/install/folder
+
   $ make -C build
+	#Generate build/lib/libnfp.so
 
-TEST
+Pre-test configurations:
 --------------------------------------------
-
-1. Run iperf3 server(Any X86 machine or LX board):
-
-  $ ifconfig ethx 1.1.1.2/24
-        #Assume ethx is connected to LX board running iperf3 client.
-  $ iperf3 -s
-
-2. Run iperf3 client on DPAA2 board with dpmac.x connected to server's eth0.
+Total 3 options are provided here, either of them can be choosed according to your scenario.
 
   Option 1:
+----------
   Configure DPDMUX connected to dpmac.x via uplink interface and two DPNIs via downlink interfaces.
   The default downlink interface is connected to kernel port and another downlink interface is connected
   to DPDK port.
 
   $ ls-addni --no-link
 	#Assume the interface created are dpni.z-ethx.
+
   $ export DPRC=dprc.2
+
   $ export MAX_QUEUES=8
+
   $ export FS_ENTRIES=8
+
   $ export MAX_TCS=1
+
   $ source ./dynamic_dpl.sh dpmac.x
 	#Assume the interface created are dpmac.x-dpni.x.
+
   $ echo dprc.2 > /sys/bus/fsl-mc/drivers/vfio-fsl-mc/unbind
+
   $ restool dprc disconnect dprc.2 --endpoint=dpni.x
+
   $ restool dpdmux create --default-if=1 --num-ifs=2 --method DPDMUX_METHOD_CUSTOM --manip=DPDMUX_MANIP_NONE --option=DPDMUX_OPT_CLS_MASK_SUPPORT --container=dprc.1
+
   $ restool dprc connect dprc.1 --endpoint1=dpdmux.0.0 --endpoint2=dpmac.x
+
   $ restool dprc connect dprc.1 --endpoint1=dpdmux.0.1 --endpoint2=dpni.z
+
   $ restool dprc connect dprc.1 --endpoint1=dpdmux.0.2 --endpoint2=dpni.x
+
   $ restool dprc assign dprc.1 --object=dpdmux.0 --child=dprc.2 --plugged=1
+
   $ echo dprc.2 > /sys/bus/fsl-mc/drivers/vfio-fsl-mc/bind
+
   $ export eth_name=ethx
-  $ ifconfig ethx 1.1.1.3/24
-  $ ifconfig ethx promisc
+
   $ export DPAA2_TX_CONF=1
+
   $ export DPAA2_TX_DYNAMIC_CONF=1
-  $ LD_PRELOAD=./libusect.so iperf3 -c 1.1.1.2 -i 1 -t 10 -u -b 1G -l 64
+
+  $ export DPAA2_RX_GET_PROTOCOL_OFFSET=1
 
   Option 2:
-  dpdk-port_fwd handles traffic from/to dpmac, the default ingress traffic from dpmac is directed to
+----------
+  dpdk-port_fwd handles traffic from/to dpmac/PCIe EP, the default ingress traffic from dpmac/PCIe EP is directed to
   kernel interface, specified ingress traffic is directed to iperf3 process.
 
                                       |          dprc.1
@@ -59,7 +73,7 @@ TEST
                         |    ^        |
     dpni.b--dpni.c(UL)--     |        |-----------------------
                ^ ^      |    |        |
-               | |       -dpni.e(DL)----dpni.5--PMD(dpdk)
+               | |       -dpni.e(DL)----dpni.g--PMD(dpdk)
                | |           ^        |
                | |           |        |
       dprc.2(dpdk-port_fwd)--         |          dprc.3(iperf3)
@@ -68,55 +82,106 @@ TEST
                |______________________|___________________|
 
   i) Start port_fwd:
+
   $ export DPIO_COUNT=10
+
   $ export DPRC=dprc.2
+
   $ export P0_DIST_1='(0,0,2)'
+
   $ export P1_DIST_1='(1,0,2)'
+
   $ export PORT1_FWD=0
+
   $ export PORT0_FWD=1
+
   $ export MAX_QUEUES=8
+
   $ export FS_ENTRIES=8
+
   $ export MAX_TCS=1
+
   $ export P2_DIST_1='(2,0,-1)'
+
   $ export P3_DIST_1='(3,0,-1)'
+
   $ export P4_DIST_1='(4,0,-1)'
 
   $ source ./dynamic_dpl.sh dpmac.x dpni-dpni dpni dpni
         #Assume the DPNIs created are dpni.a(dpmac.x), dpni.b-dpni.c, dpni.d, dpni.e.
-  #ls-addni dpni.d
-        #Assume the kernel interface created is ethx.
-  $ ifconfig ethx 1.1.1.3/24
-  $ ifconfig ethx promisc
-  $ ./dpdk-port_fwd -c 0x4 -n 1 -- -p 0x1f --config="$P0_DIST_1,$P1_DIST_1,$P2_DIST_1,$P3_DIST_1,$P4_DIST_1" --direct-def="'(dpni.c, dpni.d),(dpni.d, dpni.c),(dpni.e, dpni.c)'" --direct-rsp
 
-  ii) Start iperf3 client:
-  $ export DPIO_COUNT=10
-  $ export DPRC=dprc.3
-  $ export MAX_QUEUES=8
-  $ export FS_ENTRIES=8
-  $ export MAX_TCS=1
-  $ export eth_name=ethx
-  $ export file_prefix=rte1
-  $ export uplink_name=dpni.c
-  $ source ./dynamic_dpl.sh dpni.e
-  $ export DPAA2_TX_CONF=1
-  $ export DPAA2_TX_DYNAMIC_CONF=1
-  $ LD_PRELOAD=./libusect.so iperf3 -c 1.1.1.2 -i 1 -t 10 -u -b 1G -l 64
-
-  Option 3:
-  Create one dedicated thread to direct traffic among dpmac/kernel/iperf3
-
-  $ export DPRC=dprc.2
-  $ export MAX_QUEUES=8
-  $ export FS_ENTRIES=8
-  $ export MAX_TCS=1
-  $ source ./dynamic_dpl.sh dpmac.x dpni-dpni dpni
-        #Assume the DPNIs created are dpni.a(dpmac.x), dpni.b-dpni.c, dpni.d.
   $ ls-addni dpni.d
         #Assume the kernel interface created is ethx.
+
+  $ ./dpdk-port_fwd -c 0x4 -n 1 -- -p 0x1f --config="$P0_DIST_1,$P1_DIST_1,$P2_DIST_1,$P3_DIST_1,$P4_DIST_1" --direct-def="'(dpni.c, dpni.d),(dpni.d, dpni.c),(dpni.e, dpni.c)'" --direct-rsp
+
+  ii) Configure application:
+
+  $ export DPIO_COUNT=10
+
+  $ export DPRC=dprc.3
+
+  $ export MAX_QUEUES=8
+
+  $ export FS_ENTRIES=8
+
+  $ export MAX_TCS=1
+
   $ export eth_name=ethx
-  $ ifconfig ethx 1.1.1.3 up
-  $ ifconfig ethx promisc up
+
+  $ export file_prefix=rte1
+
+  $ export uplink_name=dpni.c
+
+  $ source ./dynamic_dpl.sh dpni.e
+
   $ export DPAA2_TX_CONF=1
+
   $ export DPAA2_TX_DYNAMIC_CONF=1
-  $ LD_PRELOAD=./libusect.so iperf3 -c 1.1.1.2 -i 1 -t 10 -u -b 10G -l 64
+
+  $ export DPAA2_RX_GET_PROTOCOL_OFFSET=1
+
+  Option 3:
+----------
+  Create one dedicated thread to direct traffic among dpmac(PCIe EP)/kernel/iperf3
+
+  $ export DPRC=dprc.2
+
+  $ export MAX_QUEUES=8
+
+  $ export FS_ENTRIES=8
+
+  $ export MAX_TCS=1
+
+  $ source ./dynamic_dpl.sh dpmac.x dpni-dpni dpni
+        #Assume the DPNIs created are dpni.a(dpmac.x), dpni.b-dpni.c, dpni.d.
+
+  $ ls-addni dpni.d
+        #Assume the kernel interface created is ethx.
+
+  $ export eth_name=ethx
+
+  $ export DPAA2_TX_CONF=1
+
+  $ export DPAA2_TX_DYNAMIC_CONF=1
+
+  $ export DPAA2_RX_GET_PROTOCOL_OFFSET=1
+
+Test application(iperf3) based on either of upon configurations:
+--------------------------------------------
+
+server mode:
+----------
+  $ ifconfig ethx 1.1.1.2/24
+
+  $ ifconfig ethx promisc up
+
+  $ LD_PRELOAD=./libnfp.so iperf3 -s
+
+client mode:
+----------
+  $ ifconfig ethx 1.1.1.3/24
+
+  $ ifconfig ethx promisc up
+
+  $ LD_PRELOAD=./libnfp.so iperf3 -c 1.1.1.2 -i 1 -t 10 -u -b 10G -l 64
