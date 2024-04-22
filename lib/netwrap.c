@@ -120,6 +120,7 @@ struct fd_desc {
 	uint16_t *rxq_id;
 	struct rte_ring *rx_ring;
 	uint16_t tx_port;
+	uint16_t def_txq_id;
 	uint16_t *txq_id;
 	struct rte_ring *tx_ring;
 	void *flow;
@@ -1402,7 +1403,9 @@ static int eal_main(void)
 		}
 		if (rte_pmd_dpaa2_dev_is_dpaa2(portid))
 			dpaa2_rxqs += rxq_num[portid];
-		rte_log(RTE_LOG_INFO, RTE_LOGTYPE_pre_ld, "done.\n");
+		rte_log(RTE_LOG_INFO, RTE_LOGTYPE_pre_ld,
+			"%d rxq(s) and %d txq(s) setup done.\n",
+			rxq_num[portid], txq_num[portid]);
 	}
 
 	if (!nb_ports_available)
@@ -1801,6 +1804,8 @@ usr_socket_fd_desc_init(int sockfd,
 	}
 	s_fd_desc[sockfd].rx_buffer.max_num = MAX_PKT_BURST * 2;
 
+	s_fd_desc[sockfd].def_txq_id = s_txq_ids[tx_port][0];
+
 	ret = rte_ring_dequeue(s_port_rxq_rings[rx_port],
 		(void **)&s_fd_desc[sockfd].rxq_id);
 	if (ret) {
@@ -1818,11 +1823,12 @@ usr_socket_fd_desc_init(int sockfd,
 		ret = rte_ring_dequeue(s_port_txq_rings[tx_port],
 				(void **)&s_fd_desc[sockfd].txq_id);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"port%d: No TXQ available for socket(%d)\n",
-				tx_port, sockfd);
+			RTE_LOG(WARNING, pre_ld,
+				"port%d: use default txq ID(%d) for socket(%d)\n",
+				tx_port, s_fd_desc[sockfd].def_txq_id, sockfd);
 
-			goto fd_init_quit;
+			s_fd_desc[sockfd].txq_id = &s_fd_desc[sockfd].def_txq_id;
+			ret = 0;
 		}
 		RTE_LOG(INFO, pre_ld,
 			"port%d: TXQ[%d] allocated for socket(%d)\n",
@@ -1862,7 +1868,9 @@ fd_init_quit:
 				s_fd_desc[sockfd].rxq_id);
 			s_fd_desc[sockfd].rxq_id = NULL;
 		}
-		if (s_fd_desc[sockfd].txq_id) {
+		if (s_fd_desc[sockfd].txq_id &&
+			s_fd_desc[sockfd].txq_id !=
+			&s_fd_desc[sockfd].def_txq_id) {
 			rte_ring_enqueue(s_port_txq_rings[tx_port],
 				s_fd_desc[sockfd].txq_id);
 			s_fd_desc[sockfd].txq_id = NULL;
@@ -1951,7 +1959,8 @@ usr_socket_fd_release(int sockfd)
 	s_fd_desc[sockfd].rxq_id = NULL;
 
 	if (s_fd_desc[sockfd].txq_id &&
-		s_port_txq_rings[tx_port]) {
+		s_port_txq_rings[tx_port] &&
+		s_fd_desc[sockfd].txq_id != &s_fd_desc[sockfd].def_txq_id) {
 		ret_tmp = rte_ring_enqueue(s_port_txq_rings[tx_port],
 					s_fd_desc[sockfd].txq_id);
 		if (ret_tmp) {
