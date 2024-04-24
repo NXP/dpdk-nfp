@@ -479,8 +479,8 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 		udp_hdr->dst_port != flow_hdr->src_port)) {
 		RTE_LOG(WARNING, pre_ld,
 			"UDP RX ERR(src %04x!=%04x, dst %04x!=%04x).\n",
-			udp_hdr->src_port, flow_hdr->src_port,
-			udp_hdr->dst_port, flow_hdr->dst_port);
+			udp_hdr->src_port, flow_hdr->dst_port,
+			udp_hdr->dst_port, flow_hdr->src_port);
 	}
 	length = rte_be_to_cpu_16(udp_hdr->dgram_len) -
 		sizeof(struct rte_udp_hdr);
@@ -1635,7 +1635,7 @@ static int
 eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 {
 	char config_str[256];
-	int ret;
+	int ret, udp_src = 0, udp_dst = 0;
 	uint16_t rxq_id, offset = 0;
 	struct pre_ld_lcore_conf *lcore;
 	struct pre_ld_lcore_fwd *fwd;
@@ -1643,6 +1643,8 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 	static int default_created;
 	char fwd_info[512];
 	const char *prot_name;
+	const struct rte_flow_item_udp *udp = NULL;
+	const struct rte_flow_item_udp *mask = NULL;
 
 	if (!s_fd_desc[sockfd].rxq_id)
 		return -EIO;
@@ -1664,6 +1666,12 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 
 	if (pattern[0].type == RTE_FLOW_ITEM_TYPE_UDP) {
 		prot_name = "udp";
+		udp = pattern[0].spec;
+		mask = pattern[0].mask;
+		if (mask->hdr.src_port)
+			udp_src = 1;
+		if (mask->hdr.dst_port)
+			udp_dst = 1;
 	} else if (pattern[0].type == RTE_FLOW_ITEM_TYPE_GTP) {
 		prot_name = "gtp";
 	} else if (pattern[0].type == RTE_FLOW_ITEM_TYPE_ETH) {
@@ -1677,8 +1685,28 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 			pattern[0].type);
 	}
 
-	sprintf(config_str,
-		"(%s, %s, %s)", s_uplink, s_downlink, prot_name);
+	if (udp_src && !udp_dst) {
+		sprintf(config_str,
+			"(%s, %s, %s, src, 0x%04x)",
+			s_uplink, s_downlink, prot_name,
+			rte_bswap16(udp->hdr.src_port));
+	} else if (!udp_src && udp_dst) {
+		sprintf(config_str,
+			"(%s, %s, %s, dst, 0x%04x)",
+			s_uplink, s_downlink, prot_name,
+			rte_bswap16(udp->hdr.dst_port));
+	} else if (udp_src && udp_dst) {
+		sprintf(config_str,
+			"(%s, %s, %s, src, 0x%04x), (%s, %s, %s, dst, 0x%04x)",
+			s_uplink, s_downlink, prot_name,
+			rte_bswap16(udp->hdr.src_port),
+			s_uplink, s_downlink, prot_name,
+			rte_bswap16(udp->hdr.dst_port));
+	} else {
+		sprintf(config_str,
+			"(%s, %s, %s)",
+			s_uplink, s_downlink, prot_name);
+	}
 
 	ret = rte_remote_direct_parse_config(config_str, 1);
 	if (ret)
