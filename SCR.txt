@@ -1,0 +1,12 @@
+Software Content Register
+--------------------------------------------
+
+Package:                     nfp.git
+Version:                     1.0
+Outgoing License:            BSD-3-Clause
+License File:                LICENSE
+Package Category:            User Space library
+Type of Content:             source
+Description and comments:    Fastpath Library
+Release Location:            https://bitbucket.sw.nxp.com/projects/DN5G/repos/nfp/browse
+Origin:                      NXP (BSD-3-Clause)
