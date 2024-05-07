@@ -1274,8 +1274,8 @@ static int eal_main(void)
 	uint16_t portid, dpaa2_rxqs = 0;
 	uint16_t rxq_num[RTE_MAX_ETHPORTS];
 	uint16_t txq_num[RTE_MAX_ETHPORTS];
-	struct rte_eth_conf port_conf[RTE_MAX_ETHPORTS];
-	struct rte_eth_dev_info dev_info[RTE_MAX_ETHPORTS];
+	struct rte_eth_conf *port_conf;
+	struct rte_eth_dev_info *dev_info;
 	enum pre_ld_port_type port_type[RTE_MAX_ETHPORTS], type_ret;
 	size_t i, eal_argc = 0;
 	char *eal_argv[MAX_ARGV_NUM];
@@ -1341,10 +1341,22 @@ static int eal_main(void)
 			"Using single pool for TX/RX\n");
 	}
 
+	port_conf = rte_zmalloc(NULL,
+		sizeof(struct rte_eth_conf) * RTE_MAX_ETHPORTS, 0);
+	if (!port_conf) {
+		rte_exit(EXIT_FAILURE,
+			"Malloc ports configuration failed\n");
+	}
+	dev_info = rte_zmalloc(NULL,
+		sizeof(struct rte_eth_dev_info) * RTE_MAX_ETHPORTS, 0);
+	if (!dev_info) {
+		rte_exit(EXIT_FAILURE,
+			"Malloc ports information failed\n");
+	}
+
 	for (i = 0; i < RTE_MAX_ETHPORTS; i++) {
 		rte_memcpy(&port_conf[i], &s_port_conf,
 			sizeof(s_port_conf));
-		memset(&dev_info[i], 0, sizeof(struct rte_eth_dev_info));
 	}
 
 	type_ret = pre_ld_set_port_type(port_type, RTE_MAX_ETHPORTS);
@@ -1465,6 +1477,7 @@ static int eal_main(void)
 					portid, (int)i, ret);
 			}
 		}
+		memset(&fc_conf, 0, sizeof(fc_conf));
 		fc_conf.mode = RTE_ETH_FC_NONE;
 		ret = rte_eth_dev_flow_ctrl_set(portid, &fc_conf);
 		if (ret) {
@@ -1502,10 +1515,9 @@ static int eal_main(void)
 			ret = rte_ring_enqueue(s_port_rxq_rings[portid],
 				&s_rxq_ids[portid][i]);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				rte_exit(EXIT_FAILURE,
 					"eq s_rxq_ids[%d][%d] to %s failed\n",
 					portid, (int)i, ring_nm);
-				return ret;
 			}
 		}
 
@@ -1521,10 +1533,9 @@ static int eal_main(void)
 			ret = rte_ring_enqueue(s_port_txq_rings[portid],
 				&s_txq_ids[portid][i]);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				rte_exit(EXIT_FAILURE,
 					"eq s_txq_ids[%d][%d] to %s failed\n",
 					portid, (int)i, ring_nm);
-				return ret;
 			}
 		}
 	}
@@ -1560,6 +1571,9 @@ static int eal_main(void)
 				ret);
 		}
 	}
+
+	rte_free(dev_info);
+	rte_free(port_conf);
 
 	return 0;
 }
@@ -2374,13 +2388,14 @@ netwrap_get_remote_hw(int sockfd)
 			__func__, sockfd);
 			return -EINVAL;
 	}
+	memset(&ia, 0, sizeof(ia));
 	ia.sin_family = AF_INET;
 	ia.sin_addr.s_addr = hdr->ip_hdr.dst_addr;
 	ia.sin_port = hdr->udp_hdr.dst_port;
 
 	memset(&arpreq, 0, sizeof(struct arpreq));
 	memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
-	strcpy(arpreq.arp_dev, s_slow_if);
+	snprintf(arpreq.arp_dev, IFNAMSIZ, "%s", s_slow_if);
 	arpreq.arp_pa.sa_family = AF_INET;
 	arpreq.arp_ha.sa_family = AF_UNSPEC;
 
@@ -2525,7 +2540,7 @@ netwrap_get_local_hw(int sockfd)
 		return 0;
 
 	ifr.ifr_addr.sa_family = AF_INET;
-	strcpy(ifr.ifr_name, s_slow_if);
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", s_slow_if);
 
 	ret = ioctl(sockfd, SIOCGIFHWADDR, &ifr);
 	if (ret < 0) {
