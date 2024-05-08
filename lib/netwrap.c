@@ -52,15 +52,19 @@
 #include <rte_mbuf.h>
 #include <rte_string_fns.h>
 #include <rte_tm.h>
+#include <rte_ipsec.h>
+
 #include <rte_pmd_dpaa2.h>
 #include <nxp/rte_remote_direct_flow.h>
 
 #include "netwrap.h"
+#include "usr_sec.h"
 
 #ifndef SOCK_TYPE_MASK
 #define SOCK_TYPE_MASK 0xf
 #endif
 #define INVALID_SOCKFD (-1)
+
 static int s_socket_pre_set;
 static int s_eal_inited;
 static pthread_mutex_t s_eal_init_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -72,6 +76,10 @@ static uint16_t s_cpu_start = 1;
 static const char *s_dpdmux_ep_name;
 static int s_dpdmux_id = -1;
 static int s_dpdmux_ep_id;
+
+#define CRYPTO_DEV_DEFAULT_ID 0
+#define CRYPTO_DEV_QP_NUM 1
+static uint8_t s_crypto_dev_id = CRYPTO_DEV_DEFAULT_ID;
 
 static const char *s_eal_file_prefix;
 static const char *s_uplink;
@@ -230,9 +238,14 @@ struct pre_ld_rxq_port {
 	uint16_t queue_id;
 };
 
+struct pre_ld_rxq_sec {
+	uint16_t queue_id;
+};
+
 enum pre_ld_poll_type {
 	RX_QUEUE,
 	TX_RING,
+	SEC_COMPLETE,
 	SELF_GEN
 };
 
@@ -243,18 +256,21 @@ struct pre_ld_poll_tx_ring {
 
 union pre_ld_poll {
 	struct pre_ld_rxq_port poll_queue;
+	struct pre_ld_rxq_sec poll_sec;
 	struct pre_ld_poll_tx_ring tx_rings;
 };
 
 enum pre_ld_fwd_type {
 	HW_PORT,
 	RX_RING,
+	SEC_INGRESS,
 	DROP
 };
 
 union pre_ld_fwd {
 	uint16_t fwd_port;
 	struct rte_ring *rx_ring;
+	uint16_t crypt_devid;
 };
 
 struct pre_ld_lcore_fwd {
@@ -851,12 +867,145 @@ pre_ld_configure_split_traffic(uint32_t portid)
 	}
 }
 
+static inline struct rte_ipsec_session *
+pre_ld_ipsec_sa_2_session(struct pre_ld_ipsec_sa_entry *sa)
+{
+	return &sa->session;
+}
+
+static inline enum rte_security_session_action_type
+pre_ld_ipsec_sa_2_action(struct pre_ld_ipsec_sa_entry *sa)
+{
+	struct rte_ipsec_session *ips;
+
+	ips = pre_ld_ipsec_sa_2_session(sa);
+	return ips->type;
+}
+
+static inline int
+pre_ld_ipsec_dequeue(struct rte_mbuf *pkts[], uint16_t max_pkts,
+	uint16_t c_qp)
+{
+	int32_t nb_pkts = 0, j, nb_cops;
+	struct pre_ld_ipsec_priv *priv;
+	struct rte_crypto_op *cops[max_pkts];
+	struct pre_ld_ipsec_sa_entry *sa;
+	struct rte_mbuf *pkt;
+
+	nb_cops = rte_cryptodev_dequeue_burst(s_crypto_dev_id,
+		c_qp, cops, max_pkts);
+
+	for (j = 0; j < nb_cops; j++) {
+		pkt = cops[j]->sym->m_src;
+
+		priv = rte_mbuf_to_priv(pkt);
+		sa = priv->sa;
+
+		RTE_ASSERT(sa);
+
+		if (pre_ld_ipsec_sa_2_action(sa) ==
+			RTE_SECURITY_ACTION_TYPE_LOOKASIDE_PROTOCOL) {
+			if (cops[j]->status) {
+				rte_pktmbuf_free(pkt);
+				continue;
+			}
+		}
+		pkts[nb_pkts++] = pkt;
+	}
+
+	/* return packets */
+	return nb_pkts;
+}
+
+static struct pre_ld_ipsec_sa_entry *
+pre_ld_in_sp_lookup_sa(uint16_t sa_idx)
+{
+	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+
+	return cntx->sp_in_fast[sa_idx]->sa;
+}
+
+static inline void
+pre_ld_adjust_inbound_ipv4_pktlen(struct rte_mbuf *m,
+	const struct rte_ipv4_hdr *iph, uint32_t l2_len)
+{
+	uint32_t plen, trim;
+
+	plen = rte_be_to_cpu_16(iph->total_length) + l2_len;
+	if (plen < m->pkt_len) {
+		trim = m->pkt_len - plen;
+		rte_pktmbuf_trim(m, trim);
+	}
+}
+
+static void
+pre_ld_adjust_inbound_ipv4(struct rte_mbuf *pkt)
+{
+	const struct rte_ether_hdr *eth;
+	const struct rte_ipv4_hdr *iph4;
+	struct pre_ld_ipsec_priv *priv;
+
+	eth = rte_pktmbuf_mtod(pkt, const struct rte_ether_hdr *);
+	priv = rte_mbuf_to_priv(pkt);
+	rte_memcpy(priv->cntx, eth, sizeof(struct rte_ether_hdr));
+
+	iph4 = (void *)rte_pktmbuf_adj(pkt, RTE_ETHER_HDR_LEN);
+	pre_ld_adjust_inbound_ipv4_pktlen(pkt, iph4, 0);
+
+	pkt->l2_len = 0;
+	pkt->l3_len = sizeof(*iph4);
+}
+
+static uint32_t
+pre_ld_sec_enqueue_cop_burst(struct rte_crypto_op **cop,
+	uint16_t qp, uint16_t nb)
+{
+	return rte_cryptodev_enqueue_burst(s_crypto_dev_id, qp, cop, nb);
+}
+
+static inline uint16_t
+pre_ld_ipsec_sa_enqueue(struct rte_mbuf *pkts[],
+	void *sas, uint16_t nb_pkts, uint16_t qp)
+{
+	int i;
+	struct pre_ld_ipsec_priv *priv;
+	struct pre_ld_ipsec_sa_entry *sa = sas;
+	struct rte_ipsec_session *ips = pre_ld_ipsec_sa_2_session(sa);
+	struct rte_crypto_op *cops[nb_pkts];
+
+	if (ips->type != RTE_SECURITY_ACTION_TYPE_LOOKASIDE_PROTOCOL) {
+		RTE_LOG(ERR, pre_ld,
+			"Type(%d) not support, Lookaside support only!\n",
+				ips->type);
+		return 0;
+	} else if (!ips->security.ses) {
+		RTE_LOG(ERR, pre_ld,
+			"Session has not been created!\n");
+		return 0;
+	}
+
+	for (i = 0; i < nb_pkts; i++) {
+		priv = rte_mbuf_to_priv(pkts[i]);
+		priv->sa = sa;
+
+		priv->cop.type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+		priv->cop.status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
+
+		priv->sym_cop.m_src = pkts[i];
+
+		rte_security_attach_session(&priv->cop, ips->security.ses);
+		cops[i] = &priv->cop;
+	}
+
+	return pre_ld_sec_enqueue_cop_burst(cops, qp, nb_pkts);
+}
+
 static int
 pre_ld_main_loop(void *dummy)
 {
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint32_t lcore_id;
-	int i, nb_rx, j, fd;
+	int i, nb_rx, j, fd, ret;
 	uint16_t nb_tx, portid, queueid, nb_txr_burst;
 	struct pre_ld_lcore_conf *qconf;
 	struct pre_ld_lcore_fwd *fwd;
@@ -864,6 +1013,7 @@ pre_ld_main_loop(void *dummy)
 	struct rte_ring *txr;
 	struct pre_ld_poll_tx_ring *tx_rings;
 	struct rte_mempool *tx_pool = NULL;
+	struct pre_ld_ipsec_sa_entry *sa;
 
 	RTE_SET_USED(dummy);
 
@@ -901,12 +1051,20 @@ pre_ld_main_loop(void *dummy)
 			"TX self gen pool created failed\n");
 	}
 
+	ret = xfm_crypto_init(s_crypto_dev_id, CRYPTO_DEV_QP_NUM,
+		s_dir_traffic_cfg.ext_id);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
+		return ret;
+	}
+
 for_ever_loop:
 	if (s_pre_ld_quit)
 		return 0;
 
 	for (i = 0; i < qconf->n_fwds; i++) {
 		fwd = &qconf->fwd[i];
+		queueid = INVALID_QUEUEID;
 
 		if (fwd->poll_type == RX_QUEUE) {
 			portid = fwd->poll.poll_queue.port_id;
@@ -942,6 +1100,10 @@ for_ever_loop:
 				nb_rx = 0;
 			for (j = 0; j < nb_rx; j++)
 				eal_send_fill_mbuf(NULL, 64, fd, mbufs[j]);
+		} else if (fwd->poll_type == SEC_COMPLETE) {
+			queueid = fwd->poll.poll_sec.queue_id;
+			nb_rx = pre_ld_ipsec_dequeue(mbufs, MAX_PKT_BURST,
+				queueid);
 		} else {
 			nb_rx = 0;
 		}
@@ -957,7 +1119,15 @@ for_ever_loop:
 		fwd->rx_pkts += nb_rx;
 		fwd->rx_count++;
 
-		if (fwd->fwd_type == HW_PORT) {
+		if (fwd->fwd_type == SEC_INGRESS) {
+			RTE_ASSERT(queueid != INVALID_QUEUEID);
+
+			sa = pre_ld_in_sp_lookup_sa(queueid);
+			RTE_ASSERT(sa);
+			for (i = 0; i < nb_rx; i++)
+				pre_ld_adjust_inbound_ipv4(mbufs[i]);
+			nb_tx = pre_ld_ipsec_sa_enqueue(mbufs, sa, nb_rx, queueid);
+		} else if (fwd->fwd_type == HW_PORT) {
 			portid = fwd->fwd_dest.fwd_port;
 			nb_tx = rte_eth_tx_burst(portid, 0, mbufs, nb_rx);
 		} else if (fwd->fwd_type == RX_RING) {
