@@ -45,4 +45,7 @@
 	usr_fd_found; \
 })
 
+void
+pre_ld_configure_dl_sec_path(uint16_t port_id, uint16_t rxq_id);
+
 #endif /* __NETWRAP_COMMON_H__ */

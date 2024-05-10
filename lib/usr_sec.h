@@ -150,8 +150,7 @@ struct pre_ld_ipsec_cntx {
 	struct pre_ld_ipsec_sp_head sp_ipv4_out_list;
 	struct pre_ld_ipsec_sp_head sp_ipv6_out_list;
 
-	uint16_t max_flow_in_nb;
-	struct pre_ld_ipsec_sp_entry **sp_in_fast;
+	struct pre_ld_ipsec_sp_entry *sp_in;
 };
 
 struct pre_ld_ipsec_priv {
@@ -194,7 +193,8 @@ struct xfm_ipsec_sa_params {
 };
 
 int
-xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb, uint16_t sec_port);
+xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
+	uint16_t sec_port, uint16_t sec_port_flow);
 
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void);
 
