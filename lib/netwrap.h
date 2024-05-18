@@ -46,6 +46,7 @@
 })
 
 void
-pre_ld_configure_dl_sec_path(uint16_t port_id, uint16_t rxq_id);
+pre_ld_configure_sec_path(uint16_t rx_port,
+	uint16_t rxq_id, uint8_t dir, uint16_t tx_port, void *sa);
 
 #endif /* __NETWRAP_COMMON_H__ */

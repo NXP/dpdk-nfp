@@ -86,8 +86,9 @@ struct xfm_mem_ctx {
 
 struct xfm_msg_param {
 	uint16_t sec_id;
-	uint16_t eth_id;
-	uint16_t eth_rx_flow;
+	uint16_t rx_ports[XFM_POLICY_ETH_NUM];
+	uint16_t rx_flows[XFM_POLICY_ETH_NUM];
+	uint16_t tx_ports[XFM_POLICY_ETH_NUM];
 };
 
 static struct xfm_msg_param s_msg_param;
@@ -143,31 +144,11 @@ static const struct xfm_auth_support s_auth_xfm[] = {
 
 static struct pre_ld_ipsec_cntx s_pre_ld_ipsec_cntx;
 
-static int s_kernel_sp_sa_clear;
+static int s_kernel_sp_sa_clear = 1;
 
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void)
 {
 	return &s_pre_ld_ipsec_cntx;
-}
-
-static inline int
-xfm_sp_addr_cmp(union pre_ld_ipsec_addr *src,
-	union pre_ld_ipsec_addr *dst, uint16_t family,
-	struct pre_ld_ipsec_sp_entry *sp)
-{
-	if (family == AF_INET) {
-		if (!memcmp(sp->src.ip4,
-			src->ip4, sizeof(rte_be32_t)) &&
-			!memcmp(sp->dst.ip4,
-			dst->ip4, sizeof(rte_be32_t) - 1))
-			return true;
-	} else if (family == AF_INET6) {
-		if (!memcmp(sp->src.ip6, src->ip6, 16) &&
-			!memcmp(sp->dst.ip6, dst->ip6, 16))
-			return true;
-	}
-
-	return false;
 }
 
 static const struct xfm_ciph_support *
@@ -906,9 +887,9 @@ dump_new_policy(const struct xfrm_userpolicy_info *pol_info)
 }
 
 static int
-xfm_steer_sp_in_flow(struct pre_ld_ipsec_sp_entry *sp,
-	int parse_spi, uint16_t port_id, uint16_t tc, uint16_t tc_idx,
-	uint16_t flow_index)
+xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp,
+	int parse_spi, uint16_t rx_port, uint16_t tc, uint16_t tc_idx,
+	uint16_t flow_index, uint16_t tx_port, void *sa)
 {
 	struct rte_flow_attr flow_attr;
 	struct rte_flow_item flow_item[3];
@@ -976,7 +957,7 @@ xfm_steer_sp_in_flow(struct pre_ld_ipsec_sp_entry *sp,
 	flow_action[0].conf = &ingress_queue;
 	flow_action[1].type = RTE_FLOW_ACTION_TYPE_END;
 
-	flow = rte_flow_create(port_id, &flow_attr,
+	flow = rte_flow_create(rx_port, &flow_attr,
 		flow_item, flow_action, &error);
 	if (flow) {
 		RTE_LOG(INFO, pre_ld,
@@ -999,8 +980,15 @@ xfm_steer_sp_in_flow(struct pre_ld_ipsec_sp_entry *sp,
 		}
 		sp->flow = flow;
 		sp->flow_idx = flow_index;
+		sp->port_idx = rx_port;
 
-		pre_ld_configure_dl_sec_path(port_id, flow_index);
+		pre_ld_configure_sec_path(rx_port, flow_index,
+			sp->dir, tx_port, sa);
+
+		RTE_LOG(ERR, pre_ld,
+			"%s: Steer %s flow from port%d flow%d to port%d\n",
+			__func__, parse_spi ? "Ingress" : "Egress",
+			rx_port, flow_index, tx_port);
 		return 0;
 	}
 
@@ -1012,35 +1000,43 @@ xfm_steer_sp_in_flow(struct pre_ld_ipsec_sp_entry *sp,
 }
 
 static int
-xfm_del_sp_in_flow(struct pre_ld_ipsec_sp_entry *sp,
-	uint16_t sec_port)
+xfm_del_sp_in_flow(struct pre_ld_ipsec_sp_entry *sp)
 {
 	int ret;
 	struct rte_flow_error err;
 
 	if (!sp->flow)
 		return 0;
-	ret = rte_flow_destroy(sec_port, sp->flow, &err);
-	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Policy flow (index=%d) destroy failed(%s)\n",
-			__func__, sp->flow_idx, err.message);
-		return ret;
+	if (sp->port_idx != INVALID_PORTID && sp->flow) {
+		ret = rte_flow_destroy(sp->port_idx, sp->flow, &err);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s: Policy flow (index=%d) destroy failed(%s)\n",
+				__func__, sp->flow_idx, err.message);
+			return ret;
+		}
 	}
+	sp->port_idx = INVALID_PORTID;
 	sp->flow = NULL;
 	return 0;
 }
 
 static int
-xfm_policy_in_hw_offload(struct pre_ld_ipsec_sp_entry *sp,
-	uint16_t port_id, uint16_t flow_idx)
+xfm_policy_hw_offload(struct pre_ld_ipsec_sp_entry *sp,
+	uint16_t rx_port, uint16_t flow_idx, uint16_t tx_port, void *sa)
 {
-	int ret;
+	int ret, parse_spi;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 
-	ret = xfm_steer_sp_in_flow(sp, 1, port_id, 0, flow_idx, flow_idx);
-	if (!ret)
-		cntx->sp_in = sp;
+	parse_spi = sp->dir == XFRM_POLICY_IN ? 1 : 0;
+	ret = xfm_steer_sp_flow(sp, parse_spi, rx_port, 0, flow_idx, flow_idx,
+		tx_port, sa);
+	if (!ret) {
+		if (sp->dir == XFRM_POLICY_IN)
+			cntx->sp_in = sp;
+		else
+			cntx->sp_out = sp;
+	}
 
 	return ret;
 }
@@ -1079,14 +1075,36 @@ xfm_apply_sa(struct pre_ld_ipsec_sa_entry *sa,
 
 static void
 xfm_sa_sp_associate(struct pre_ld_ipsec_sp_entry *sp,
-	struct pre_ld_ipsec_sa_entry *sa, uint16_t port_id,
-	uint16_t flow_id)
+	struct pre_ld_ipsec_sa_entry *sa, uint8_t dir,
+	uint16_t rx_ports[], uint16_t flow_ids[], uint16_t tx_ports[])
 {
 	int ret;
+	uint16_t rx_port_id, flow_id, tx_port_id;
 
+	sp->dir = dir;
+	if (dir == XFRM_POLICY_IN) {
+		rx_port_id = rx_ports[XFM_POLICY_IN_ETH_IDX];
+		flow_id = flow_ids[XFM_POLICY_IN_ETH_IDX];
+		tx_port_id = tx_ports[XFM_POLICY_IN_ETH_IDX];
+	} else if (dir == XFRM_POLICY_OUT) {
+		rx_port_id = rx_ports[XFM_POLICY_OUT_ETH_IDX];
+		flow_id = flow_ids[XFM_POLICY_OUT_ETH_IDX];
+		tx_port_id = tx_ports[XFM_POLICY_OUT_ETH_IDX];
+	} else {
+		return;
+	}
+	rx_port_id = dir == XFRM_POLICY_IN ?
+		rx_ports[XFM_POLICY_IN_ETH_IDX] :
+		rx_ports[XFM_POLICY_OUT_ETH_IDX];
+	flow_id = dir == XFRM_POLICY_IN ?
+		flow_ids[XFM_POLICY_IN_ETH_IDX] :
+		flow_ids[XFM_POLICY_OUT_ETH_IDX];
+	tx_port_id = dir == XFRM_POLICY_IN ?
+		tx_ports[XFM_POLICY_IN_ETH_IDX] :
+		tx_ports[XFM_POLICY_OUT_ETH_IDX];
 	sp->spi = rte_cpu_to_be_32(sa->sess_conf.ipsec.spi);
-	if (port_id != INVALID_PORTID) {
-		ret = xfm_policy_in_hw_offload(sp, port_id, flow_id);
+	if (rx_port_id != INVALID_PORTID) {
+		ret = xfm_policy_hw_offload(sp, rx_port_id, flow_id, tx_port_id, sa);
 		if (ret) {
 			RTE_LOG(WARNING, pre_ld,
 				"Policy in HW offload failed(%d)\n", ret);
@@ -1152,8 +1170,8 @@ xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 
 static int
 process_new_policy(const struct nlmsghdr *nh,
-	uint16_t sec_id, uint16_t sec_port,
-	uint16_t sec_port_flow)
+	uint16_t sec_id, uint16_t rx_ports[],
+	uint16_t rx_port_flows[], uint16_t tx_ports[])
 {
 	struct xfrm_userpolicy_info *pol_info;
 	int ret = 0, af;
@@ -1165,6 +1183,14 @@ process_new_policy(const struct nlmsghdr *nh,
 	pol_info = NLMSG_DATA(nh);
 
 	dump_new_policy(pol_info);
+
+	if (pol_info->dir != XFRM_POLICY_IN &&
+		pol_info->dir != XFRM_POLICY_OUT) {
+		RTE_LOG(INFO, pre_ld,
+			"Don't configure policy (dir=%d)\n",
+			pol_info->dir);
+		return 0;
+	}
 
 	ret = do_spdget(pol_info->index, &saddr, &daddr, &af);
 	if (ret) {
@@ -1209,10 +1235,8 @@ process_new_policy(const struct nlmsghdr *nh,
 	}
 
 	if (!ret) {
-		xfm_sa_sp_associate(sp, sa,
-			pol_info->dir == XFRM_POLICY_IN ?
-			sec_port : INVALID_PORTID,
-			sec_port_flow);
+		xfm_sa_sp_associate(sp, sa, pol_info->dir,
+			rx_ports, rx_port_flows, tx_ports);
 		if (s_kernel_sp_sa_clear) {
 			ret = do_spddel(pol_info->index);
 			if (ret) {
@@ -1240,8 +1264,7 @@ process_new_policy(const struct nlmsghdr *nh,
 	return ret;
 }
 
-static int process_del_policy(const struct nlmsghdr *nh,
-	uint16_t sec_port)
+static int process_del_policy(const struct nlmsghdr *nh)
 {
 	struct xfrm_userpolicy_id *pol_id;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
@@ -1300,7 +1323,7 @@ static int process_del_policy(const struct nlmsghdr *nh,
 	if (curr) {
 		cntx->sp_in = NULL;
 		LIST_REMOVE(curr, next);
-		ret = xfm_del_sp_in_flow(curr, sec_port);
+		ret = xfm_del_sp_in_flow(curr);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM del in policy: remove HW flow failed(%d)\n",
@@ -1351,7 +1374,8 @@ static int process_flush_policy(void)
 
 static int
 resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
-	uint16_t sec_id, uint16_t sec_port, uint16_t sec_port_flow)
+	uint16_t sec_id, uint16_t rx_ports[], uint16_t port_flows[],
+	uint16_t tx_ports[])
 {
 	int ret = 0;
 
@@ -1398,8 +1422,8 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		break;
 	case XFRM_MSG_UPDPOLICY:
 		RTE_LOG(INFO, pre_ld, "XFRM update policy start\n");
-		ret = process_new_policy(nh, sec_id, sec_port,
-			sec_port_flow);
+		ret = process_new_policy(nh, sec_id, rx_ports,
+			port_flows, tx_ports);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM update policy failed(%d)\n\n", ret);
@@ -1409,8 +1433,8 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		break;
 	case XFRM_MSG_NEWPOLICY:
 		RTE_LOG(INFO, pre_ld, "XFRM new policy start\n");
-		ret = process_new_policy(nh, sec_id, sec_port,
-			sec_port_flow);
+		ret = process_new_policy(nh, sec_id, rx_ports,
+			port_flows, tx_ports);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM new policy failed(%d)\n\n", ret);
@@ -1420,7 +1444,7 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		break;
 	case XFRM_MSG_DELPOLICY:
 		RTE_LOG(INFO, pre_ld, "XFRM delete policy start\n");
-		ret = process_del_policy(nh, sec_port);
+		ret = process_del_policy(nh);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM delete policy failed(%d)\n\n", ret);
@@ -1481,8 +1505,6 @@ static void *xfrm_msg_loop(void *data)
 	cpu_set_t cpuset;
 	struct xfm_msg_param *param = data;
 	uint16_t sec_id = param->sec_id;
-	uint16_t sec_port = param->eth_id;
-	uint16_t sec_port_flow = param->eth_rx_flow;
 
 	/* Set this cpu-affinity to CPU 0 */
 	CPU_ZERO(&cpuset);
@@ -1542,8 +1564,8 @@ static void *xfrm_msg_loop(void *data)
 				break;
 			}
 
-			ret = resolve_xfrm_notif(nh, len, sec_id, sec_port,
-				sec_port_flow);
+			ret = resolve_xfrm_notif(nh, len, sec_id, param->rx_ports,
+				param->rx_flows, param->tx_ports);
 			if (ret && ret != -EBADMSG)
 				break;
 		}
@@ -1594,7 +1616,8 @@ xfm_cryptodev_init(uint8_t crypt_dev, uint16_t qp_nb)
 }
 
 static int
-xfm_session_pool_create(uint8_t crypt_dev, uint16_t sec_port)
+xfm_session_pool_create(uint8_t crypt_dev,
+	struct rte_mempool *mbuf_pool)
 {
 	size_t max_sz, sz;
 	void *sec_ctx;
@@ -1615,17 +1638,7 @@ xfm_session_pool_create(uint8_t crypt_dev, uint16_t sec_port)
 			max_sz = sz;
 	}
 
-	sec_ctx = rte_eth_dev_get_sec_ctx(sec_port);
-	if (sec_ctx) {
-		sz = rte_security_session_get_size(sec_ctx);
-		if (sz > max_sz)
-			max_sz = sz;
-	}
-
-	snprintf(mp_name, RTE_MEMPOOL_NAMESIZE, "sess_mp");
-	sess_mp = rte_cryptodev_sym_session_pool_create(mp_name,
-		SESS_MP_NB_OBJS, max_sz, SESS_MP_CACHE_SZ, 0, 0);
-	s_xfm_mem_ctx.session_pool = sess_mp;
+	s_xfm_mem_ctx.session_pool = mbuf_pool;
 	if (!s_xfm_mem_ctx.session_pool)
 		rte_exit(EXIT_FAILURE, "Cannot init session pool\n");
 
@@ -1641,15 +1654,19 @@ xfm_session_pool_create(uint8_t crypt_dev, uint16_t sec_port)
 }
 
 static int
-xfrm_setup_msgloop(uint16_t sec_id, uint16_t sec_port,
-	uint16_t sec_port_flow)
+xfrm_setup_msgloop(uint16_t sec_id, uint16_t rx_ports[],
+	uint16_t rx_flows[], uint16_t tx_ports[])
 {
 	int ret;
 	pthread_t tid;
 
 	s_msg_param.sec_id = sec_id;
-	s_msg_param.eth_id = sec_port;
-	s_msg_param.eth_rx_flow = sec_port_flow;
+	rte_memcpy(s_msg_param.rx_ports, rx_ports,
+		sizeof(uint16_t) * XFM_POLICY_ETH_NUM);
+	rte_memcpy(s_msg_param.rx_flows, rx_flows,
+		sizeof(uint16_t) * XFM_POLICY_ETH_NUM);
+	rte_memcpy(s_msg_param.tx_ports, tx_ports,
+		sizeof(uint16_t) * XFM_POLICY_ETH_NUM);
 
 	ret = pthread_create(&tid, NULL, xfrm_msg_loop, &s_msg_param);
 	if (ret) {
@@ -1662,11 +1679,12 @@ xfrm_setup_msgloop(uint16_t sec_id, uint16_t sec_port,
 
 int
 xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
-	uint16_t sec_port, uint16_t sec_port_flow)
+	uint16_t rx_ports[], uint16_t rx_flows[],
+	uint16_t tx_ports[], struct rte_mempool *mbuf_pool)
 {
 	int ret;
 
-	ret = xfm_session_pool_create(crypt_dev, sec_port);
+	ret = xfm_session_pool_create(crypt_dev, mbuf_pool);
 	if (ret) {
 		RTE_LOG(ERR, pre_ld,
 			"Crypto session pool create failed(%d)\n",
@@ -1680,7 +1698,7 @@ xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
 
 		return ret;
 	}
-	ret = xfrm_setup_msgloop(crypt_dev, sec_port, sec_port_flow);
+	ret = xfrm_setup_msgloop(crypt_dev, rx_ports, rx_flows, tx_ports);
 	if (ret) {
 		RTE_LOG(ERR, pre_ld, "IPSec msg setup failed(%d)\n", ret);
 

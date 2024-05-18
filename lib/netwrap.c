@@ -64,6 +64,7 @@
 #define SOCK_TYPE_MASK 0xf
 #endif
 #define INVALID_SOCKFD (-1)
+#define INVALID_ESP_SPI 0
 
 static int s_socket_pre_set;
 static int s_eal_inited;
@@ -78,8 +79,12 @@ static int s_dpdmux_id = -1;
 static int s_dpdmux_ep_id;
 
 #define CRYPTO_DEV_DEFAULT_ID 0
-#define CRYPTO_DEV_QP_NUM 1
 #define CRYPTO_PORT_SEC_FLOW 0
+enum {
+	CRYPTO_DEV_INGRESS_QP,
+	CRYPTO_DEV_EGRESS_QP,
+	CRYPTO_DEV_QP_NUM
+};
 
 static uint8_t s_crypto_dev_id = CRYPTO_DEV_DEFAULT_ID;
 
@@ -150,9 +155,11 @@ struct fd_desc {
 	uint64_t rx_usr_bytes;
 };
 
-enum ingress_crypto_dir {
+enum pre_ld_crypto_dir {
 	INGRESS_CRYPTO_EQ,
-	INGRESS_CRYPTO_DQ
+	INGRESS_CRYPTO_DQ,
+	EGRESS_CRYPTO_EQ,
+	EGRESS_CRYPTO_DQ
 };
 
 pthread_mutex_t s_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -242,14 +249,15 @@ enum pre_ld_port_type {
 #define IP_HDRLEN       0x05
 #define IP_VHL_DEF      (IP_VERSION | IP_HDRLEN)
 
-struct pre_ld_rxq_port {
+struct pre_ld_port_desc {
 	uint16_t port_id;
 	uint16_t queue_id;
 };
 
-struct pre_ld_rxq_sec {
+struct pre_ld_sec_desc {
 	uint16_t sec_id;
 	uint16_t queue_id;
+	void *sa;
 };
 
 enum pre_ld_poll_type {
@@ -259,28 +267,29 @@ enum pre_ld_poll_type {
 	SELF_GEN
 };
 
-struct pre_ld_poll_tx_ring {
+struct pre_ld_txr_desc {
 	struct rte_ring **tx_ring;
 	uint16_t tx_ring_num;
 };
 
 union pre_ld_poll {
-	struct pre_ld_rxq_port poll_queue;
-	struct pre_ld_rxq_sec poll_sec;
-	struct pre_ld_poll_tx_ring tx_rings;
+	struct pre_ld_port_desc poll_port;
+	struct pre_ld_sec_desc poll_sec;
+	struct pre_ld_txr_desc tx_rings;
 };
 
 enum pre_ld_fwd_type {
 	HW_PORT,
 	RX_RING,
 	SEC_INGRESS,
+	SEC_EGRESS,
 	DROP
 };
 
 union pre_ld_fwd {
 	uint16_t fwd_port;
 	struct rte_ring *rx_ring;
-	uint16_t crypt_devid;
+	struct pre_ld_sec_desc fwd_sec;
 };
 
 struct pre_ld_lcore_fwd {
@@ -290,11 +299,17 @@ struct pre_ld_lcore_fwd {
 	union pre_ld_fwd fwd_dest;
 	uint64_t tx_count;
 	uint64_t tx_pkts;
-	uint64_t tx_oh_bytes;
+	union {
+		uint64_t tx_oh_bytes;
+		uint64_t tx_sec_bytes;
+	};
 
 	uint64_t rx_count;
 	uint64_t rx_pkts;
-	uint64_t rx_oh_bytes;
+	union {
+		uint64_t rx_oh_bytes;
+		uint64_t rx_sec_bytes;
+	};
 };
 
 #define MAX_RX_POLLS_PER_LCORE 16
@@ -325,6 +340,15 @@ struct pre_ld_udp_desc {
 	uint16_t offset;
 	uint16_t length;
 } __rte_packed;
+
+#define PRE_LD_MP_PRIV_SIZE \
+	sizeof(struct pre_ld_ipsec_priv)
+
+#define PRE_LD_MBUF_OFFSET 512
+
+#define PRE_LD_MBUF_MAX_SIZE \
+	(PRE_LD_MP_PRIV_SIZE + PRE_LD_MBUF_OFFSET + \
+	RTE_MBUF_DEFAULT_DATAROOM)
 
 static inline int
 convert_ip_addr_to_str(char *str,
@@ -670,6 +694,8 @@ eal_send_fill_mbuf(const void *buf, size_t len, int fd,
 	struct rte_ipv4_hdr *ip_hdr;
 	struct rte_udp_hdr *udp_hdr;
 
+	m->data_off = PRE_LD_MBUF_OFFSET;
+
 	/* Initialize the Ethernet header */
 	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
@@ -687,7 +713,6 @@ eal_send_fill_mbuf(const void *buf, size_t len, int fd,
 	udp_data = (void *)(udp_hdr + 1);
 	if (buf)
 		rte_memcpy(udp_data, buf, len);
-	m->data_off = RTE_PKTMBUF_HEADROOM;
 	m->nb_segs = 1;
 	m->next = NULL;
 	m->data_len = len + sizeof(*eth_hdr) +
@@ -695,6 +720,8 @@ eal_send_fill_mbuf(const void *buf, size_t len, int fd,
 	if (m->data_len < 60)
 		m->data_len = 60;
 	m->pkt_len = m->data_len;
+	m->packet_type = RTE_PTYPE_L2_ETHER |
+		RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
 }
 
 static int
@@ -704,11 +731,15 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 	int sent, cnt, ret;
 	uint16_t txq_id;
 	uint32_t byte, byte_overhead;
-	struct rte_mempool *pool = s_tx_from_rx_pool ?
-		s_pre_ld_rx_pool : s_fd_desc[sockfd].tx_pool;
+	struct rte_mempool *pool;
 
 	RTE_SET_USED(sockfd);
 	RTE_SET_USED(flags);
+
+	if (s_tx_from_rx_pool)
+		pool = s_pre_ld_rx_pool;
+	else
+		pool = s_fd_desc[sockfd].tx_pool;
 
 	ret = eal_data_path_thread_register(&s_fd_desc[sockfd]);
 	if (ret)
@@ -764,8 +795,9 @@ send_err:
 }
 
 void
-pre_ld_configure_dl_sec_path(uint16_t port_id,
-	uint16_t rxq_id)
+pre_ld_configure_sec_path(uint16_t rx_port,
+	uint16_t rxq_id, uint8_t dir, uint16_t tx_port,
+	void *sa)
 {
 	struct pre_ld_lcore_conf *lcore;
 	uint16_t lcore_id = s_data_path_core;
@@ -779,13 +811,86 @@ pre_ld_configure_dl_sec_path(uint16_t port_id,
 	pthread_mutex_lock(&s_lcore_mutex);
 	fwd = &lcore->fwd[lcore->n_fwds];
 	fwd->poll_type = RX_QUEUE;
-	fwd->poll.poll_queue.port_id = port_id;
-	fwd->poll.poll_queue.queue_id = rxq_id;
-	fwd->fwd_type = SEC_INGRESS;
-	fwd->fwd_dest.crypt_devid = s_crypto_dev_id;
+	fwd->poll.poll_port.port_id = rx_port;
+	fwd->poll.poll_port.queue_id = rxq_id;
+	if (dir == XFRM_POLICY_IN) {
+		fwd->fwd_type = SEC_INGRESS;
+		fwd->fwd_dest.fwd_sec.queue_id = CRYPTO_DEV_INGRESS_QP;
+	} else {
+		fwd->fwd_type = SEC_EGRESS;
+		fwd->fwd_dest.fwd_sec.queue_id = CRYPTO_DEV_EGRESS_QP;
+	}
+	fwd->fwd_dest.fwd_sec.sec_id = s_crypto_dev_id;
+	fwd->fwd_dest.fwd_sec.sa = sa;
+	rte_wmb();
+	lcore->n_fwds++;
+
+	if (tx_port == INVALID_PORTID) {
+		pthread_mutex_unlock(&s_lcore_mutex);
+		return;
+	}
+	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
+		rte_exit(EXIT_FAILURE, "Line%d: Too many forwards\n",
+			__LINE__);
+	}
+	fwd = &lcore->fwd[lcore->n_fwds];
+	fwd->poll_type = SEC_COMPLETE;
+	fwd->poll.poll_sec.sec_id = s_crypto_dev_id;
+	if (dir == XFRM_POLICY_IN)
+		fwd->poll.poll_sec.queue_id = CRYPTO_DEV_INGRESS_QP;
+	else
+		fwd->poll.poll_sec.queue_id = CRYPTO_DEV_EGRESS_QP;
+
+	fwd->fwd_type = HW_PORT;
+	fwd->fwd_dest.fwd_port = tx_port;
 	rte_wmb();
 	lcore->n_fwds++;
 	pthread_mutex_unlock(&s_lcore_mutex);
+}
+
+static struct rte_flow *
+pre_ld_configure_default_flow(uint16_t portid,
+	uint16_t group, uint16_t priority)
+{
+	struct rte_flow_attr flow_attr;
+	struct rte_flow_item flow_item[2];
+	struct rte_flow_action flow_action[2];
+	struct rte_flow_action_queue rxq;
+	struct rte_flow *flow = NULL;
+	int ret;
+
+	memset(&flow_attr, 0, sizeof(struct rte_flow_attr));
+	flow_attr.group = group;
+	flow_attr.priority = priority;
+	flow_attr.ingress = 1;
+	flow_attr.egress = 0;
+
+	flow_item[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+	flow_item[0].spec = NULL;
+	flow_item[0].mask = NULL;
+	flow_item[0].last = NULL;
+	flow_item[1].type = RTE_FLOW_ITEM_TYPE_END;
+
+	flow_action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+	rxq.index = priority;
+	flow_action[0].conf = &rxq;
+	flow_action[1].type = RTE_FLOW_ACTION_TYPE_END;
+	ret = rte_flow_validate(portid, &flow_attr, flow_item,
+		flow_action, NULL);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld, "%s: flow validate failed(%d)",
+			__func__, ret);
+		return NULL;
+	}
+	flow = rte_flow_create(portid, &flow_attr, flow_item,
+		flow_action, NULL);
+	if (!flow) {
+		RTE_LOG(ERR, pre_ld, "%s: flow create failed", __func__);
+
+		return NULL;
+	}
+
+	return flow;
 }
 
 static void
@@ -840,39 +945,30 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	pthread_mutex_lock(&s_lcore_mutex);
 	fwd = &lcore->fwd[lcore->n_fwds];
 	fwd->poll_type = RX_QUEUE;
-	fwd->poll.poll_queue.port_id = ext_id;
-	fwd->poll.poll_queue.queue_id = 0;
+	fwd->poll.poll_port.port_id = ext_id;
+	fwd->poll.poll_port.queue_id = 0;
 	fwd->fwd_type = HW_PORT;
 	fwd->fwd_dest.fwd_port = ul_id;
 	rte_wmb();
 	lcore->n_fwds++;
 
+	flow = pre_ld_configure_default_flow(ul_id,
+		DEFAULT_DIRECT_GROUP, rxq_nb[ul_id] - 1);
+	if (!flow) {
+		pthread_mutex_unlock(&s_lcore_mutex);
+		return;
+	}
+	s_default_flow[s_default_flow_num] = flow;
+	s_default_flow_num++;
 	fwd = &lcore->fwd[lcore->n_fwds];
 	fwd->poll_type = RX_QUEUE;
-	fwd->poll.poll_queue.port_id = ul_id;
-	fwd->poll.poll_queue.queue_id = 0;
+	fwd->poll.poll_port.port_id = ul_id;
+	fwd->poll.poll_port.queue_id = rxq_nb[ul_id] - 1;
 	fwd->fwd_type = HW_PORT;
 	fwd->fwd_dest.fwd_port = ext_id;
 	rte_wmb();
 	lcore->n_fwds++;
 
-	if (!s_ipsec_enable) {
-		pthread_mutex_unlock(&s_lcore_mutex);
-		return;
-	}
-	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
-		pthread_mutex_unlock(&s_lcore_mutex);
-		rte_exit(EXIT_FAILURE, "Line%d: Too many forwards\n",
-			__LINE__);
-	}
-	fwd = &lcore->fwd[lcore->n_fwds];
-	fwd->poll_type = SEC_COMPLETE;
-	fwd->poll.poll_sec.sec_id = s_crypto_dev_id;
-	fwd->poll.poll_sec.queue_id = 0;
-	fwd->fwd_type = HW_PORT;
-	fwd->fwd_dest.fwd_port = ul_id;
-	rte_wmb();
-	lcore->n_fwds++;
 	pthread_mutex_unlock(&s_lcore_mutex);
 }
 
@@ -970,18 +1066,99 @@ pre_ld_ipsec_dequeue(struct rte_mbuf *pkts[], uint16_t max_pkts,
 	return nb_pkts;
 }
 
-static struct pre_ld_ipsec_sa_entry *
-pre_ld_in_sp_lookup_sa(uint16_t sa_idx)
+static inline int
+pre_ld_ipaddr_sp_cmp(union pre_ld_ipsec_addr *src,
+	union pre_ld_ipsec_addr *dst, uint16_t family,
+	struct pre_ld_ipsec_sp_entry *sp)
 {
+	if (family == AF_INET) {
+		if (!memcmp(sp->src.ip4,
+			src->ip4, sizeof(rte_be32_t)) &&
+			!memcmp(sp->dst.ip4,
+			dst->ip4, sizeof(rte_be32_t) - 1))
+			return true;
+	} else if (family == AF_INET6) {
+		if (!memcmp(sp->src.ip6, src->ip6, 16) &&
+			!memcmp(sp->dst.ip6, dst->ip6, 16))
+			return true;
+	}
+
+	return false;
+}
+
+static struct pre_ld_ipsec_sa_entry *
+pre_ld_out_sp_lookup_sa(union pre_ld_ipsec_addr *src,
+	union pre_ld_ipsec_addr *dst, rte_be32_t spi,
+	uint16_t family)
+{
+	struct pre_ld_ipsec_sp_entry *curr;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 
-	RTE_SET_USED(sa_idx);
+	if (family == AF_INET) {
+		curr = LIST_FIRST(&cntx->sp_ipv4_out_list);
+	} else if (family == AF_INET6) {
+		curr = LIST_FIRST(&cntx->sp_ipv6_out_list);
+	} else {
+		RTE_LOG(ERR, pre_ld,
+			"%s: Invalid family(%d)\n", __func__, family);
+		return NULL;
+	}
 
-	return cntx->sp_in->sa;
+	while (curr) {
+		if (pre_ld_ipaddr_sp_cmp(src, dst,
+			family, curr)) {
+			if (spi != INVALID_ESP_SPI &&
+				spi == curr->spi)
+				return curr->sa;
+			else if (spi == INVALID_ESP_SPI)
+				return curr->sa;
+		}
+		curr = LIST_NEXT(curr, next);
+	}
+
+	return NULL;
+}
+
+static struct pre_ld_ipsec_sa_entry *
+pre_ld_single_sa_lookup(struct rte_mbuf *pkt,
+	enum pre_ld_crypto_dir dir)
+{
+	struct rte_ether_hdr *eth;
+	struct rte_ipv4_hdr *ipv4_hdr = NULL;
+	struct rte_ipv6_hdr *ipv6_hdr = NULL;
+	union pre_ld_ipsec_addr src, dst;
+	struct pre_ld_ipsec_sa_entry *sa = NULL;
+
+	if (dir != EGRESS_CRYPTO_EQ) {
+		RTE_LOG(WARNING, pre_ld,
+			"SA lookup not implemented on direction(%d)\n", dir);
+
+		return NULL;
+	}
+
+	eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+	if (pkt->packet_type & RTE_PTYPE_L3_IPV4) {
+		ipv4_hdr = (void *)(eth + 1);
+		rte_memcpy(src.ip4, &ipv4_hdr->src_addr, sizeof(rte_be32_t));
+		rte_memcpy(dst.ip4, &ipv4_hdr->dst_addr, sizeof(rte_be32_t));
+	} else if (pkt->packet_type & RTE_PTYPE_L3_IPV6) {
+		ipv6_hdr = (void *)(eth + 1);
+		rte_memcpy(src.ip6, ipv6_hdr->src_addr, 16);
+		rte_memcpy(dst.ip6, ipv6_hdr->dst_addr, 16);
+	} else {
+		RTE_LOG(ERR, pre_ld, "Invalid mbuf packet type(%08x)\n",
+			pkt->packet_type);
+		return NULL;
+	}
+
+	/**Lookup outbound SP to get associated SA.*/
+	sa = pre_ld_out_sp_lookup_sa(&src, &dst, INVALID_ESP_SPI,
+			ipv4_hdr ? AF_INET : AF_INET6);
+	return sa;
 }
 
 static inline void
-pre_ld_adjust_inbound_ipv4_pktlen(struct rte_mbuf *m,
+pre_ld_adjust_ipv4_pktlen(struct rte_mbuf *m,
 	const struct rte_ipv4_hdr *iph, uint32_t l2_len)
 {
 	uint32_t plen, trim;
@@ -994,43 +1171,40 @@ pre_ld_adjust_inbound_ipv4_pktlen(struct rte_mbuf *m,
 }
 
 static void
-pre_ld_adjust_inbound_ipv4(struct rte_mbuf *pkt,
-	enum ingress_crypto_dir dir)
+pre_ld_adjust_ipv4(struct rte_mbuf *pkt,
+	enum pre_ld_crypto_dir dir)
 {
 	struct rte_ether_hdr *eth;
 	struct rte_ipv4_hdr *iph4;
 	struct pre_ld_ipsec_priv *priv;
 
 	priv = rte_mbuf_to_priv(pkt);
-	if (dir == INGRESS_CRYPTO_EQ) {
+	if (dir == INGRESS_CRYPTO_EQ || dir == EGRESS_CRYPTO_EQ) {
 		eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
 		rte_memcpy(priv->cntx, eth, sizeof(struct rte_ether_hdr));
 
 		iph4 = (void *)rte_pktmbuf_adj(pkt, RTE_ETHER_HDR_LEN);
-		pre_ld_adjust_inbound_ipv4_pktlen(pkt, iph4, 0);
+		pre_ld_adjust_ipv4_pktlen(pkt, iph4, 0);
 
 		pkt->l2_len = 0;
 		pkt->l3_len = sizeof(*iph4);
-	} else {
+	} else if (dir == INGRESS_CRYPTO_DQ || dir == EGRESS_CRYPTO_DQ) {
+
 		iph4 = rte_pktmbuf_mtod(pkt, void *);
 		rte_memcpy((char *)iph4 - sizeof(struct rte_ether_hdr),
 				priv->cntx, sizeof(struct rte_ether_hdr));
 		pkt->data_off -= sizeof(struct rte_ether_hdr);
 		pkt->pkt_len += sizeof(struct rte_ether_hdr);
 		pkt->data_len += sizeof(struct rte_ether_hdr);
+	} else {
+		RTE_LOG(ERR, pre_ld, "Invalid IPSec dir(%d)\n", dir);
 	}
-}
-
-static uint32_t
-pre_ld_sec_enqueue_cop_burst(struct rte_crypto_op **cop,
-	uint16_t qp, uint16_t nb)
-{
-	return rte_cryptodev_enqueue_burst(s_crypto_dev_id, qp, cop, nb);
 }
 
 static inline uint16_t
 pre_ld_ipsec_sa_enqueue(struct rte_mbuf *pkts[],
-	void *sas, uint16_t nb_pkts, uint16_t qp)
+	void *sas, uint16_t nb_pkts,
+	uint16_t crypto_id, uint16_t qp)
 {
 	int i;
 	struct pre_ld_ipsec_priv *priv;
@@ -1060,10 +1234,85 @@ pre_ld_ipsec_sa_enqueue(struct rte_mbuf *pkts[],
 		priv->sym_cop.m_dst = NULL;
 
 		rte_security_attach_session(&priv->cop, ips->security.ses);
+
 		cops[i] = &priv->cop;
 	}
 
-	return pre_ld_sec_enqueue_cop_burst(cops, qp, nb_pkts);
+	return rte_cryptodev_enqueue_burst(crypto_id,
+			qp, cops, nb_pkts);
+}
+
+static void
+pre_ld_pktmbuf_init(struct rte_mempool *mp,
+	__rte_unused void *opaque_arg,
+	void *_m,
+	__rte_unused uint32_t i)
+{
+	struct rte_mbuf *m = _m;
+	uint32_t mbuf_size, buf_len, priv_size;
+
+	RTE_ASSERT(mp->private_data_size >=
+		   sizeof(struct rte_pktmbuf_pool_private));
+
+	priv_size = rte_pktmbuf_priv_size(mp);
+	mbuf_size = sizeof(struct rte_mbuf) + priv_size;
+	buf_len = rte_pktmbuf_data_room_size(mp);
+
+	RTE_ASSERT(RTE_ALIGN(priv_size, RTE_MBUF_PRIV_ALIGN) == priv_size);
+	RTE_ASSERT(mp->elt_size >= mbuf_size);
+	RTE_ASSERT(buf_len <= UINT16_MAX);
+
+	memset(m, 0, mbuf_size);
+	/* start of buffer is after mbuf structure and priv data */
+	m->priv_size = priv_size;
+	m->buf_addr = (char *)m + mbuf_size;
+	rte_mbuf_iova_set(m, rte_mempool_virt2iova(m) + mbuf_size);
+	m->buf_len = buf_len;
+
+	/* keep some headroom between start of buffer and data */
+	m->data_off = PRE_LD_MBUF_OFFSET;
+
+	/* init some constant fields */
+	m->pool = mp;
+	m->nb_segs = 1;
+	m->port = RTE_MBUF_PORT_INVALID;
+	rte_mbuf_refcnt_set(m, 1);
+	m->next = NULL;
+}
+
+static uint16_t
+pre_ld_fwd_to_crypto(struct pre_ld_lcore_fwd *fwd,
+	struct rte_mbuf *mbufs[], uint16_t nb_rx)
+{
+	uint16_t crypto_id = fwd->fwd_dest.fwd_sec.sec_id;
+	uint16_t queueid = fwd->fwd_dest.fwd_sec.queue_id;
+	void *sa = fwd->fwd_dest.fwd_sec.sa;
+	enum pre_ld_crypto_dir dir = EGRESS_CRYPTO_EQ;
+	uint16_t nb_tx = 0, i;
+
+	if (fwd->fwd_type == SEC_EGRESS)
+		dir = EGRESS_CRYPTO_EQ;
+	else if (fwd->fwd_type == SEC_INGRESS)
+		dir = INGRESS_CRYPTO_EQ;
+	else
+		return 0;
+
+	if (!sa) {
+		RTE_LOG(WARNING, pre_ld, "HW SA lookup failed\n");
+		for (i = 0; i < nb_rx; i++) {
+			sa = pre_ld_single_sa_lookup(mbufs[i], dir);
+			pre_ld_adjust_ipv4(mbufs[i], dir);
+			nb_tx += pre_ld_ipsec_sa_enqueue(&mbufs[i],
+					sa, 1, crypto_id, queueid);
+		}
+	} else {
+		for (i = 0; i < nb_rx; i++)
+			pre_ld_adjust_ipv4(mbufs[i], dir);
+		nb_tx = pre_ld_ipsec_sa_enqueue(mbufs, sa, nb_rx,
+			crypto_id, queueid);
+	}
+
+	return nb_tx;
 }
 
 static int
@@ -1077,9 +1326,11 @@ pre_ld_main_loop(void *dummy)
 	struct pre_ld_lcore_fwd *fwd;
 	uint64_t bytes_overhead[MAX_PKT_BURST];
 	struct rte_ring *txr;
-	struct pre_ld_poll_tx_ring *tx_rings;
+	struct pre_ld_txr_desc *tx_rings;
 	struct rte_mempool *tx_pool = NULL;
-	struct pre_ld_ipsec_sa_entry *sa;
+	uint16_t rx_ports[XFM_POLICY_ETH_NUM];
+	uint16_t tx_ports[XFM_POLICY_ETH_NUM];
+	uint16_t rx_port_flows[XFM_POLICY_ETH_NUM];
 
 	RTE_SET_USED(dummy);
 
@@ -1109,17 +1360,27 @@ pre_ld_main_loop(void *dummy)
 		qconf->n_fwds, lcore_id);
 
 	tx_pool = rte_pktmbuf_pool_create_by_ops("tx_self_gen_pool",
-		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE, 0,
-		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id(),
+		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE,
+		PRE_LD_MP_PRIV_SIZE,
+		PRE_LD_MBUF_MAX_SIZE,
+		rte_socket_id(),
 		RTE_MBUF_DEFAULT_MEMPOOL_OPS);
 	if (!tx_pool) {
 		RTE_LOG(WARNING, pre_ld,
 			"TX self gen pool created failed\n");
 	}
+	rte_mempool_obj_iter(tx_pool, pre_ld_pktmbuf_init, NULL);
 
 	if (s_ipsec_enable) {
+		rx_ports[XFM_POLICY_IN_ETH_IDX] = s_dir_traffic_cfg.dl_id;
+		tx_ports[XFM_POLICY_IN_ETH_IDX] = s_dir_traffic_cfg.ul_id;
+		rx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ul_id;
+		tx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ext_id;
+		rx_port_flows[XFM_POLICY_IN_ETH_IDX] = CRYPTO_PORT_SEC_FLOW;
+		rx_port_flows[XFM_POLICY_OUT_ETH_IDX] = CRYPTO_PORT_SEC_FLOW;
 		ret = xfm_crypto_init(s_crypto_dev_id, CRYPTO_DEV_QP_NUM,
-			s_dir_traffic_cfg.dl_id, CRYPTO_PORT_SEC_FLOW);
+			rx_ports, rx_port_flows, tx_ports,
+			s_pre_ld_rx_pool);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
 			return ret;
@@ -1135,8 +1396,8 @@ for_ever_loop:
 		queueid = INVALID_QUEUEID;
 
 		if (fwd->poll_type == RX_QUEUE) {
-			portid = fwd->poll.poll_queue.port_id;
-			queueid = fwd->poll.poll_queue.queue_id;
+			portid = fwd->poll.poll_port.port_id;
+			queueid = fwd->poll.poll_port.queue_id;
 			nb_rx = rte_eth_rx_burst(portid, queueid,
 					mbufs, MAX_PKT_BURST);
 		} else if (fwd->poll_type == TX_RING) {
@@ -1173,9 +1434,12 @@ for_ever_loop:
 			queueid = fwd->poll.poll_sec.queue_id;
 			nb_rx = pre_ld_ipsec_dequeue(mbufs, MAX_PKT_BURST,
 				crypto_id, queueid);
-			if (nb_rx) {
+			if (nb_rx && queueid == CRYPTO_DEV_INGRESS_QP) {
 				for (i = 0; i < nb_rx; i++)
-					pre_ld_adjust_inbound_ipv4(mbufs[i], INGRESS_CRYPTO_DQ);
+					pre_ld_adjust_ipv4(mbufs[i], INGRESS_CRYPTO_DQ);
+			} else if (nb_rx && queueid == CRYPTO_DEV_EGRESS_QP) {
+				for (i = 0; i < nb_rx; i++)
+					pre_ld_adjust_ipv4(mbufs[i], EGRESS_CRYPTO_DQ);
 			}
 		} else {
 			nb_rx = 0;
@@ -1184,22 +1448,22 @@ for_ever_loop:
 		if (!nb_rx)
 			continue;
 
-		for (j = 0; j < nb_rx; j++) {
-			bytes_overhead[j] = mbufs[j]->pkt_len +
-				RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
-			fwd->rx_oh_bytes += bytes_overhead[j];
+		if (fwd->poll_type == SEC_COMPLETE) {
+			for (j = 0; j < nb_rx; j++)
+				fwd->rx_sec_bytes += mbufs[j]->pkt_len;
+		} else {
+			for (j = 0; j < nb_rx; j++) {
+				bytes_overhead[j] = mbufs[j]->pkt_len +
+					RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+				fwd->rx_oh_bytes += bytes_overhead[j];
+			}
 		}
 		fwd->rx_pkts += nb_rx;
 		fwd->rx_count++;
 
-		if (fwd->fwd_type == SEC_INGRESS) {
-			RTE_ASSERT(queueid != INVALID_QUEUEID);
-
-			sa = pre_ld_in_sp_lookup_sa(queueid);
-			RTE_ASSERT(sa);
-			for (i = 0; i < nb_rx; i++)
-				pre_ld_adjust_inbound_ipv4(mbufs[i], INGRESS_CRYPTO_EQ);
-			nb_tx = pre_ld_ipsec_sa_enqueue(mbufs, sa, nb_rx, queueid);
+		if (fwd->fwd_type == SEC_EGRESS ||
+			fwd->fwd_type == SEC_INGRESS) {
+			nb_tx = pre_ld_fwd_to_crypto(fwd, mbufs, nb_rx);
 		} else if (fwd->fwd_type == HW_PORT) {
 			portid = fwd->fwd_dest.fwd_port;
 			nb_tx = rte_eth_tx_burst(portid, 0, mbufs, nb_rx);
@@ -1327,7 +1591,7 @@ pre_ld_data_path_statistics(void *arg)
 {
 	uint16_t i, j;
 	struct pre_ld_lcore_conf *qconf;
-	struct pre_ld_poll_tx_ring *tx_rings;
+	struct pre_ld_txr_desc *tx_rings;
 	char poll_info[512], fwd_info[512];
 	char rx_stat_info[512], tx_stat_info[512];
 	const char *space = "        ";
@@ -1374,8 +1638,8 @@ statistics_loop:
 	for (i = 0; i < qconf->n_fwds; i++) {
 		if (qconf->fwd[i].poll_type == RX_QUEUE) {
 			sprintf(poll_info, "Poll from port%d/queue%d",
-				qconf->fwd[i].poll.poll_queue.port_id,
-				qconf->fwd[i].poll.poll_queue.queue_id);
+				qconf->fwd[i].poll.poll_port.port_id,
+				qconf->fwd[i].poll.poll_port.queue_id);
 		} else if (qconf->fwd[i].poll_type == TX_RING) {
 			tx_rings = &qconf->fwd[i].poll.tx_rings;
 			offset = sprintf(poll_info, "Poll from tx rings:");
@@ -1573,8 +1837,9 @@ static int eal_main(void)
 
 	/* create the mbuf pool */
 	s_pre_ld_rx_pool = rte_pktmbuf_pool_create("rx_pool",
-		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE, 0,
-		RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE,
+		PRE_LD_MP_PRIV_SIZE,
+		PRE_LD_MBUF_MAX_SIZE, rte_socket_id());
 	if (!s_pre_ld_rx_pool)
 		rte_exit(EXIT_FAILURE, "Cannot init rx pool\n");
 
@@ -1628,16 +1893,19 @@ static int eal_main(void)
 
 		if (port_type[portid] == EXTERNAL_TYPE) {
 			ext_id = portid;
-			s_tx_port = ext_id;
+			if (!s_ipsec_enable)
+				s_tx_port = ext_id;
 			rxq_num[portid] = 1;
 			txq_num[portid] = 1;
 		} else if (port_type[portid] == UP_LINK_TYPE) {
 			ul_id = portid;
-			rxq_num[portid] = 1;
-			txq_num[portid] = 1;
+			rxq_num[portid] = dev_info[portid].max_rx_queues;
+			txq_num[portid] = dev_info[portid].max_tx_queues;
 		} else if (port_type[portid] == DOWN_LINK_TYPE) {
 			dl_id = portid;
 			s_rx_port = dl_id;
+			if (s_ipsec_enable)
+				s_tx_port = dl_id;
 			rxq_num[portid] = dev_info[portid].max_rx_queues;
 			txq_num[portid] = dev_info[portid].max_tx_queues;
 		} else if (port_type[portid] == KERNEL_TAP_TYPE) {
@@ -2013,12 +2281,12 @@ create_local_flow:
 	pthread_mutex_lock(&s_lcore_mutex);
 	fwd = &lcore->fwd[lcore->n_fwds];
 	fwd->poll_type = RX_QUEUE;
-	fwd->poll.poll_queue.port_id = s_fd_desc[sockfd].rx_port;
-	fwd->poll.poll_queue.queue_id = rxq_id;
+	fwd->poll.poll_port.port_id = s_fd_desc[sockfd].rx_port;
+	fwd->poll.poll_port.queue_id = rxq_id;
 	offset += sprintf(&fwd_info[offset],
 		"FWD[%d]: RX from port%d, queue%d ",
-		lcore->n_fwds, fwd->poll.poll_queue.port_id,
-		fwd->poll.poll_queue.queue_id);
+		lcore->n_fwds, fwd->poll.poll_port.port_id,
+		fwd->poll.poll_port.queue_id);
 	fwd->fwd_type = RX_RING;
 	fwd->fwd_dest.rx_ring = s_fd_desc[sockfd].rx_ring;
 	offset += sprintf(&fwd_info[offset],
@@ -2052,7 +2320,7 @@ usr_socket_fd_desc_init(int sockfd,
 	int ret = 0, found = 0;
 	struct pre_ld_lcore_conf *lcore;
 	struct pre_ld_lcore_fwd *fwd;
-	struct pre_ld_poll_tx_ring *tx_rings;
+	struct pre_ld_txr_desc *tx_rings;
 	uint16_t n_fwds;
 	char nm[64];
 
@@ -2146,13 +2414,15 @@ usr_socket_fd_desc_init(int sockfd,
 	s_fd_desc[sockfd].cpu = -1;
 	sprintf(nm, "tx_pool_fd%d", sockfd);
 	s_fd_desc[sockfd].tx_pool = rte_pktmbuf_pool_create_by_ops(nm,
-			MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE, 0,
-			RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id(),
-			RTE_MBUF_DEFAULT_MEMPOOL_OPS);
+			MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE,
+			PRE_LD_MP_PRIV_SIZE, PRE_LD_MBUF_MAX_SIZE,
+			rte_socket_id(), RTE_MBUF_DEFAULT_MEMPOOL_OPS);
 	if (!s_fd_desc[sockfd].tx_pool) {
 		ret = -ENOMEM;
 		RTE_LOG(ERR, pre_ld, "Create %s failed\n", nm);
 	}
+	rte_mempool_obj_iter(s_fd_desc[sockfd].tx_pool,
+		pre_ld_pktmbuf_init, NULL);
 
 fd_init_quit:
 	if (ret) {
@@ -2197,6 +2467,10 @@ fd_init_quit:
 		}
 	}
 	if (!found) {
+		if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
+			rte_exit(EXIT_FAILURE, "Line%d: Too many forwards\n",
+				__LINE__);
+		}
 		fwd = &lcore->fwd[lcore->n_fwds];
 		fwd->poll.tx_rings.tx_ring = rte_malloc(NULL,
 			sizeof(void *) * MAX_USR_FD_NUM, 0);
@@ -2213,6 +2487,22 @@ fd_init_quit:
 		fwd->poll.tx_rings.tx_ring_num = 1;
 		rte_wmb();
 		lcore->n_fwds++;
+
+		if (s_ipsec_enable) {
+			if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
+				pthread_mutex_unlock(&s_lcore_mutex);
+				rte_exit(EXIT_FAILURE,
+					"Line%d: Too many forwards\n", __LINE__);
+			}
+			fwd = &lcore->fwd[lcore->n_fwds];
+			fwd->poll_type = SEC_COMPLETE;
+			fwd->poll.poll_sec.sec_id = s_crypto_dev_id;
+			fwd->poll.poll_sec.queue_id = CRYPTO_DEV_EGRESS_QP;
+			fwd->fwd_type = HW_PORT;
+			fwd->fwd_dest.fwd_port = s_fd_desc[sockfd].tx_port;
+			rte_wmb();
+			lcore->n_fwds++;
+		}
 	} else {
 		tx_rings = &fwd->poll.tx_rings;
 		tx_rings->tx_ring[tx_rings->tx_ring_num] =

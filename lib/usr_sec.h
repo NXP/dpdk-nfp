@@ -73,6 +73,12 @@
 #define INVALID_QUEUEID 0xffff
 #define INVALID_PORTID 0xffff
 
+enum {
+	XFM_POLICY_IN_ETH_IDX,
+	XFM_POLICY_OUT_ETH_IDX,
+	XFM_POLICY_ETH_NUM
+};
+
 #define MAX_SEC_KEY_SIZE 36
 
 #define PRE_LD_INVALID_SPI (0)
@@ -121,6 +127,7 @@ struct pre_ld_ipsec_sp_entry {
 	uint16_t family;
 	uint32_t priority;
 	uint32_t index;
+	uint8_t dir;
 
 	struct rte_flow_action action;
 	struct rte_flow_attr attr;
@@ -130,7 +137,8 @@ struct pre_ld_ipsec_sp_entry {
 	};
 	struct rte_flow_item_esp esp_spec;
 	struct rte_flow *flow;
-	uint32_t flow_idx;
+	uint16_t flow_idx;
+	uint16_t port_idx;
 
 	struct pre_ld_ipsec_sa_entry *sa;
 };
@@ -151,6 +159,7 @@ struct pre_ld_ipsec_cntx {
 	struct pre_ld_ipsec_sp_head sp_ipv6_out_list;
 
 	struct pre_ld_ipsec_sp_entry *sp_in;
+	struct pre_ld_ipsec_sp_entry *sp_out;
 };
 
 struct pre_ld_ipsec_priv {
@@ -194,7 +203,8 @@ struct xfm_ipsec_sa_params {
 
 int
 xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
-	uint16_t sec_port, uint16_t sec_port_flow);
+	uint16_t rx_ports[], uint16_t rx_flows[],
+	uint16_t tx_ports[], struct rte_mempool *mbuf_pool);
 
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void);
 
