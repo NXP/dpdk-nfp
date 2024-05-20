@@ -60,6 +60,8 @@
 #include "netwrap.h"
 #include "usr_sec.h"
 
+#define PRE_LD_CONSTRUCTOR_PRIO 65535
+
 #ifndef SOCK_TYPE_MASK
 #define SOCK_TYPE_MASK 0xf
 #endif
@@ -67,6 +69,8 @@
 #define INVALID_ESP_SPI 0
 
 static int s_socket_pre_set;
+static int s_in_pre_loading;
+
 static int s_eal_inited;
 static pthread_mutex_t s_eal_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t s_dp_init_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -379,6 +383,26 @@ convert_ip_addr_to_str(char *str,
 	}
 
 	return 0;
+}
+
+static void
+pre_ld_wait_for_sp_ip4_ready(void)
+{
+	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+
+	while (!LIST_FIRST(&cntx->sp_ipv4_out_list) ||
+		!LIST_FIRST(&cntx->sp_ipv4_in_list) ||
+		!cntx->sp_in || !cntx->sp_out) {
+		RTE_LOG(INFO, pre_ld,
+			"Waiting for xfm negotiate complete\n");
+		sleep(1);
+	}
+
+	while (!cntx->sp_in->sa || !cntx->sp_out->sa) {
+		RTE_LOG(INFO, pre_ld,
+			"Waiting for sa negotiate complete\n");
+		sleep(1);
+	}
 }
 
 static int
@@ -2688,6 +2712,9 @@ socket(int domain, int type, int protocol)
 
 			return sockfd;
 		}
+		if (s_in_pre_loading)
+			return sockfd;
+
 		ret = eal_init(domain, type);
 		if (ret > 0 && (type & SOCK_TYPE_MASK) == SOCK_DGRAM) {
 			ret = usr_socket_fd_desc_init(sockfd,
@@ -2700,6 +2727,8 @@ socket(int domain, int type, int protocol)
 			RTE_LOG(INFO, pre_ld,
 				"pre set user Socket FD(%d) created.\n",
 				sockfd);
+			if (s_ipsec_enable)
+				pre_ld_wait_for_sp_ip4_ready();
 		}
 	} else { /* pre init*/
 		LIBC_FUNCTION(socket);
@@ -2719,6 +2748,9 @@ socket(int domain, int type, int protocol)
 
 			return sockfd;
 		}
+		if (s_in_pre_loading)
+			return sockfd;
+
 		ret = eal_init(domain, type);
 		if (ret > 0 && (type & SOCK_TYPE_MASK) == SOCK_DGRAM) {
 			ret = usr_socket_fd_desc_init(sockfd,
@@ -2730,6 +2762,8 @@ socket(int domain, int type, int protocol)
 			}
 			RTE_LOG(INFO, pre_ld,
 				"user Socket FD(%d) created.\n", sockfd);
+			if (s_ipsec_enable)
+				pre_ld_wait_for_sp_ip4_ready();
 		}
 	}
 
@@ -3707,11 +3741,13 @@ __attribute__((destructor)) static void netwrap_main_dtor(void)
 	s_fd_desc = NULL;
 }
 
-__attribute__((constructor(65535))) static void setup_wrappers(void)
+__attribute__((constructor(PRE_LD_CONSTRUCTOR_PRIO)))
+static void setup_wrappers(void)
 {
 	char *env;
-	int i;
+	int i, ret;
 
+	s_in_pre_loading = 1;
 	s_uplink = getenv("uplink_name");
 	s_eal_file_prefix = getenv("file_prefix");
 	s_slow_if = getenv("eth_name");
@@ -3762,8 +3798,10 @@ __attribute__((constructor(65535))) static void setup_wrappers(void)
 		s_fd_desc[i].flow = NULL;
 	}
 
-	if (!getenv("PRE_LOAD_WAPPERS"))
+	if (PRE_LD_CONSTRUCTOR_PRIO <= RTE_PRIORITY_LAST) {
+		s_in_pre_loading = 0;
 		return;
+	}
 
 	LIBC_FUNCTION(socket);
 	LIBC_FUNCTION(shutdown);
@@ -3777,4 +3815,22 @@ __attribute__((constructor(65535))) static void setup_wrappers(void)
 	LIBC_FUNCTION(send);
 	LIBC_FUNCTION(select);
 	s_socket_pre_set = 1;
+
+	/** Make sure all the (RTE_INIT)s have been done before here.
+	 * user can manually change the RTE_PRIORITY_LAST to value
+	 * less(higher prio) than this constructor function.
+	 */
+	ret = eal_main();
+	if (!ret) {
+		s_eal_inited = 1;
+	} else {
+		RTE_LOG(ERR, pre_ld,
+			"eal init failed(%d)\n", ret);
+		exit(EXIT_FAILURE);
+	}
+
+	if (s_ipsec_enable)
+		pre_ld_wait_for_sp_ip4_ready();
+
+	s_in_pre_loading = 0;
 }
