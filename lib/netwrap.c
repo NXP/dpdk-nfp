@@ -924,12 +924,16 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 {
 	uint16_t i, lcore_id;
 	struct rte_flow *flow;
-	uint32_t prio[2];
+	uint32_t prio[MAX_DEF_DIR_NUM];
 	struct pre_ld_lcore_conf *lcore;
 	struct pre_ld_lcore_fwd *fwd;
+	char ext_nm[RTE_ETH_NAME_MAX_LEN];
+	char ul_nm[RTE_ETH_NAME_MAX_LEN];
 	char dl_nm[RTE_ETH_NAME_MAX_LEN];
 	char tap_nm[RTE_ETH_NAME_MAX_LEN];
 
+	rte_eth_dev_get_name_by_port(ext_id, ext_nm);
+	rte_eth_dev_get_name_by_port(ul_id, ul_nm);
 	rte_eth_dev_get_name_by_port(dl_id, dl_nm);
 	rte_eth_dev_get_name_by_port(tap_id, tap_nm);
 
@@ -948,6 +952,18 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	strcpy(s_def_dir[1].to_name, dl_nm);
 	prio[1] = rxq_nb[tap_id] - 1;
 
+	if (rte_pmd_dpaa2_dev_is_dpaa2(ext_id)) {
+		strcpy(s_def_dir[2].from_name, ext_nm);
+		strcpy(s_def_dir[2].to_name, ul_nm);
+		prio[2] = rxq_nb[ext_id] - 1;
+		s_def_dir_num++;
+
+		strcpy(s_def_dir[3].from_name, ul_nm);
+		strcpy(s_def_dir[3].to_name, ext_nm);
+		prio[3] = rxq_nb[ul_id] - 1;
+		s_def_dir_num++;
+	}
+
 	for (i = 0; i < s_def_dir_num; i++) {
 		flow = rte_remote_default_direct(s_def_dir[i].from_name,
 				s_def_dir[i].to_name, NULL,
@@ -962,6 +978,9 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 			s_default_flow_num++;
 		}
 	}
+
+	if (rte_pmd_dpaa2_dev_is_dpaa2(ext_id))
+		return;
 
 	lcore = &s_pre_ld_lcore[lcore_id];
 	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE)
