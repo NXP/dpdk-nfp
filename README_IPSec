@@ -1,0 +1,88 @@
+---------------------------
+NXP fast path IPSec network
+---------------------------
+
+IPSec implementation is based on option3(Referring to README)
+
+Gateway is one generic Linux machine to run as VPN server.
+Application with nFP preloaded runs on EP to negotiates with gateway to setup Security link.
+
+0001-net-xfrm-Bypass-xfrm.patch need be applied(maybe manually) on EP kernel to
+bypass kernel crypto and change TCP MSS.
+
+1. Build:
+--------------------------------------------
+  $ cmake . -Bbuild -DCMAKE_BUILD_TYPE=release -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DDPDK_INSTALL=/your/dpdk/install/folder
+
+  $ make -C build
+        #Generate build/lib/libnfp.so
+
+2. Install strongswan-swanctl on both gateway and endpoint:
+--------------------------------------------
+
+  $ apt-get install strongswan-swanctl
+
+3. Gateway setup:
+--------------------------------------------
+
+  $ Copy swanctl-gw.conf to /etc/swanctl/conf.d/swanctl.conf
+  $ ifconfig ethx 1.1.1.1 up(security port)
+  $ ipsec stop
+  $ ipsec start
+  $ swanctl --load-all
+
+4. EP platform setup:
+--------------------------------------------
+
+  $ Copy swanctl-ep.conf to /etc/swanctl/conf.d/swanctl.conf
+  $ ipsec stop
+  $ ipsec start
+  $ swanctl --load-all
+
+  $ export DPRC=dprc.2
+  $ export MAX_QUEUES=8
+  $ export FS_ENTRIES=8
+  $ export MAX_TCS=1
+  $ source ./dynamic_dpl.sh dpni-dpni dpni dpmac.x #DPMAC as external port.
+    or
+  $ source ./dynamic_dpl.sh dpni-dpni dpni         #PCIe EP as external port.
+     #Assume the DPNIs created are dpni.a-dpni.b, dpni.c, dpni.d(dpmac.x).
+  $ ls-addni dpni.c
+     #Assume the kernel interface created is ethx.
+  $ export eth_name=ethx
+  $ export DPAA2_TX_CONF=1
+  $ export DPAA2_TX_DYNAMIC_CONF=1
+  $ export DPAA2_RX_GET_PROTOCOL_OFFSET=1
+  $ export PRE_LOAD_IPSEC_ENABLE=1
+  $ ifconfig ethx 1.1.1.2
+  $ ifconfig ethx promisc up
+  $ echo 1 > /proc/sys/net/core/xfrm_bypass
+
+5. Test application(iperf3) based on either of upon configurations:
+--------------------------------------------
+
+1) server mode on gateway and client mmode on EP:
+----------
+
+Server on gateway:
+  $ iperf3 -s
+
+Server on EP:
+  $ LD_PRELOAD=./libnfp.so iperf3 -c 1.1.1.1 -i 1 -t 10 -u -b 10G -l 64
+  Run on another terminal:
+  $ /usr/lib/ipsec/stroke down host-host1
+  $ /usr/lib/ipsec/stroke up host-host1
+
+2) server mode on EP and client mmode on gateway:
+---------
+
+Server on EP:
+  $ iperf3 -s
+  Run on another terminal:
+  $ /usr/lib/ipsec/stroke down host-host1
+  $ /usr/lib/ipsec/stroke up host-host1
+
+Server on gateway:
+  $ iperf3 -c 1.1.1.2 -i 1 -t 10 -u -b 10G -l 64
+
+3) Run network tools based on TCP protocol between gateway and EP while running UDP test.

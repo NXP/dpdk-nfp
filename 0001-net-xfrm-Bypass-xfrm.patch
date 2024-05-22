@@ -1,0 +1,159 @@
+From c3175bdcbfcb358294973ded222119a51207b3c1 Mon Sep 17 00:00:00 2001
+From: Jun Yang <jun.yang@nxp.com>
+Date: Tue, 21 May 2024 22:37:25 -0700
+Subject: [PATCH] net/xfrm: Bypass xfrm
+
+Assume the crypted port has inline cryption capability.
+This patch bypasses xfrm to receive plain frame from
+crypted port and send plain frame to crypted port.
+The actual egress frames have additional out IP,
+ESP, padding and IV, so for TCP, these should be considered
+to decrease the MSS size.
+
+Bypass xfrm:
+echo 1 > /proc/sys/net/core/xfrm_bypass
+
+Signed-off-by: Jun Yang <jun.yang@nxp.com>
+---
+ include/net/netns/xfrm.h |  1 +
+ include/net/xfrm.h       | 32 ++++++++++++++++++++++++++++++--
+ net/ipv4/tcp_output.c    | 16 +++++++++++++++-
+ net/xfrm/xfrm_policy.c   |  3 +++
+ net/xfrm/xfrm_sysctl.c   |  7 +++++++
+ 5 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
+index bd7c3be4af5d..cd2e49eef074 100644
+--- a/include/net/netns/xfrm.h
++++ b/include/net/netns/xfrm.h
+@@ -65,6 +65,7 @@ struct netns_xfrm {
+ 	u32			sysctl_aevent_rseqth;
+ 	int			sysctl_larval_drop;
+ 	u32			sysctl_acq_expires;
++	int			sysctl_bypass;
+ 
+ 	u8			policy_default[XFRM_POLICY_MAX];
+ 
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index 73030094c6e6..4181c00b760a 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -1126,12 +1126,40 @@ static inline int xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *sk
+ 
+ static inline int xfrm4_policy_check(struct sock *sk, int dir, struct sk_buff *skb)
+ {
+-	return xfrm_policy_check(sk, dir, skb, AF_INET);
++	int ret = xfrm_policy_check(sk, dir, skb, AF_INET);
++	struct iphdr *ipv4;
++	struct net *net = dev_net(skb->dev);
++
++	if (ret)
++		return ret;
++
++	if (net->xfrm.sysctl_bypass) {
++		ipv4 = (void *)skb_network_header(skb);
++		if (ipv4->protocol != IPPROTO_ESP &&
++			ipv4->protocol != IPPROTO_AH)
++			return 1;
++	}
++
++	return 0;
+ }
+ 
+ static inline int xfrm6_policy_check(struct sock *sk, int dir, struct sk_buff *skb)
+ {
+-	return xfrm_policy_check(sk, dir, skb, AF_INET6);
++	int ret = xfrm_policy_check(sk, dir, skb, AF_INET6);
++	struct ipv6hdr *ipv6;
++	struct net *net = dev_net(skb->dev);
++
++	if (ret)
++		return ret;
++
++	if (net->xfrm.sysctl_bypass) {
++		ipv6 = ipv6_hdr(skb);
++		if (ipv6->nexthdr != IPPROTO_ESP &&
++			ipv6->nexthdr != IPPROTO_AH)
++			return 1;
++	}
++
++	return 0;
+ }
+ 
+ static inline int xfrm4_policy_check_reverse(struct sock *sk, int dir,
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index ed2e1836c0c0..d5b2a5386968 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -1696,6 +1696,7 @@ static inline int __tcp_mtu_to_mss(struct sock *sk, int pmtu)
+ {
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+ 	const struct inet_connection_sock *icsk = inet_csk(sk);
++	const struct net *net = sock_net(sk);
+ 	int mss_now;
+ 
+ 	/* Calculate base mss without TCP options:
+@@ -1720,7 +1721,20 @@ static inline int __tcp_mtu_to_mss(struct sock *sk, int pmtu)
+ 
+ 	/* Then reserve room for full set of TCP options and 8 bytes of data */
+ 	mss_now = max(mss_now,
+-		      READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_min_snd_mss));
++		      READ_ONCE(net->ipv4.sysctl_tcp_min_snd_mss));
++#ifdef CONFIG_XFRM
++#define NXP_ICV_MAX_SIZE 16
++#define NXP_TUNNEL_OUTER_SIZE \
++	(max(sizeof(struct iphdr), sizeof(struct ipv6hdr)) + \
++	sizeof(struct ip_esp_hdr))
++#define NXP_MAX_PADDING_SIZE 16 /** Include pad len and next header.*/
++
++	if (net->xfrm.sysctl_bypass) {
++		mss_now -= (NXP_TUNNEL_OUTER_SIZE + NXP_ICV_MAX_SIZE);
++		mss_now -= NXP_MAX_PADDING_SIZE;
++	}
++#endif
++
+ 	return mss_now;
+ }
+ 
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index ba58b963f482..a58f53698c8b 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -3046,6 +3046,9 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
+ 	xdst = NULL;
+ 	route = NULL;
+ 
++	if (net->xfrm.sysctl_bypass)
++		return dst_orig;
++
+ 	sk = sk_const_to_full_sk(sk);
+ 	if (sk && sk->sk_policy[XFRM_POLICY_OUT]) {
+ 		num_pols = 1;
+diff --git a/net/xfrm/xfrm_sysctl.c b/net/xfrm/xfrm_sysctl.c
+index 0c6c5ef65f9d..9388f44e6af5 100644
+--- a/net/xfrm/xfrm_sysctl.c
++++ b/net/xfrm/xfrm_sysctl.c
+@@ -38,6 +38,12 @@ static struct ctl_table xfrm_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec
+ 	},
++	{
++		.procname	= "xfrm_bypass",
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec
++	},
+ 	{}
+ };
+ 
+@@ -54,6 +60,7 @@ int __net_init xfrm_sysctl_init(struct net *net)
+ 	table[1].data = &net->xfrm.sysctl_aevent_rseqth;
+ 	table[2].data = &net->xfrm.sysctl_larval_drop;
+ 	table[3].data = &net->xfrm.sysctl_acq_expires;
++	table[4].data = &net->xfrm.sysctl_bypass;
+ 
+ 	/* Don't export sysctls to unprivileged users */
+ 	if (net->user_ns != &init_user_ns)
+-- 
+2.34.1
+
