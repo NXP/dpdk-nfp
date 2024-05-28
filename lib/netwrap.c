@@ -340,6 +340,8 @@ static uint16_t s_default_flow_num;
 
 static int s_data_path_core = -1;
 
+static int s_ipsec_buf_swap;
+
 struct pre_ld_udp_desc {
 	uint16_t offset;
 	uint16_t length;
@@ -1079,31 +1081,36 @@ pre_ld_ipsec_dequeue(struct rte_mbuf *pkts[], uint16_t max_pkts,
 	uint16_t dev_id, uint16_t c_qp)
 {
 	int32_t nb_pkts = 0, j, nb_cops;
-	struct pre_ld_ipsec_priv *priv;
 	struct rte_crypto_op *cops[max_pkts];
-	struct pre_ld_ipsec_sa_entry *sa;
 	struct rte_mbuf *pkt;
+	struct rte_mbuf *free_mbufs[max_pkts];
+	struct pre_ld_ipsec_priv *src_priv, *dst_priv;
 
 	nb_cops = rte_cryptodev_dequeue_burst(dev_id,
 		c_qp, cops, max_pkts);
 
 	for (j = 0; j < nb_cops; j++) {
-		pkt = cops[j]->sym->m_src;
-
-		priv = rte_mbuf_to_priv(pkt);
-		sa = priv->sa;
-
-		RTE_ASSERT(sa);
-
-		if (pre_ld_ipsec_sa_2_action(sa) ==
-			RTE_SECURITY_ACTION_TYPE_LOOKASIDE_PROTOCOL) {
-			if (cops[j]->status) {
-				rte_pktmbuf_free(pkt);
-				continue;
-			}
+		if (s_ipsec_buf_swap) {
+			pkt = cops[j]->sym->m_dst;
+			dst_priv = rte_mbuf_to_priv(pkt);
+			src_priv = rte_mbuf_to_priv(cops[j]->sym->m_src);
+			rte_memcpy(dst_priv->cntx, src_priv->cntx,
+				sizeof(struct rte_ether_hdr));
+			free_mbufs[j] = cops[j]->sym->m_src;
+		} else {
+			pkt = cops[j]->sym->m_src;
 		}
+
+		if (unlikely(cops[j]->status)) {
+			rte_pktmbuf_free(pkt);
+			continue;
+		}
+
 		pkts[nb_pkts++] = pkt;
 	}
+
+	if (s_ipsec_buf_swap)
+		rte_pktmbuf_free_bulk(free_mbufs, nb_cops);
 
 	/* return packets */
 	return nb_pkts;
@@ -1249,11 +1256,12 @@ pre_ld_ipsec_sa_enqueue(struct rte_mbuf *pkts[],
 	void *sas, uint16_t nb_pkts,
 	uint16_t crypto_id, uint16_t qp)
 {
-	int i;
+	int i, ret;
 	struct pre_ld_ipsec_priv *priv;
 	struct pre_ld_ipsec_sa_entry *sa = sas;
 	struct rte_ipsec_session *ips = pre_ld_ipsec_sa_2_session(sa);
 	struct rte_crypto_op *cops[nb_pkts];
+	struct rte_mbuf *mbufs[nb_pkts];
 
 	if (ips->type != RTE_SECURITY_ACTION_TYPE_LOOKASIDE_PROTOCOL) {
 		RTE_LOG(ERR, pre_ld,
@@ -1266,6 +1274,13 @@ pre_ld_ipsec_sa_enqueue(struct rte_mbuf *pkts[],
 		return 0;
 	}
 
+	if (s_ipsec_buf_swap) {
+		ret = rte_pktmbuf_alloc_bulk(s_pre_ld_rx_pool,
+			mbufs, nb_pkts);
+		if (ret)
+			return 0;
+	}
+
 	for (i = 0; i < nb_pkts; i++) {
 		priv = rte_mbuf_to_priv(pkts[i]);
 		priv->sa = sa;
@@ -1274,7 +1289,10 @@ pre_ld_ipsec_sa_enqueue(struct rte_mbuf *pkts[],
 		priv->cop.status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
 
 		priv->sym_cop.m_src = pkts[i];
-		priv->sym_cop.m_dst = NULL;
+		if (s_ipsec_buf_swap)
+			priv->sym_cop.m_dst = mbufs[i];
+		else
+			priv->sym_cop.m_dst = NULL;
 
 		rte_security_attach_session(&priv->cop, ips->security.ses);
 
@@ -3788,6 +3806,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_IPSEC_ENABLE");
 	if (env)
 		s_ipsec_enable = atoi(env);
+
+	env = getenv("PRE_LOAD_IPSEC_BUF_SWAP");
+	if (env)
+		s_ipsec_buf_swap = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
