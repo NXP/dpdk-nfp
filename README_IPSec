@@ -12,8 +12,14 @@ bypass kernel crypto and change TCP MSS.
 
 1. Build:
 --------------------------------------------
-  $ cmake . -Bbuild -DCMAKE_BUILD_TYPE=release -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DDPDK_INSTALL=/your/dpdk/install/folder
 
+1) Build dpdk from (https://github.com/NXP/dpdk/commits/22.11-qoriq/):
+  $ export CROSS=aarch64-linux-gnu-
+  $ meson arm64-build --cross-file config/arm/arm64_dpaa_linux_gcc -Dc_args="-Werror" -Dusr_def_priority_last=60000 -Dexamples=all -Dprefix=/your/dpdk/install/folder
+  $ ninja -C arm64-build install
+
+2) Build dpdk-nfp:
+  $ cmake . -Bbuild -DCMAKE_BUILD_TYPE=release -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DDPDK_INSTALL=/your/dpdk/install/folder
   $ make -C build
         #Generate build/lib/libnfp.so
 
@@ -61,13 +67,13 @@ bypass kernel crypto and change TCP MSS.
 5. Test application(iperf3) based on either of upon configurations:
 --------------------------------------------
 
-1) server mode on gateway and client mmode on EP:
+1) server mode on gateway and client mode on EP:
 ----------
 
 Server on gateway:
   $ iperf3 -s
 
-Server on EP:
+Client on EP:
   $ LD_PRELOAD=./libnfp.so iperf3 -c 1.1.1.1 -i 1 -t 10 -u -b 10G -l 64
   Run on another terminal:
   $ /usr/lib/ipsec/stroke down host-host1
@@ -77,12 +83,12 @@ Server on EP:
 ---------
 
 Server on EP:
-  $ iperf3 -s
+  $ LD_PRELOAD=./libnfp.so iperf3 -s
   Run on another terminal:
   $ /usr/lib/ipsec/stroke down host-host1
   $ /usr/lib/ipsec/stroke up host-host1
 
-Server on gateway:
+Client on gateway:
   $ iperf3 -c 1.1.1.2 -i 1 -t 10 -u -b 10G -l 64
 
 3) Run network tools based on TCP protocol between gateway and EP while running UDP test.
