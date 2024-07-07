@@ -29,6 +29,7 @@
 #include <linux/sockios.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
 
 #include <rte_common.h>
 #include <rte_log.h>
@@ -93,9 +94,9 @@ enum {
 static uint8_t s_crypto_dev_id = CRYPTO_DEV_DEFAULT_ID;
 
 static const char *s_eal_file_prefix;
-static const char *s_uplink;
+static char *s_uplink;
 static const char *s_slow_if;
-static const char *s_downlink;
+static char *s_downlink;
 
 static int s_ipsec_enable;
 
@@ -1017,11 +1018,46 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	pthread_mutex_unlock(&s_lcore_mutex);
 }
 
+static const char *
+pre_ld_get_tap_kernel_if_nm(const char *peer_name)
+{
+	char dir_nm[512];
+	DIR *dir;
+	char *dup_nm;
+	struct dirent *entry;
+
+	sprintf(dir_nm,
+		"/sys/bus/fsl-mc/drivers/fsl_mc_dprc/dprc.1/%s/net",
+		peer_name);
+	dir = opendir(dir_nm);
+	if (!dir) {
+		RTE_LOG(ERR, pre_ld, "Unable open directory(%s)\n",
+			dir_nm);
+
+		return NULL;
+	}
+
+	while ((entry = readdir(dir)) != NULL) {
+		if (entry->d_name[0] == '.' || entry->d_type != DT_DIR)
+			continue;
+
+		dup_nm = strdup(entry->d_name);
+		closedir(dir);
+		return dup_nm;
+	}
+
+	closedir(dir);
+	return NULL;
+}
+
 static void
 pre_ld_configure_split_traffic(uint32_t portid)
 {
 	const char *ep_name;
+	const char *def_ep_name;
 	int ret, id = -1, ep_id = -1;
+	uint16_t mux_def_id;
+	struct rte_remote_query_rsp rsp;
 
 	ep_name = rte_pmd_dpaa2_ep_name(portid);
 	if (!ep_name)
@@ -1038,26 +1074,40 @@ pre_ld_configure_split_traffic(uint32_t portid)
 		s_dpdmux_ep_name = ep_name;
 		s_dpdmux_id = id;
 		s_dpdmux_ep_id = ep_id;
+		if (!s_slow_if &&
+			!rte_pmd_dpaa2_mux_default_id(id, &mux_def_id) &&
+			!rte_pmd_dpaa2_mux_ep_name(id, mux_def_id, &def_ep_name)) {
+			s_slow_if = pre_ld_get_tap_kernel_if_nm(def_ep_name);
+			if (s_slow_if) {
+				RTE_LOG(INFO, pre_ld,
+					"Found tap port(%s)(%s) connected to dpdmux%d.%d\n",
+					s_slow_if, def_ep_name, id, mux_def_id);
+			}
+		}
 
 		return;
 	}
 
-	ret = rte_remote_parse_ep_name(ep_name,
-			NULL, &ep_id);
+	ret = remote_direct_query(&rsp);
 	if (!ret) {
-		if (s_downlink) {
-			RTE_LOG(WARNING, pre_ld,
-				"Multiple downlinks(%s)(%s) detected.\n",
-				s_downlink, ep_name);
+		if (!s_downlink) {
+			s_downlink = rte_malloc(NULL,
+				RTE_ETH_NAME_MAX_LEN, 0);
+			strcpy(s_downlink, rsp.downlink_nm);
 		}
 		if (!s_uplink) {
-			RTE_LOG(WARNING, pre_ld,
-				"No uplink specified\n");
+			s_uplink = rte_malloc(NULL,
+				RTE_ETH_NAME_MAX_LEN, 0);
+			strcpy(s_uplink, rsp.uplink_nm);
 		}
-		s_downlink = ep_name;
-		RTE_LOG(INFO, pre_ld,
-			"%s <-> %s is hijacked.\n",
-			s_uplink, s_downlink);
+		if (!s_slow_if)
+			s_slow_if = pre_ld_get_tap_kernel_if_nm(rsp.taplink_end_nm);
+
+		if (s_slow_if) {
+			RTE_LOG(INFO, pre_ld,
+				"Found tap port(%s)(%s) connected to %s\n",
+				s_slow_if, rsp.taplink_end_nm, rsp.taplink_nm);
+		}
 	}
 }
 
@@ -1558,6 +1608,7 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 	char port_name2[RTE_ETH_NAME_MAX_LEN];
 	const char *peer_name;
 	enum pre_ld_port_type type_val = NULL_TYPE;
+	int kernel_port = -1;
 
 	for (port_num = 0; port_num < size; port_num++)
 		port_type[port_num] = NULL_TYPE;
@@ -1611,6 +1662,7 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 			}
 			port_type[portid1] = KERNEL_TAP_TYPE;
 			type_val |= KERNEL_TAP_TYPE;
+			kernel_port = portid1;
 		}
 	}
 
@@ -1621,6 +1673,15 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 				type_val = DOWN_LINK_TYPE;
 			}
 		}
+	} else if (kernel_port >= 0 && !s_slow_if) {
+		peer_name = rte_pmd_dpaa2_ep_name(kernel_port);
+		s_slow_if = pre_ld_get_tap_kernel_if_nm(peer_name);
+		if (s_slow_if) {
+			rte_eth_dev_get_name_by_port(kernel_port, port_name1);
+			RTE_LOG(INFO, pre_ld,
+				"Found tap port(%s)(%s) connected to %s\n",
+				s_slow_if, peer_name, port_name1);
+		}
 	}
 quit:
 	if (type_val == NULL_TYPE) {
@@ -1629,6 +1690,7 @@ quit:
 	}
 	return type_val;
 }
+
 #define MAX_ARGV_NUM 32
 
 static int
@@ -2305,7 +2367,7 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 	ret = rte_remote_direct_parse_config(config_str, 1);
 	if (ret)
 		return ret;
-	ret = rte_remote_direct_traffic(RTE_REMOTE_DIR_REQ);
+	ret = rte_remote_direct_traffic(RTE_REMOTE_DIR_REQ, NULL);
 	if (ret)
 		return ret;
 
@@ -2992,13 +3054,19 @@ netwrap_get_remote_hw(int sockfd)
 	struct sockaddr_in ia;
 	struct eth_ipv4_udp_hdr *hdr = &s_fd_desc[sockfd].hdr;
 
+	if (!s_slow_if) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: No tap port specified!\n", __func__);
+		return -EINVAL;
+	}
+
 	if ((s_fd_desc[sockfd].hdr_init &
 		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) !=
 		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) {
 		RTE_LOG(ERR, pre_ld,
 			"%s: fd:%d, remote IP/UDP not initialized.\n",
 			__func__, sockfd);
-			return -EINVAL;
+		return -EINVAL;
 	}
 	memset(&ia, 0, sizeof(ia));
 	ia.sin_family = AF_INET;
@@ -3150,6 +3218,12 @@ netwrap_get_local_hw(int sockfd)
 	if ((s_fd_desc[sockfd].hdr_init & LOCAL_ETH_INIT) ==
 		LOCAL_ETH_INIT)
 		return 0;
+
+	if (!s_slow_if) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: No tap port specified!\n", __func__);
+		return -EINVAL;
+	}
 
 	ifr.ifr_addr.sa_family = AF_INET;
 	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", s_slow_if);
@@ -3776,6 +3850,12 @@ __attribute__((destructor)) static void netwrap_main_dtor(void)
 	if (s_fd_desc)
 		free(s_fd_desc);
 	s_fd_desc = NULL;
+	if (s_downlink)
+		rte_free(s_downlink);
+	s_downlink = NULL;
+	if (s_uplink)
+		rte_free(s_uplink);
+	s_uplink = NULL;
 }
 
 __attribute__((constructor(PRE_LD_CONSTRUCTOR_PRIO)))
@@ -3784,20 +3864,25 @@ static void setup_wrappers(void)
 	char *env;
 	int i, ret;
 
+	if (!getenv("DPAA2_TX_CONF"))
+		setenv("DPAA2_TX_CONF", "1", 1);
+
+	if (!getenv("DPAA2_TX_DYNAMIC_CONF"))
+		setenv("DPAA2_TX_DYNAMIC_CONF", "1", 1);
+
+	if (!getenv("DPAA2_RX_GET_PROTOCOL_OFFSET"))
+		setenv("DPAA2_RX_GET_PROTOCOL_OFFSET", "1", 1);
+
 	s_in_pre_loading = 1;
-	s_uplink = getenv("uplink_name");
 	s_eal_file_prefix = getenv("file_prefix");
-	s_slow_if = getenv("eth_name");
-	if (!s_slow_if) {
-		rte_exit(EXIT_FAILURE,
-			"slow interface(kernel) not specified!\n");
-	}
 
-	if (getenv("PRE_LOAD_WRAP_LOG"))
-		s_socket_dbg = 1;
+	env = getenv("PRE_LOAD_WRAP_LOG");
+	if (env)
+		s_socket_dbg = atoi(env);
 
-	if (getenv("PRE_LOAD_STATISTIC_PRINT"))
-		s_statistic_print = 1;
+	env = getenv("PRE_LOAD_STATISTIC_PRINT");
+	if (env)
+		s_statistic_print = atoi(env);
 
 	env = getenv("PRE_LOAD_WRAP_CPU_START");
 	if (env)
