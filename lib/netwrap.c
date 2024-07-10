@@ -149,6 +149,9 @@ struct fd_desc {
 	struct rte_mempool *tx_pool;
 	struct pre_ld_rx_pool rx_buffer;
 
+	uint16_t rx_port_mtu;
+	uint16_t tx_port_mtu;
+
 	uint64_t tx_count;
 	uint64_t tx_pkts;
 	uint64_t tx_oh_bytes;
@@ -177,6 +180,11 @@ static int s_max_usr_fd = INVALID_SOCKFD;
 
 #define IPv4_HDR_LEN \
 	(sizeof(struct rte_ipv4_hdr) + UDP_HDR_LEN)
+
+#define IPv4_ESP_HDR_LEN \
+	(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_esp_hdr))
+
+#define ESP_TAIL_MAX_LEN 16
 
 static int (*libc_socket)(int, int, int);
 static int (*libc_shutdown)(int, int);
@@ -713,51 +721,55 @@ finsh_recv:
 }
 
 static void
-eal_send_fill_mbuf(const void *buf, size_t len, int fd,
-	struct rte_mbuf *m)
+eal_send_fill_mbufs(int fd, const uint8_t *buf, uint16_t lens[],
+	struct rte_mbuf *mbufs[], uint16_t count)
 {
 	void *udp_data;
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ip_hdr;
 	struct rte_udp_hdr *udp_hdr;
+	uint16_t i;
+	struct rte_mbuf *m;
 
-	m->data_off = PRE_LD_MBUF_OFFSET;
+	for (i = 0; i < count; i++) {
+		m = mbufs[i];
+		m->data_off = PRE_LD_MBUF_OFFSET;
 
-	/* Initialize the Ethernet header */
-	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+		/* Initialize the Ethernet header */
+		eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
-	rte_memcpy(eth_hdr, &s_fd_desc[fd].hdr,
-		sizeof(struct eth_ipv4_udp_hdr));
-	/* Set IP header length then calculate checksum.*/
-	ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
-	ip_hdr->total_length = rte_cpu_to_be_16(len + IPv4_HDR_LEN);
-	ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+		rte_memcpy(eth_hdr, &s_fd_desc[fd].hdr,
+			sizeof(struct eth_ipv4_udp_hdr));
+		/* Set IP header length then calculate checksum.*/
+		ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+		ip_hdr->total_length = rte_cpu_to_be_16(lens[i] + IPv4_HDR_LEN);
+		ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
-	/* Set UDP header length only*/
-	udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
-	udp_hdr->dgram_len = rte_cpu_to_be_16(len + UDP_HDR_LEN);
+		/* Set UDP header length only*/
+		udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+		udp_hdr->dgram_len = rte_cpu_to_be_16(lens[i] + UDP_HDR_LEN);
 
-	udp_data = (void *)(udp_hdr + 1);
-	if (buf)
-		rte_memcpy(udp_data, buf, len);
-	m->nb_segs = 1;
-	m->next = NULL;
-	m->data_len = len + sizeof(*eth_hdr) +
-		sizeof(*ip_hdr) + sizeof(*udp_hdr);
-	if (m->data_len < 60)
-		m->data_len = 60;
-	m->pkt_len = m->data_len;
-	m->packet_type = RTE_PTYPE_L2_ETHER |
-		RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
+		udp_data = (void *)(udp_hdr + 1);
+		rte_memcpy(udp_data, buf, lens[i]);
+		m->nb_segs = 1;
+		m->next = NULL;
+		m->data_len = lens[i] + RTE_ETHER_HDR_LEN + IPv4_HDR_LEN;
+		if (m->data_len < (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN))
+			m->data_len = (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN);
+		m->pkt_len = m->data_len;
+		m->packet_type = RTE_PTYPE_L2_ETHER |
+			RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
+		buf += lens[i];
+	}
 }
 
 static int
 eal_send(int sockfd, const void *buf, size_t len, int flags)
 {
-	struct rte_mbuf *m = NULL;
-	int sent, cnt, ret;
-	uint16_t txq_id;
-	uint32_t byte, byte_overhead;
+	struct rte_mbuf *mbufs[MAX_PKT_BURST];
+	uint16_t lens[MAX_PKT_BURST];
+	int sent = 0, i, ret;
+	uint16_t txq_id, mtu, max_len, hdr_len, count = 0;
 	struct rte_mempool *pool;
 
 	RTE_SET_USED(sockfd);
@@ -770,32 +782,35 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 
 	ret = eal_data_path_thread_register(&s_fd_desc[sockfd]);
 	if (ret)
-		return ret;
-
-	cnt = 0;
-	m = rte_pktmbuf_alloc(pool);
-	if (unlikely(!m)) {
-		RTE_LOG(WARNING, pre_ld,
-			"Alloc from TX pool %s failed\n", pool->name);
 		return 0;
-	}
 
-	eal_send_fill_mbuf(buf, len, sockfd, m);
-	byte = m->pkt_len;
-	byte_overhead = byte + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+	ret = 0;
+	mtu = s_fd_desc[sockfd].tx_port_mtu;
+	max_len = mtu + RTE_ETHER_HDR_LEN;
+	hdr_len = RTE_ETHER_HDR_LEN + IPv4_HDR_LEN;
+	if (s_ipsec_enable)
+		hdr_len += IPv4_ESP_HDR_LEN + ESP_TAIL_MAX_LEN;
+	while ((len + hdr_len) > max_len) {
+		if (unlikely(count >= MAX_PKT_BURST))
+			break;
+
+		lens[count] = (max_len - hdr_len);
+		len -= lens[count];
+		count++;
+	}
+	if (len > 0 && count < MAX_PKT_BURST) {
+		lens[count] = len;
+		count++;
+	}
+	ret = rte_pktmbuf_alloc_bulk(pool, mbufs, count);
+	if (ret)
+		return 0;
+
+	eal_send_fill_mbufs(sockfd, buf, lens, mbufs, count);
 
 	if (s_fd_desc[sockfd].tx_ring) {
-		cnt = 0;
-eq_again:
-		sent = rte_ring_enqueue(s_fd_desc[sockfd].tx_ring, m);
-		if (!sent) {
-			sent = 1;
-		} else {
-			if (cnt < 100) {
-				cnt++;
-				goto eq_again;
-			}
-		}
+		sent = rte_ring_enqueue_bulk(s_fd_desc[sockfd].tx_ring,
+			(void * const *)mbufs, count, NULL);
 	} else {
 		if (unlikely(!s_fd_desc[sockfd].txq_id)) {
 			RTE_LOG(ERR, pre_ld,
@@ -805,20 +820,23 @@ eq_again:
 		}
 		txq_id = *s_fd_desc[sockfd].txq_id;
 		sent = rte_eth_tx_burst(s_fd_desc[sockfd].tx_port,
-			txq_id, &m, 1);
+			txq_id, mbufs, count);
 	}
-	if (likely(sent == 1)) {
-		s_fd_desc[sockfd].tx_usr_bytes += len;
-		s_fd_desc[sockfd].tx_oh_bytes += byte_overhead;
-		s_fd_desc[sockfd].tx_pkts++;
-		s_fd_desc[sockfd].tx_count++;
-
-		return len;
+	ret = 0;
+	for (i = 0; i < sent; i++) {
+		s_fd_desc[sockfd].tx_usr_bytes += lens[i];
+		s_fd_desc[sockfd].tx_oh_bytes +=
+			lens[i] + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+		ret += lens[i];
 	}
+	s_fd_desc[sockfd].tx_pkts += sent;
+	s_fd_desc[sockfd].tx_count += sent;
 
 send_err:
-	rte_pktmbuf_free(m);
-	return 0;
+	if (sent < count)
+		rte_pktmbuf_free_bulk(&mbufs[sent], count - sent);
+
+	return ret;
 }
 
 void
@@ -1442,6 +1460,9 @@ pre_ld_main_loop(void *dummy)
 	uint16_t rx_ports[XFM_POLICY_ETH_NUM];
 	uint16_t tx_ports[XFM_POLICY_ETH_NUM];
 	uint16_t rx_port_flows[XFM_POLICY_ETH_NUM];
+	uint16_t self_gen_lens[MAX_PKT_BURST];
+	uint8_t *self_gen_pool = NULL;
+	uint16_t self_gen_len = 0;
 
 	RTE_SET_USED(dummy);
 
@@ -1499,8 +1520,12 @@ pre_ld_main_loop(void *dummy)
 	}
 
 for_ever_loop:
-	if (s_pre_ld_quit)
+	if (s_pre_ld_quit) {
+		if (self_gen_pool)
+			rte_free(self_gen_pool);
+
 		return 0;
+	}
 
 	for (i = 0; i < qconf->n_fwds; i++) {
 		fwd = &qconf->fwd[i];
@@ -1538,8 +1563,17 @@ for_ever_loop:
 				nb_rx = MAX_PKT_BURST;
 			else
 				nb_rx = 0;
-			for (j = 0; j < nb_rx; j++)
-				eal_send_fill_mbuf(NULL, 64, fd, mbufs[j]);
+			for (j = 0; j < nb_rx; j++) {
+				self_gen_lens[j] = 64;
+				self_gen_len += 64;
+			}
+			if (!self_gen_pool)
+				self_gen_pool = rte_malloc(NULL, self_gen_len, 0);
+
+			if (self_gen_pool) {
+				eal_send_fill_mbufs(fd, self_gen_pool, self_gen_lens,
+					mbufs, nb_rx);
+			}
 		} else if (fwd->poll_type == SEC_COMPLETE) {
 			crypto_id = fwd->poll.poll_sec.sec_id;
 			queueid = fwd->poll.poll_sec.queue_id;
@@ -1596,6 +1630,8 @@ for_ever_loop:
 	}
 	goto for_ever_loop;
 
+	if (self_gen_pool)
+		rte_free(self_gen_pool);
 	return 0;
 }
 
@@ -2444,7 +2480,7 @@ usr_socket_fd_desc_init(int sockfd,
 	struct pre_ld_lcore_conf *lcore;
 	struct pre_ld_lcore_fwd *fwd;
 	struct pre_ld_txr_desc *tx_rings;
-	uint16_t n_fwds;
+	uint16_t n_fwds, mtu;
 	char nm[64];
 
 	pthread_mutex_lock(&s_fd_mutex);
@@ -2523,6 +2559,17 @@ usr_socket_fd_desc_init(int sockfd,
 
 	s_fd_desc[sockfd].rx_port = rx_port;
 	s_fd_desc[sockfd].tx_port = tx_port;
+
+	ret = rte_eth_dev_get_mtu(rx_port, &mtu);
+	if (!ret)
+		s_fd_desc[sockfd].rx_port_mtu = mtu;
+	else
+		s_fd_desc[sockfd].rx_port_mtu = RTE_ETHER_MTU;
+	ret = rte_eth_dev_get_mtu(tx_port, &mtu);
+	if (!ret)
+		s_fd_desc[sockfd].tx_port_mtu = mtu;
+	else
+		s_fd_desc[sockfd].tx_port_mtu = RTE_ETHER_MTU;
 
 	s_fd_desc[sockfd].hdr_init = HDR_INIT_NONE;
 
