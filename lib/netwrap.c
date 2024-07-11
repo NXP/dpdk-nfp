@@ -676,10 +676,10 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 		} else {
 			rte_memcpy(&buf_u8[total_bytes], pkt, remain);
 			s_fd_desc[sockfd].rx_usr_bytes += remain;
-			remain = 0;
 			total_bytes += remain;
 			desc->offset += remain;
 			desc->length -= remain;
+			remain = 0;
 		}
 		if (i == MAX_PKT_BURST) {
 			rte_pktmbuf_free_bulk(free_burst, i);
