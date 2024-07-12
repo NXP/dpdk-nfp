@@ -63,6 +63,9 @@
 
 #define PRE_LD_CONSTRUCTOR_PRIO 65535
 
+#define IPSEC_STROCK_PROCESS_NAME \
+	"/usr/lib/ipsec/stroke"
+
 #ifndef SOCK_TYPE_MASK
 #define SOCK_TYPE_MASK 0xf
 #endif
@@ -99,6 +102,7 @@ static const char *s_slow_if;
 static char *s_downlink;
 
 static int s_ipsec_enable;
+static int s_usr_stroke_control;
 
 static pthread_t s_main_td;
 
@@ -394,6 +398,51 @@ convert_ip_addr_to_str(char *str,
 	}
 
 	return 0;
+}
+
+static int
+netwrap_get_current_process_name(char *nm)
+{
+	FILE *f;
+	size_t size;
+	char file_nm[1024];
+	char ps_nm[1024];
+	int pid = getpid();
+
+	memset(file_nm, 0, 1024);
+	memset(ps_nm, 0, 1024);
+	sprintf(file_nm, "/proc/%d/cmdline", pid);
+	f = fopen(file_nm, "r");
+	if (f) {
+		size = fread(ps_nm, sizeof(char), 1024, f);
+		if (size > 0) {
+			RTE_LOG(INFO, pre_ld,
+				"This process: PID = %d, name: %s\n",
+				pid, ps_nm);
+			strcpy(nm, ps_nm);
+
+			return 0;
+		}
+	}
+
+	return -EACCES;
+}
+
+static int
+netwrap_is_ipsec_stroke_process(void)
+{
+	int ret;
+	char current_nm[1024];
+
+	ret = netwrap_get_current_process_name(current_nm);
+	if (!ret) {
+		if (!strcmp(IPSEC_STROCK_PROCESS_NAME, current_nm))
+			return true;
+		if (!strcmp("sh", current_nm))
+			return true;
+	}
+
+	return false;
 }
 
 static void
@@ -2858,6 +2907,8 @@ socket(int domain, int type, int protocol)
 
 			return sockfd;
 		}
+		if (netwrap_is_ipsec_stroke_process())
+			return sockfd;
 		if (s_in_pre_loading)
 			return sockfd;
 
@@ -2894,6 +2945,8 @@ socket(int domain, int type, int protocol)
 
 			return sockfd;
 		}
+		if (netwrap_is_ipsec_stroke_process())
+			return sockfd;
 		if (s_in_pre_loading)
 			return sockfd;
 
@@ -3893,6 +3946,9 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
 __attribute__((destructor)) static void netwrap_main_dtor(void)
 {
+	if (netwrap_is_ipsec_stroke_process())
+		return;
+
 	eal_quit();
 	if (s_fd_desc)
 		free(s_fd_desc);
@@ -3905,11 +3961,41 @@ __attribute__((destructor)) static void netwrap_main_dtor(void)
 	s_uplink = NULL;
 }
 
+static void *
+pre_ld_ipsec_stroke(void *arg)
+{
+#define SWANCTL_CONF_DEFAULT_NAME "host-host1"
+	int ret;
+	char cmd[1024];
+	char *desc = getenv("SWANCTL_CONF_NAME");
+
+	sleep(2);
+	sprintf(cmd, "%s down %s", IPSEC_STROCK_PROCESS_NAME,
+		desc ? desc : SWANCTL_CONF_DEFAULT_NAME);
+	ret = system(cmd);
+	RTE_LOG(INFO, pre_ld, "%s down %s\n",
+		IPSEC_STROCK_PROCESS_NAME,
+		ret ? "failed" : "success");
+	sleep(1);
+	sprintf(cmd, "%s up %s", IPSEC_STROCK_PROCESS_NAME,
+		desc ? desc : SWANCTL_CONF_DEFAULT_NAME);
+	ret = system(cmd);
+	RTE_LOG(INFO, pre_ld, "%s up %s\n",
+		IPSEC_STROCK_PROCESS_NAME,
+		ret ? "failed" : "success");
+
+	return arg;
+}
+
 __attribute__((constructor(PRE_LD_CONSTRUCTOR_PRIO)))
 static void setup_wrappers(void)
 {
 	char *env;
 	int i, ret;
+	pthread_t pid;
+
+	if (netwrap_is_ipsec_stroke_process())
+		return;
 
 	if (!getenv("DPAA2_TX_CONF"))
 		setenv("DPAA2_TX_CONF", "1", 1);
@@ -3938,6 +4024,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_IPSEC_ENABLE");
 	if (env)
 		s_ipsec_enable = atoi(env);
+
+	env = getenv("PRE_LOAD_USR_STROKE_CONTROL");
+	if (env)
+		s_usr_stroke_control = atoi(env);
 
 	env = getenv("PRE_LOAD_IPSEC_BUF_SWAP");
 	if (env)
@@ -4002,8 +4092,24 @@ static void setup_wrappers(void)
 		exit(EXIT_FAILURE);
 	}
 
-	if (s_ipsec_enable)
+	if (s_ipsec_enable) {
+		if (!s_usr_stroke_control) {
+			ret = pthread_create(&pid, NULL,
+				pre_ld_ipsec_stroke, NULL);
+			if (ret) {
+				rte_exit(EXIT_FAILURE,
+					"Create thread to stroke ipsec failed(%d)\n",
+					ret);
+			}
+		} else {
+			/** Example of stroking ipsec manually on another terminal:
+			 *
+			 /usr/lib/ipsec/stroke down host-host1
+			 /usr/lib/ipsec/stroke up host-host1
+			 */
+		}
 		pre_ld_wait_for_sp_ip4_ready();
+	}
 
 	s_in_pre_loading = 0;
 }
