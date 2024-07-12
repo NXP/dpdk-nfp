@@ -355,6 +355,9 @@ static int s_data_path_core = -1;
 
 static int s_ipsec_buf_swap;
 
+#define MAX_HUGE_FRAME_SIZE 9600
+static uint16_t s_mtu_set;
+
 struct pre_ld_udp_desc {
 	uint16_t offset;
 	uint16_t length;
@@ -2205,6 +2208,15 @@ static int eal_main(void)
 				portid);
 		}
 
+		if (s_mtu_set) {
+			ret = rte_eth_dev_set_mtu(portid, s_mtu_set);
+			if (ret) {
+				RTE_LOG(WARNING, pre_ld,
+					"Set MTU(%d) on port%d failed(%d)\n",
+					s_mtu_set, portid, ret);
+			}
+		}
+
 		/* Start device */
 		ret = rte_eth_dev_start(portid);
 		if (ret) {
@@ -4032,6 +4044,18 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_IPSEC_BUF_SWAP");
 	if (env)
 		s_ipsec_buf_swap = atoi(env);
+
+	env = getenv("PRE_LOAD_SET_MTU");
+	if (env) {
+		s_mtu_set = atoi(env);
+		if (s_mtu_set < RTE_ETHER_MTU ||
+			s_mtu_set > MAX_HUGE_FRAME_SIZE) {
+			RTE_LOG(WARNING, pre_ld,
+				"Invalid MTU size(%d) to set\n",
+				s_mtu_set);
+			s_mtu_set = 0;
+		}
+	}
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
