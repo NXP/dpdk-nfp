@@ -87,7 +87,6 @@ static int s_dpdmux_id = -1;
 static int s_dpdmux_ep_id;
 
 #define CRYPTO_DEV_DEFAULT_ID 0
-#define CRYPTO_PORT_SEC_FLOW 0
 enum {
 	CRYPTO_DEV_INGRESS_QP,
 	CRYPTO_DEV_EGRESS_QP,
@@ -226,7 +225,11 @@ static uint16_t s_nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 
 #define MAX_QUEUES_PER_PORT 16
 static struct rte_ring *s_port_rxq_rings[RTE_MAX_ETHPORTS];
+static struct rte_ring *s_port_sp_rings[RTE_MAX_ETHPORTS];
+
 static struct rte_ring *s_port_txq_rings[RTE_MAX_ETHPORTS];
+static uint16_t s_def_rxq[RTE_MAX_ETHPORTS];
+
 static uint16_t s_rxq_ids[RTE_MAX_ETHPORTS][MAX_QUEUES_PER_PORT];
 static uint16_t s_txq_ids[RTE_MAX_ETHPORTS][MAX_QUEUES_PER_PORT];
 
@@ -246,7 +249,6 @@ struct pre_ld_dir_traffic_cfg {
 	uint16_t ul_id;
 	uint16_t dl_id;
 	uint16_t tap_id;
-	uint16_t rxq_nb[RTE_MAX_ETHPORTS];
 };
 
 static struct pre_ld_dir_traffic_cfg s_dir_traffic_cfg;
@@ -992,8 +994,7 @@ pre_ld_configure_default_flow(uint16_t portid,
 
 static void
 pre_ld_configure_direct_traffic(uint16_t ext_id,
-	uint16_t ul_id, uint16_t dl_id,
-	uint16_t tap_id, uint16_t rxq_nb[])
+	uint16_t ul_id, uint16_t dl_id, uint16_t tap_id)
 {
 	uint16_t i, lcore_id;
 	struct rte_flow *flow;
@@ -1020,20 +1021,20 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	/**Assume only single TC support and
 	 * direct flow is lowest priority.
 	 */
-	prio[0] = rxq_nb[dl_id] - 1;
+	prio[0] = s_def_rxq[dl_id];
 	strcpy(s_def_dir[1].from_name, tap_nm);
 	strcpy(s_def_dir[1].to_name, dl_nm);
-	prio[1] = rxq_nb[tap_id] - 1;
+	prio[1] = s_def_rxq[tap_id];
 
 	if (rte_pmd_dpaa2_dev_is_dpaa2(ext_id)) {
 		strcpy(s_def_dir[2].from_name, ext_nm);
 		strcpy(s_def_dir[2].to_name, ul_nm);
-		prio[2] = rxq_nb[ext_id] - 1;
+		prio[2] = s_def_rxq[ext_id];
 		s_def_dir_num++;
 
 		strcpy(s_def_dir[3].from_name, ul_nm);
 		strcpy(s_def_dir[3].to_name, ext_nm);
-		prio[3] = rxq_nb[ul_id] - 1;
+		prio[3] = s_def_rxq[ul_id];
 		s_def_dir_num++;
 	}
 
@@ -1069,7 +1070,7 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	lcore->n_fwds++;
 
 	flow = pre_ld_configure_default_flow(ul_id,
-		DEFAULT_DIRECT_GROUP, rxq_nb[ul_id] - 1);
+		DEFAULT_DIRECT_GROUP, s_def_rxq[ul_id]);
 	if (!flow) {
 		pthread_mutex_unlock(&s_lcore_mutex);
 		return;
@@ -1079,7 +1080,7 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	fwd = &lcore->fwd[lcore->n_fwds];
 	fwd->poll_type = RX_QUEUE;
 	fwd->poll.poll_port.port_id = ul_id;
-	fwd->poll.poll_port.queue_id = rxq_nb[ul_id] - 1;
+	fwd->poll.poll_port.queue_id = s_def_rxq[ul_id];
 	fwd->fwd_type = HW_PORT;
 	fwd->fwd_dest.fwd_port = ext_id;
 	rte_wmb();
@@ -1511,10 +1512,10 @@ pre_ld_main_loop(void *dummy)
 	struct rte_mempool *tx_pool = NULL;
 	uint16_t rx_ports[XFM_POLICY_ETH_NUM];
 	uint16_t tx_ports[XFM_POLICY_ETH_NUM];
-	uint16_t rx_port_flows[XFM_POLICY_ETH_NUM];
 	uint16_t self_gen_lens[MAX_PKT_BURST];
 	uint8_t *self_gen_pool = NULL;
 	uint16_t self_gen_len = 0;
+	struct rte_ring *sp_ring[XFM_POLICY_ETH_NUM];
 
 	RTE_SET_USED(dummy);
 
@@ -1535,8 +1536,7 @@ pre_ld_main_loop(void *dummy)
 	pre_ld_configure_direct_traffic(s_dir_traffic_cfg.ext_id,
 		s_dir_traffic_cfg.ul_id,
 		s_dir_traffic_cfg.dl_id,
-		s_dir_traffic_cfg.tap_id,
-		s_dir_traffic_cfg.rxq_nb);
+		s_dir_traffic_cfg.tap_id);
 	pthread_mutex_unlock(&s_dp_init_mutex);
 
 	RTE_LOG(INFO, pre_ld,
@@ -1560,11 +1560,12 @@ pre_ld_main_loop(void *dummy)
 		tx_ports[XFM_POLICY_IN_ETH_IDX] = s_dir_traffic_cfg.ul_id;
 		rx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ul_id;
 		tx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ext_id;
-		rx_port_flows[XFM_POLICY_IN_ETH_IDX] = CRYPTO_PORT_SEC_FLOW;
-		rx_port_flows[XFM_POLICY_OUT_ETH_IDX] = CRYPTO_PORT_SEC_FLOW;
+		sp_ring[XFM_POLICY_IN_ETH_IDX] =
+			s_port_sp_rings[s_dir_traffic_cfg.dl_id];
+		sp_ring[XFM_POLICY_OUT_ETH_IDX] =
+			s_port_sp_rings[s_dir_traffic_cfg.ul_id];
 		ret = xfm_crypto_init(s_crypto_dev_id, CRYPTO_DEV_QP_NUM,
-			rx_ports, rx_port_flows, tx_ports,
-			s_pre_ld_rx_pool);
+			rx_ports, tx_ports, sp_ring, s_pre_ld_rx_pool);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
 			return ret;
@@ -1987,7 +1988,7 @@ statistics_continue:
 static int eal_main(void)
 {
 	int ret;
-	uint16_t nb_ports;
+	uint16_t nb_ports, i;
 	uint16_t nb_ports_available = 0;
 	uint16_t portid, dpaa2_rxqs = 0;
 	uint16_t rxq_num[RTE_MAX_ETHPORTS];
@@ -1995,7 +1996,7 @@ static int eal_main(void)
 	struct rte_eth_conf *port_conf;
 	struct rte_eth_dev_info *dev_info;
 	enum pre_ld_port_type port_type[RTE_MAX_ETHPORTS], type_ret;
-	size_t i, eal_argc = 0;
+	size_t eal_argc = 0;
 	char *eal_argv[MAX_ARGV_NUM];
 	char func_nm[64], s_cpu[32], s_cpu_mask[32];
 	char s_file_prefix[32], s_file_prefix_val[32];
@@ -2241,18 +2242,34 @@ static int eal_main(void)
 		if (!s_port_rxq_rings[portid])
 			rte_exit(EXIT_FAILURE, "create %s failed\n", ring_nm);
 
+		if ((port_type[portid] == DOWN_LINK_TYPE ||
+			port_type[portid] == UP_LINK_TYPE) &&
+			s_ipsec_enable) {
+			sprintf(ring_nm, "port%d_sp_ring", portid);
+			s_port_sp_rings[portid] = rte_ring_create(ring_nm,
+				dev_info[portid].max_rx_queues * 2, 0,
+				RING_F_SP_ENQ | RING_F_SC_DEQ);
+			if (!s_port_rxq_rings[portid])
+				rte_exit(EXIT_FAILURE, "create %s failed\n", ring_nm);
+		}
+
 		for (i = 0; i < dev_info[portid].max_rx_queues; i++) {
 			s_rxq_ids[portid][i] = i;
-			if (port_type[portid] == DOWN_LINK_TYPE &&
-				i == CRYPTO_PORT_SEC_FLOW &&
-				s_ipsec_enable) {
-				/** Downlink port's specific flow is used to
-				 * receive esp traffic.
-				 */
+			if (i == (dev_info[portid].max_rx_queues - 1)) {
+				/** Default flow, lowest priority.*/
+				s_def_rxq[portid] = i;
 				continue;
 			}
-			ret = rte_ring_enqueue(s_port_rxq_rings[portid],
-				&s_rxq_ids[portid][i]);
+			if ((port_type[portid] == DOWN_LINK_TYPE ||
+				port_type[portid] == UP_LINK_TYPE) &&
+				s_ipsec_enable &&
+				i < (dev_info[portid].max_rx_queues / 2)) {
+				ret = rte_ring_enqueue(s_port_sp_rings[portid],
+					&s_rxq_ids[portid][i]);
+			} else {
+				ret = rte_ring_enqueue(s_port_rxq_rings[portid],
+					&s_rxq_ids[portid][i]);
+			}
 			if (ret) {
 				rte_exit(EXIT_FAILURE,
 					"eq s_rxq_ids[%d][%d] to %s failed\n",
@@ -2287,8 +2304,6 @@ static int eal_main(void)
 		s_dir_traffic_cfg.ul_id = ul_id;
 		s_dir_traffic_cfg.dl_id = dl_id;
 		s_dir_traffic_cfg.tap_id = tap_id;
-		rte_memcpy(s_dir_traffic_cfg.rxq_nb,
-			rxq_num, sizeof(uint16_t) * RTE_MAX_ETHPORTS);
 		ret = rte_eal_mp_remote_launch(pre_ld_main_loop,
 			NULL, SKIP_MAIN);
 		if (ret) {

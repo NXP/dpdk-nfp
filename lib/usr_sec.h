@@ -137,7 +137,8 @@ struct pre_ld_ipsec_sp_entry {
 	};
 	struct rte_flow_item_esp esp_spec;
 	struct rte_flow *flow;
-	uint16_t flow_idx;
+	uint16_t *flow_idx;
+	struct rte_ring *flow_idx_ring;
 	uint16_t port_idx;
 
 	struct pre_ld_ipsec_sa_entry *sa;
@@ -203,8 +204,9 @@ struct xfm_ipsec_sa_params {
 
 int
 xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
-	uint16_t rx_ports[], uint16_t rx_flows[],
-	uint16_t tx_ports[], struct rte_mempool *mbuf_pool);
+	uint16_t rx_ports[], uint16_t tx_ports[],
+	struct rte_ring *sp_ring[],
+	struct rte_mempool *mbuf_pool);
 
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void);
 
