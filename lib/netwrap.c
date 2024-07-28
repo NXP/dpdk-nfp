@@ -3333,9 +3333,10 @@ netwrap_get_local_ip(int sockfd)
 static int
 netwrap_get_remote_hw(int sockfd)
 {
-	int ret, offset = 0, i, arp_s, close_ret;
+	int ret = 0, offset = 0, i, arp_s, close_ret;
 	struct arpreq arpreq;
 	char mac_addr[64];
+	uint8_t *ip4_addr;
 	uint8_t addr_bytes[RTE_ETHER_ADDR_LEN];
 	struct sockaddr_in ia;
 	struct eth_ipv4_udp_hdr *hdr = &s_fd_desc[sockfd].hdr;
@@ -3360,7 +3361,7 @@ netwrap_get_remote_hw(int sockfd)
 	ia.sin_port = hdr->udp_hdr.dst_port;
 
 	memset(&arpreq, 0, sizeof(struct arpreq));
-	memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
+	rte_memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
 	snprintf(arpreq.arp_dev, IFNAMSIZ, "%s", s_slow_if);
 	arpreq.arp_pa.sa_family = AF_INET;
 	arpreq.arp_ha.sa_family = AF_UNSPEC;
@@ -3379,13 +3380,29 @@ netwrap_get_remote_hw(int sockfd)
 
 		return arp_s;
 	}
+	ip4_addr = (void *)&ia.sin_addr.s_addr;
 	ret = ioctl(arp_s, SIOCGARP, &arpreq);
 	if (ret) {
-		RTE_LOG(INFO, pre_ld,
-			"%s: Get arp table by socket(%d) failed(%d)\n",
-			__func__, arp_s, ret);
-
-		goto close_arp_socket;
+		RTE_LOG(WARNING, pre_ld,
+			"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
+			__func__, ip4_addr[0], ip4_addr[1],
+			ip4_addr[2], ip4_addr[3], ret);
+		ret = xfm_find_sa_addrs_by_sp_addrs(NULL,
+				(const xfrm_address_t *)&hdr->ip_hdr.dst_addr,
+				AF_INET, XFRM_POLICY_OUT, NULL,
+				(xfrm_address_t *)&ia.sin_addr.s_addr);
+		if (ret)
+			goto close_arp_socket;
+		ip4_addr = (void *)&ia.sin_addr.s_addr;
+		rte_memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
+		ret = ioctl(arp_s, SIOCGARP, &arpreq);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
+				__func__, ip4_addr[0], ip4_addr[1],
+				ip4_addr[2], ip4_addr[3], ret);
+			goto close_arp_socket;
+		}
 	}
 
 	rte_memcpy(&s_fd_desc[sockfd].hdr.eth_hdr.dst_addr,
@@ -3403,8 +3420,9 @@ netwrap_get_remote_hw(int sockfd)
 		}
 	}
 	RTE_LOG(INFO, pre_ld,
-		"%s: socket fd:%d, Remote Mac: %s\n",
-		__func__, sockfd, mac_addr);
+		"%s: socket fd:%d, Get Remote Mac: %s by %d.%d.%d.%d\n",
+		__func__, sockfd, mac_addr,
+		ip4_addr[0], ip4_addr[1], ip4_addr[2], ip4_addr[3]);
 
 	s_fd_desc[sockfd].hdr_init |= REMOTE_ETH_INIT;
 
@@ -3416,7 +3434,7 @@ close_arp_socket:
 			__func__, arp_s, close_ret);
 	}
 
-	return 0;
+	return ret;
 }
 
 static int
