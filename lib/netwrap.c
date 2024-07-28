@@ -103,6 +103,9 @@ static char *s_downlink;
 static int s_ipsec_enable;
 static int s_usr_stroke_control;
 
+static uint16_t s_l3_traffic_dump;
+static uint8_t s_l4_traffic_dump;
+
 static pthread_t s_main_td;
 
 #define MAX_USR_FD_NUM 1024
@@ -349,16 +352,23 @@ static uint16_t s_tx_port;
 
 static int s_dpdmux_entry_index = -1;
 
-#define MAX_DEFAULT_FLOW_NUM 8
-static struct rte_flow *s_default_flow[MAX_DEFAULT_FLOW_NUM];
-static uint16_t s_default_flow_num;
-
 static int s_data_path_core = -1;
 
 static int s_ipsec_buf_swap;
 
 #define MAX_HUGE_FRAME_SIZE 9600
 static uint16_t s_mtu_set;
+static int s_dump_traffic_flow;
+
+struct pre_ld_default_direction {
+	struct rte_remote_dir_req *def_dir;
+	uint16_t from_ids[MAX_DEF_DIR_NUM];
+	uint16_t to_ids[MAX_DEF_DIR_NUM];
+	uint16_t prios[MAX_DEF_DIR_NUM];
+	struct rte_flow *flows[MAX_DEF_DIR_NUM];
+};
+
+struct pre_ld_default_direction s_pre_ld_def_dir;
 
 struct pre_ld_udp_desc {
 	uint16_t offset;
@@ -992,15 +1002,85 @@ pre_ld_configure_default_flow(uint16_t portid,
 	return flow;
 }
 
+static inline void
+pre_ld_add_port_fwd_entry(struct pre_ld_lcore_conf *lcore,
+	uint16_t from_id, uint16_t to_id, uint16_t rxq_id)
+{
+	struct pre_ld_lcore_fwd *fwd;
+
+	fwd = &lcore->fwd[lcore->n_fwds];
+	fwd->poll_type = RX_QUEUE;
+	fwd->poll.poll_port.port_id = from_id;
+	fwd->poll.poll_port.queue_id = rxq_id;
+	fwd->fwd_type = HW_PORT;
+	fwd->fwd_dest.fwd_port = to_id;
+	rte_wmb();
+	lcore->n_fwds++;
+}
+
+static inline struct rte_flow *
+pre_ld_sw_default_direct(struct pre_ld_lcore_conf *lcore,
+	uint32_t prio, uint16_t from_id, uint16_t to_id)
+{
+	struct rte_flow *flow;
+
+	pre_ld_add_port_fwd_entry(lcore, from_id, to_id, prio);
+	flow = pre_ld_configure_default_flow(from_id,
+		DEFAULT_DIRECT_GROUP, prio);
+
+	return flow;
+}
+
+static inline void
+pre_ld_def_dir_add(const char *from_nm,
+	const char *to_nm, uint16_t from_id, uint16_t to_id,
+	uint16_t prio, struct rte_flow *flow)
+{
+	if (!s_pre_ld_def_dir.def_dir)
+		s_pre_ld_def_dir.def_dir = s_def_dir;
+
+	strcpy(s_pre_ld_def_dir.def_dir[s_def_dir_num].from_name,
+		from_nm);
+	strcpy(s_pre_ld_def_dir.def_dir[s_def_dir_num].to_name,
+		to_nm);
+	s_pre_ld_def_dir.from_ids[s_def_dir_num] = from_id;
+	s_pre_ld_def_dir.to_ids[s_def_dir_num] = to_id;
+	s_pre_ld_def_dir.prios[s_def_dir_num] = prio;
+	s_pre_ld_def_dir.flows[s_def_dir_num] = flow;
+	s_def_dir_num++;
+}
+
+static void
+pre_ld_build_def_direct_traffic(struct pre_ld_lcore_conf *lcore,
+	const char *from_nm, const char *to_nm,
+	uint16_t from_id, uint16_t to_id)
+{
+	struct rte_flow *flow;
+
+	if (rte_pmd_dpaa2_dev_is_dpaa2(from_id)) {
+		if (s_dump_traffic_flow) {
+			flow = pre_ld_sw_default_direct(lcore,
+					s_def_rxq[from_id], from_id, to_id);
+		} else {
+			flow = rte_remote_default_direct(from_nm,
+					to_nm, NULL, DEFAULT_DIRECT_GROUP,
+					s_def_rxq[from_id]);
+		}
+	} else {
+		flow = NULL;
+		pre_ld_add_port_fwd_entry(lcore, from_id, to_id,
+			s_def_rxq[from_id]);
+	}
+	pre_ld_def_dir_add(from_nm, to_nm, from_id, to_id,
+		s_def_rxq[from_id], flow);
+}
+
 static void
 pre_ld_configure_direct_traffic(uint16_t ext_id,
 	uint16_t ul_id, uint16_t dl_id, uint16_t tap_id)
 {
-	uint16_t i, lcore_id;
-	struct rte_flow *flow;
-	uint32_t prio[MAX_DEF_DIR_NUM];
+	uint16_t lcore_id;
 	struct pre_ld_lcore_conf *lcore;
-	struct pre_ld_lcore_fwd *fwd;
 	char ext_nm[RTE_ETH_NAME_MAX_LEN];
 	char ul_nm[RTE_ETH_NAME_MAX_LEN];
 	char dl_nm[RTE_ETH_NAME_MAX_LEN];
@@ -1015,77 +1095,16 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 		rte_exit(EXIT_FAILURE, "No data path core available\n");
 	lcore_id = s_data_path_core;
 
-	s_def_dir_num = 2;
-	strcpy(s_def_dir[0].from_name, dl_nm);
-	strcpy(s_def_dir[0].to_name, tap_nm);
-	/**Assume only single TC support and
-	 * direct flow is lowest priority.
-	 */
-	prio[0] = s_def_rxq[dl_id];
-	strcpy(s_def_dir[1].from_name, tap_nm);
-	strcpy(s_def_dir[1].to_name, dl_nm);
-	prio[1] = s_def_rxq[tap_id];
-
-	if (rte_pmd_dpaa2_dev_is_dpaa2(ext_id)) {
-		strcpy(s_def_dir[2].from_name, ext_nm);
-		strcpy(s_def_dir[2].to_name, ul_nm);
-		prio[2] = s_def_rxq[ext_id];
-		s_def_dir_num++;
-
-		strcpy(s_def_dir[3].from_name, ul_nm);
-		strcpy(s_def_dir[3].to_name, ext_nm);
-		prio[3] = s_def_rxq[ul_id];
-		s_def_dir_num++;
-	}
-
-	for (i = 0; i < s_def_dir_num; i++) {
-		flow = rte_remote_default_direct(s_def_dir[i].from_name,
-				s_def_dir[i].to_name, NULL,
-				DEFAULT_DIRECT_GROUP, prio[i]);
-		if (!flow) {
-			RTE_LOG(WARNING, pre_ld,
-				"default flow (%s)->(%s) created failed\n",
-				s_def_dir[i].from_name,
-				s_def_dir[i].to_name);
-		} else {
-			s_default_flow[s_default_flow_num] = flow;
-			s_default_flow_num++;
-		}
-	}
-
-	if (rte_pmd_dpaa2_dev_is_dpaa2(ext_id))
-		return;
-
 	lcore = &s_pre_ld_lcore[lcore_id];
-	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE)
-		rte_exit(EXIT_FAILURE, "Too many forwards\n");
 	pthread_mutex_lock(&s_lcore_mutex);
-	fwd = &lcore->fwd[lcore->n_fwds];
-	fwd->poll_type = RX_QUEUE;
-	fwd->poll.poll_port.port_id = ext_id;
-	fwd->poll.poll_port.queue_id = 0;
-	fwd->fwd_type = HW_PORT;
-	fwd->fwd_dest.fwd_port = ul_id;
-	rte_wmb();
-	lcore->n_fwds++;
-
-	flow = pre_ld_configure_default_flow(ul_id,
-		DEFAULT_DIRECT_GROUP, s_def_rxq[ul_id]);
-	if (!flow) {
-		pthread_mutex_unlock(&s_lcore_mutex);
-		return;
-	}
-	s_default_flow[s_default_flow_num] = flow;
-	s_default_flow_num++;
-	fwd = &lcore->fwd[lcore->n_fwds];
-	fwd->poll_type = RX_QUEUE;
-	fwd->poll.poll_port.port_id = ul_id;
-	fwd->poll.poll_port.queue_id = s_def_rxq[ul_id];
-	fwd->fwd_type = HW_PORT;
-	fwd->fwd_dest.fwd_port = ext_id;
-	rte_wmb();
-	lcore->n_fwds++;
-
+	pre_ld_build_def_direct_traffic(lcore, dl_nm, tap_nm,
+		dl_id, tap_id);
+	pre_ld_build_def_direct_traffic(lcore, tap_nm, dl_nm,
+		tap_id, dl_id);
+	pre_ld_build_def_direct_traffic(lcore, ext_nm, ul_nm,
+		ext_id, ul_id);
+	pre_ld_build_def_direct_traffic(lcore, ul_nm, ext_nm,
+		ul_id, ext_id);
 	pthread_mutex_unlock(&s_lcore_mutex);
 }
 
@@ -1497,6 +1516,66 @@ pre_ld_fwd_to_crypto(struct pre_ld_lcore_fwd *fwd,
 	return nb_tx;
 }
 
+static inline void
+pre_ld_l3_l4_traffic_dump(struct rte_mbuf *mbuf,
+	const char *prefix)
+{
+	struct rte_ether_hdr *eth;
+	struct rte_ipv4_hdr *iph4;
+	struct rte_ipv6_hdr *iph6;
+
+	eth = rte_pktmbuf_mtod(mbuf, void *);
+
+	if (s_l3_traffic_dump && !s_l4_traffic_dump) {
+		if (eth->ether_type == rte_cpu_to_be_16(s_l3_traffic_dump))
+			goto print_mbuf;
+	} else if (!s_l3_traffic_dump && s_l4_traffic_dump) {
+		if (eth->ether_type ==
+			rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+			iph4 = (void *)(eth + 1);
+			if (iph4->next_proto_id == s_l4_traffic_dump)
+				goto print_mbuf;
+		} else if (eth->ether_type ==
+			rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6)) {
+			iph6 = (void *)(eth + 1);
+			if (iph6->proto == s_l4_traffic_dump)
+				goto print_mbuf;
+		}
+	} else if (s_l3_traffic_dump && s_l4_traffic_dump) {
+		if (s_l3_traffic_dump == RTE_ETHER_TYPE_IPV4 &&
+			eth->ether_type ==
+			rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+			iph4 = (void *)(eth + 1);
+			if (iph4->next_proto_id == s_l4_traffic_dump)
+				goto print_mbuf;
+		} else if (s_l3_traffic_dump == RTE_ETHER_TYPE_IPV6 &&
+			eth->ether_type ==
+			rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6)) {
+			iph6 = (void *)(eth + 1);
+			if (iph6->proto == s_l4_traffic_dump)
+				goto print_mbuf;
+		}
+	}
+
+	return;
+
+print_mbuf:
+	if (s_l3_traffic_dump && !s_l4_traffic_dump) {
+		RTE_LOG(INFO, pre_ld,
+			"%s with l3 is 0x%04x\n",
+			prefix, s_l3_traffic_dump);
+	} else if (!s_l3_traffic_dump && s_l4_traffic_dump) {
+		RTE_LOG(INFO, pre_ld,
+			"%s with l4 is 0x%02x\n",
+			prefix, s_l4_traffic_dump);
+	} else if (s_l3_traffic_dump && s_l4_traffic_dump) {
+		RTE_LOG(INFO, pre_ld,
+			"%s with l3 is 0x%04x and l4 is 0x%02x\n",
+			prefix, s_l3_traffic_dump, s_l4_traffic_dump);
+	}
+	rte_pktmbuf_dump(stdout, mbuf, 60);
+}
+
 static int
 pre_ld_main_loop(void *dummy)
 {
@@ -1516,6 +1595,7 @@ pre_ld_main_loop(void *dummy)
 	uint8_t *self_gen_pool = NULL;
 	uint16_t self_gen_len = 0;
 	struct rte_ring *sp_ring[XFM_POLICY_ETH_NUM];
+	char prefix[1024];
 
 	RTE_SET_USED(dummy);
 
@@ -1589,6 +1669,19 @@ for_ever_loop:
 			queueid = fwd->poll.poll_port.queue_id;
 			nb_rx = rte_eth_rx_burst(portid, queueid,
 					mbufs, MAX_PKT_BURST);
+			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+				sprintf(prefix, "Receive from port%d queue%d",
+					portid, queueid);
+				for (j = 0; j < nb_rx; j++)
+					pre_ld_l3_l4_traffic_dump(mbufs[j], prefix);
+			}
+			if (unlikely(s_dump_traffic_flow && nb_rx > 0)) {
+				RTE_LOG(INFO, pre_ld,
+					"Receive from port%d queue%d\n",
+					portid, queueid);
+				for (j = 0; j < nb_rx; j++)
+					rte_pktmbuf_dump(stdout, mbufs[j], 60);
+			}
 		} else if (fwd->poll_type == TX_RING) {
 			tx_rings = &fwd->poll.tx_rings;
 			if (!tx_rings->tx_ring_num)
@@ -1600,6 +1693,16 @@ for_ever_loop:
 				nb_rx += rte_ring_dequeue_burst(txr,
 					(void **)&mbufs[nb_rx], nb_txr_burst,
 					NULL);
+			}
+			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+				sprintf(prefix, "Receive from TX ring");
+				for (j = 0; j < nb_rx; j++)
+					pre_ld_l3_l4_traffic_dump(mbufs[j], prefix);
+			}
+			if (unlikely(s_dump_traffic_flow && nb_rx > 0)) {
+				RTE_LOG(INFO, pre_ld, "Receive from TX ring\n");
+				for (j = 0; j < nb_rx; j++)
+					rte_pktmbuf_dump(stdout, mbufs[j], 60);
 			}
 		} else if (fwd->poll_type == SELF_GEN) {
 			if (s_usr_fd_num <= 0) {
@@ -1635,9 +1738,29 @@ for_ever_loop:
 			if (nb_rx && queueid == CRYPTO_DEV_INGRESS_QP) {
 				for (i = 0; i < nb_rx; i++)
 					pre_ld_adjust_ipv4(mbufs[i], INGRESS_CRYPTO_DQ);
+				if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+					sprintf(prefix, "Ingress SEC DQ:");
+					for (i = 0; i < nb_rx; i++)
+						pre_ld_l3_l4_traffic_dump(mbufs[i], prefix);
+				}
+				if (unlikely(s_dump_traffic_flow)) {
+					RTE_LOG(INFO, pre_ld, "Ingress SEC DQ:\n");
+					for (i = 0; i < nb_rx; i++)
+						rte_pktmbuf_dump(stdout, mbufs[i], 60);
+				}
 			} else if (nb_rx && queueid == CRYPTO_DEV_EGRESS_QP) {
 				for (i = 0; i < nb_rx; i++)
 					pre_ld_adjust_ipv4(mbufs[i], EGRESS_CRYPTO_DQ);
+				if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+					sprintf(prefix, "Egress SEC DQ:");
+					for (i = 0; i < nb_rx; i++)
+						pre_ld_l3_l4_traffic_dump(mbufs[i], prefix);
+				}
+				if (unlikely(s_dump_traffic_flow)) {
+					RTE_LOG(INFO, pre_ld, "Egress SEC DQ:\n");
+					for (i = 0; i < nb_rx; i++)
+						rte_pktmbuf_dump(stdout, mbufs[i], 60);
+				}
 			}
 		} else {
 			nb_rx = 0;
@@ -1661,11 +1784,47 @@ for_ever_loop:
 
 		if (fwd->fwd_type == SEC_EGRESS ||
 			fwd->fwd_type == SEC_INGRESS) {
+			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+				sprintf(prefix, "%s SEC EQ:",
+					fwd->fwd_type == SEC_EGRESS ?
+					"Egress" : "Ingress");
+				for (i = 0; i < nb_rx; i++)
+					pre_ld_l3_l4_traffic_dump(mbufs[i], prefix);
+			}
+			if (unlikely(s_dump_traffic_flow)) {
+				RTE_LOG(INFO, pre_ld, "%s SEC EQ:\n",
+					fwd->fwd_type == SEC_EGRESS ?
+					"Egress" : "Ingress");
+				for (i = 0; i < nb_rx; i++)
+					rte_pktmbuf_dump(stdout, mbufs[i], 60);
+			}
 			nb_tx = pre_ld_fwd_to_crypto(fwd, mbufs, nb_rx);
 		} else if (fwd->fwd_type == HW_PORT) {
 			portid = fwd->fwd_dest.fwd_port;
+			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+				sprintf(prefix, "TX to port%d:", portid);
+				for (i = 0; i < nb_rx; i++)
+					pre_ld_l3_l4_traffic_dump(mbufs[i], prefix);
+			}
+			if (unlikely(s_dump_traffic_flow)) {
+				RTE_LOG(INFO, pre_ld, "TX to port%d:\n", portid);
+				for (i = 0; i < nb_rx; i++)
+					rte_pktmbuf_dump(stdout, mbufs[i], 60);
+			}
 			nb_tx = rte_eth_tx_burst(portid, 0, mbufs, nb_rx);
 		} else if (fwd->fwd_type == RX_RING) {
+			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+				sprintf(prefix, "EQ to rx ring(%s):",
+					fwd->fwd_dest.rx_ring->name);
+				for (i = 0; i < nb_rx; i++)
+					pre_ld_l3_l4_traffic_dump(mbufs[i], prefix);
+			}
+			if (unlikely(s_dump_traffic_flow)) {
+				RTE_LOG(INFO, pre_ld, "EQ to rx ring(%s):\n",
+					fwd->fwd_dest.rx_ring->name);
+				for (i = 0; i < nb_rx; i++)
+					rte_pktmbuf_dump(stdout, mbufs[i], 60);
+			}
 			nb_tx = rte_ring_enqueue_burst(fwd->fwd_dest.rx_ring,
 					(void * const *)mbufs, nb_rx, NULL);
 		} else {
@@ -2253,9 +2412,9 @@ static int eal_main(void)
 				rte_exit(EXIT_FAILURE, "create %s failed\n", ring_nm);
 		}
 
-		for (i = 0; i < dev_info[portid].max_rx_queues; i++) {
+		for (i = 0; i < rxq_num[portid]; i++) {
 			s_rxq_ids[portid][i] = i;
-			if (i == (dev_info[portid].max_rx_queues - 1)) {
+			if (i == (rxq_num[portid] - 1)) {
 				/** Default flow, lowest priority.*/
 				s_def_rxq[portid] = i;
 				continue;
@@ -4071,6 +4230,18 @@ static void setup_wrappers(void)
 			s_mtu_set = 0;
 		}
 	}
+
+	env = getenv("PRE_LOAD_DUMP_TRAFFIC_FLOW");
+	if (env)
+		s_dump_traffic_flow = atoi(env);
+
+	env = getenv("PRE_LOAD_L3_DUMP_PROTOCOL");
+	if (env)
+		s_l3_traffic_dump = atoi(env);
+
+	env = getenv("PRE_LOAD_L4_DUMP_PROTOCOL");
+	if (env)
+		s_l4_traffic_dump = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
