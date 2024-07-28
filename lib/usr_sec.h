@@ -95,19 +95,14 @@ enum pre_ld_ipsec_sa_flag {
 	IP6_TRANSPORT = (1 << 4)
 };
 
-union pre_ld_ipsec_addr {
-	uint8_t ip4[sizeof(rte_be32_t)];
-	uint8_t ip6[16];
-};
-
 struct pre_ld_ipsec_sa_entry {
 	LIST_ENTRY(pre_ld_ipsec_sa_entry) next;
 	struct rte_ipsec_session session;
 	uint64_t seq;
 	enum pre_ld_ipsec_sa_flag sa_flags;
 	uint16_t family;
-	union pre_ld_ipsec_addr src;
-	union pre_ld_ipsec_addr dst;
+	xfrm_address_t src;
+	xfrm_address_t dst;
 	uint8_t cipher_key[MAX_SEC_KEY_SIZE];
 	uint16_t cipher_key_len;
 	uint8_t auth_key[MAX_SEC_KEY_SIZE];
@@ -121,8 +116,8 @@ struct pre_ld_ipsec_sa_entry {
 
 struct pre_ld_ipsec_sp_entry {
 	LIST_ENTRY(pre_ld_ipsec_sp_entry) next;
-	union pre_ld_ipsec_addr src;
-	union pre_ld_ipsec_addr dst;
+	xfrm_address_t src;
+	xfrm_address_t dst;
 	rte_be32_t spi;
 	uint16_t family;
 	uint32_t priority;
@@ -209,6 +204,11 @@ xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
 	struct rte_mempool *mbuf_pool);
 
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void);
+
+int
+xfm_find_sa_addrs_by_sp_addrs(const xfrm_address_t *src,
+	const xfrm_address_t *dst, uint16_t family, int dir,
+	xfrm_address_t *sa_src, xfrm_address_t *sa_dst);
 
 int
 do_spdget(int spid, xfrm_address_t *saddr,

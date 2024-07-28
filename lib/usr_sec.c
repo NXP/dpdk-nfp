@@ -335,7 +335,7 @@ dump_sa_from_xfrm(const struct xfrm_usersa_info *sa_info)
 		rte_memcpy(dst, &sa_info->id.daddr.a4, sizeof(rte_be32_t));
 		offset += sprintf(&pol_dump[offset],
 			"%ssrc:%d.%d.%d.%d", DUMP_PREFIX,
-			dst[0], dst[1], dst[2], dst[3]);
+			src[0], src[1], src[2], src[3]);
 		offset += sprintf(&pol_dump[offset],
 			" dst:%d.%d.%d.%d\n",
 			dst[0], dst[1], dst[2], dst[3]);
@@ -447,12 +447,23 @@ static int nl_parse_attrs(struct nlattr *na, int len,
 }
 
 static struct pre_ld_ipsec_sa_entry *
-xfm_find_sa_by_dst_addr(const union pre_ld_ipsec_addr *dst,
-	uint16_t family)
+xfm_find_sa_by_addrs(const xfrm_address_t *src,
+	const xfrm_address_t *dst, uint16_t family)
 {
 	struct rte_security_ipsec_xform *ipsec;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 	struct pre_ld_ipsec_sa_entry *curr = LIST_FIRST(&cntx->sa_list);
+	uint16_t size = 0;
+
+	if (family == AF_INET)
+		size = sizeof(rte_be32_t);
+	else if (family == AF_INET6)
+		size = 16;
+	else
+		return NULL;
+
+	if (!src && !dst)
+		return NULL;
 
 	while (curr) {
 		ipsec = &curr->sess_conf.ipsec;
@@ -460,20 +471,82 @@ xfm_find_sa_by_dst_addr(const union pre_ld_ipsec_addr *dst,
 			curr = LIST_NEXT(curr, next);
 			continue;
 		}
-		if (family == curr->family &&
-			family == AF_INET) {
-			if (!memcmp(dst->ip4, curr->dst.ip4,
-				sizeof(rte_be32_t)))
-				return curr;
-		} else if (family == curr->family &&
-			family == AF_INET6) {
-			if (!memcmp(dst->ip6, curr->dst.ip6, 16))
-				return curr;
+		if (family != curr->family) {
+			curr = LIST_NEXT(curr, next);
+			continue;
 		}
+		if (!src && dst && !memcmp(dst, &curr->dst, size))
+			return curr;
+		if (!dst && src && !memcmp(src, &curr->src, size))
+			return curr;
+		if (src && !memcmp(src, &curr->src, size) &&
+			dst && !memcmp(dst, &curr->dst, size))
+			return curr;
 		curr = LIST_NEXT(curr, next);
 	}
 
 	return NULL;
+}
+
+int
+xfm_find_sa_addrs_by_sp_addrs(const xfrm_address_t *src,
+	const xfrm_address_t *dst, uint16_t family, int dir,
+	xfrm_address_t *sa_src, xfrm_address_t *sa_dst)
+{
+	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+	struct pre_ld_ipsec_sp_head *head;
+	struct pre_ld_ipsec_sp_entry *curr;
+	uint16_t size = 0;
+
+	if (family == AF_INET &&
+		dir == XFRM_POLICY_IN) {
+		head = &cntx->sp_ipv4_in_list;
+		size = sizeof(rte_be32_t);
+	} else if (family == AF_INET &&
+		dir == XFRM_POLICY_OUT) {
+		head = &cntx->sp_ipv4_out_list;
+		size = sizeof(rte_be32_t);
+	} else if (family == AF_INET6 &&
+		dir == XFRM_POLICY_IN) {
+		head = &cntx->sp_ipv6_in_list;
+		size = 16;
+	} else if (family == AF_INET6 &&
+		dir == XFRM_POLICY_OUT) {
+		head = &cntx->sp_ipv6_out_list;
+		size = 16;
+	} else {
+		/* we handle only in/out policies */
+		RTE_LOG(ERR, pre_ld,
+			"Policy dir(%d)/family(%d) unsupport\n",
+			dir, family);
+		return -EINVAL;
+	}
+
+	curr = LIST_FIRST(head);
+
+	while (curr) {
+		if (src && !dst && !memcmp(src, &curr->src, size))
+			break;
+		if (dst && !src && !memcmp(dst, &curr->dst, size))
+			break;
+		if (src && dst && !memcmp(src, &curr->src, size) &&
+			!memcmp(dst, &curr->dst, size))
+			break;
+		curr = LIST_NEXT(curr, next);
+	}
+
+	if (curr) {
+		if (sa_src)
+			rte_memcpy(sa_src, &curr->sa->src,
+				sizeof(xfrm_address_t));
+		if (sa_dst)
+			rte_memcpy(sa_dst, &curr->sa->dst,
+				sizeof(xfrm_address_t));
+
+		return 0;
+	}
+
+	return -ENODATA;
 }
 
 static int
@@ -560,11 +633,11 @@ update_sa:
 			sa_entry->auth_key_len);
 	}
 
+	rte_memcpy(&sa_entry->src, &sa_info->saddr,
+		sizeof(xfrm_address_t));
+	rte_memcpy(&sa_entry->dst, &sa_info->id.daddr,
+		sizeof(xfrm_address_t));
 	if (sa_info->family == AF_INET) {
-		rte_memcpy(sa_entry->src.ip4,
-			&sa_info->saddr.a4, sizeof(sizeof(rte_be32_t)));
-		rte_memcpy(sa_entry->dst.ip4,
-			&sa_info->id.daddr.a4, sizeof(sizeof(rte_be32_t)));
 		if (sa_info->mode == XFRM_MODE_TRANSPORT) {
 			sa_entry->sa_flags = IP4_TRANSPORT;
 		} else if (sa_info->mode == XFRM_MODE_TUNNEL) {
@@ -577,10 +650,6 @@ update_sa:
 			goto quit;
 		}
 	} else if (sa_info->family == AF_INET6) {
-		rte_memcpy(sa_entry->src.ip6, sa_info->saddr.a6,
-			16);
-		rte_memcpy(sa_entry->dst.ip6, sa_info->id.daddr.a6,
-			16);
 		if (sa_info->mode == XFRM_MODE_TRANSPORT) {
 			sa_entry->sa_flags = IP6_TRANSPORT;
 		} else if (sa_info->mode == XFRM_MODE_TUNNEL) {
@@ -667,7 +736,10 @@ update_sa:
 	sa_entry->auth_xform.auth.key.data = sa_entry->auth_key;
 	sa_entry->auth_xform.auth.key.length = sa_entry->auth_key_len;
 	/**Digest len is identified by IPSec protocal offload engine.*/
-	sa_entry->auth_xform.auth.digest_length = 0;
+	if (auth_entry->algo == RTE_CRYPTO_AUTH_SHA256_HMAC)
+		sa_entry->auth_xform.auth.digest_length = 16;
+	else
+		sa_entry->auth_xform.auth.digest_length = 0;
 
 	sa_entry->ciph_xform.next = NULL;
 	sa_entry->ciph_xform.type = RTE_CRYPTO_SYM_XFORM_CIPHER;
@@ -786,9 +858,14 @@ static int process_del_sa(const struct nlmsghdr *nh)
 	struct pre_ld_ipsec_sa_entry *curr, *del = NULL;
 	uint8_t addr[16];
 	char addr_info[128];
-	uint16_t info_offset = 0;
+	uint16_t info_offset = 0, size = 0;
 
 	usersa_id = NLMSG_DATA(nh);
+
+	if (usersa_id->family == AF_INET)
+		size = sizeof(rte_be32_t);
+	else if (usersa_id->family == AF_INET6)
+		size = 16;
 
 	RTE_LOG(INFO, pre_ld,
 		"XFRM delete spi(0x%08x)\n",
@@ -798,21 +875,9 @@ static int process_del_sa(const struct nlmsghdr *nh)
 
 	while (curr) {
 		if (usersa_id->family == curr->family &&
-			usersa_id->family == AF_INET) {
-			if (!memcmp(&usersa_id->daddr.a4, curr->dst.ip4,
-				sizeof(rte_be32_t)) &&
-				usersa_id->spi == curr->sess_conf.ipsec.spi) {
-				del = curr;
-				break;
-			}
-		} else if (usersa_id->family == curr->family &&
-			usersa_id->family == AF_INET6) {
-			if (!memcmp(usersa_id->daddr.a6,
-				curr->dst.ip6, 16) &&
-				usersa_id->spi == curr->sess_conf.ipsec.spi) {
-				del = curr;
-				break;
-			}
+			!memcmp(&usersa_id->daddr, &curr->dst, size)) {
+			del = curr;
+			break;
 		}
 		curr = LIST_NEXT(curr, next);
 	}
@@ -831,7 +896,7 @@ static int process_del_sa(const struct nlmsghdr *nh)
 		return 0;
 	}
 
-	rte_memcpy(addr, &usersa_id->daddr, 16);
+	rte_memcpy(addr, &usersa_id->daddr, size);
 	if (usersa_id->family == AF_INET) {
 		sprintf(addr_info, "IPV4 dst: %d.%d.%d.%d",
 			addr[0], addr[1], addr[2], addr[3]);
@@ -918,9 +983,9 @@ xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp,
 
 	if (sp->family == AF_INET) {
 		flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV4;
-		rte_memcpy(&spec_ip4.hdr.src_addr, sp->src.ip4,
+		rte_memcpy(&spec_ip4.hdr.src_addr, &sp->src,
 			sizeof(rte_be32_t));
-		rte_memcpy(&spec_ip4.hdr.dst_addr, sp->dst.ip4,
+		rte_memcpy(&spec_ip4.hdr.dst_addr, &sp->dst,
 			sizeof(rte_be32_t));
 		mask_ip4.hdr.src_addr = 0xffffffff;
 		mask_ip4.hdr.dst_addr = 0xffffffff;
@@ -928,8 +993,8 @@ xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp,
 		flow_item[0].mask = &mask_ip4;
 	} else if (sp->family == AF_INET6) {
 		flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV6;
-		rte_memcpy(spec_ip6.hdr.src_addr, sp->src.ip6, 16);
-		rte_memcpy(spec_ip6.hdr.dst_addr, sp->dst.ip6, 16);
+		rte_memcpy(spec_ip6.hdr.src_addr, &sp->src, 16);
+		rte_memcpy(spec_ip6.hdr.dst_addr, &sp->dst, 16);
 		memset(mask_ip6.hdr.src_addr, 0xff, 16);
 		memset(mask_ip6.hdr.dst_addr, 0xff, 16);
 		flow_item[0].spec = &spec_ip6;
@@ -1142,11 +1207,16 @@ xfm_sa_sp_associate(struct pre_ld_ipsec_sp_entry *sp,
 static void
 xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 	const struct xfrm_userpolicy_info *pol_info,
-	const xfrm_address_t *saddr, int af)
+	const xfrm_address_t *saddr, const xfrm_address_t *daddr,
+	int af)
 {
 	struct pre_ld_ipsec_sp_entry *curr;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 	struct pre_ld_ipsec_sp_head *head;
+	const uint8_t *src_ip4, *dst_ip4;
+	const rte_be16_t *src_ip6, *dst_ip6;
+	char add_str[1024];
+	int offset;
 
 	if (pol_info->dir == XFRM_POLICY_OUT) {
 		if (af == AF_INET)
@@ -1161,25 +1231,39 @@ xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 	}
 	curr = LIST_FIRST(head);
 
+	rte_memcpy(&sp->src, saddr, sizeof(xfrm_address_t));
+	rte_memcpy(&sp->dst, daddr, sizeof(xfrm_address_t));
+	src_ip4 = (const void *)saddr;
+	dst_ip4 = (const void *)daddr;
+	src_ip6 = (const void *)saddr;
+	dst_ip6 = (const void *)daddr;
 	if (af == AF_INET) {
-		if (saddr)
-			rte_memcpy(sp->src.ip4, &saddr->a4, sizeof(rte_be32_t));
-		rte_memcpy(sp->dst.ip4, &pol_info->sel.daddr.a4,
-			sizeof(rte_be32_t));
-		RTE_LOG(INFO, pre_ld,
-			"New %s: %d.%d.%d.%d/%d.%d.%d.%d\n",
-			pol_info->dir == XFRM_POLICY_OUT ?
-			"Outbound policy IPv4 src/dst" :
-			"Inbound policy IPv4 src/dst",
-			sp->src.ip4[0], sp->src.ip4[1],
-			sp->src.ip4[2], sp->src.ip4[3],
-			sp->dst.ip4[0], sp->dst.ip4[1],
-			sp->dst.ip4[2], sp->dst.ip4[3]);
+		offset = sprintf(add_str, "%s", "IPv4 src/dst: ");
+		offset = sprintf(&add_str[offset],
+			"%d.%d.%d.%d/%d.%d.%d.%d",
+			src_ip4[0], src_ip4[1],
+			src_ip4[2], src_ip4[3],
+			dst_ip4[0], dst_ip4[1],
+			dst_ip4[2], dst_ip4[3]);
 	} else {
-		if (saddr)
-			rte_memcpy(sp->src.ip6, saddr->a6, 16);
-		rte_memcpy(sp->dst.ip6, &pol_info->sel.daddr.a6, 16);
+		offset = sprintf(add_str, "%s", "IPv6 src/dst: ");
+		offset = sprintf(&add_str[offset],
+			"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x/",
+			src_ip6[0], src_ip6[1],
+			src_ip6[2], src_ip6[3],
+			src_ip6[4], src_ip6[5],
+			src_ip6[6], src_ip6[7]);
+		offset = sprintf(&add_str[offset],
+			"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+			dst_ip6[0], dst_ip6[1],
+			dst_ip6[2], dst_ip6[3],
+			dst_ip6[4], dst_ip6[5],
+			dst_ip6[6], dst_ip6[7]);
 	}
+	RTE_LOG(INFO, pre_ld, "New %s %s\n",
+		pol_info->dir == XFRM_POLICY_OUT ?
+		"Outbound policy" : "Inbound policy",
+		add_str);
 	sp->priority = pol_info->priority;
 	sp->index = pol_info->index;
 	sp->family = af;
@@ -1200,11 +1284,11 @@ process_new_policy(const struct nlmsghdr *nh,
 	struct rte_ring *sp_rxq_rings[])
 {
 	struct xfrm_userpolicy_info *pol_info;
-	int ret = 0, af;
+	int ret = 0, af, offset = 0;
 	xfrm_address_t saddr, daddr;
-	union pre_ld_ipsec_addr dst;
 	struct pre_ld_ipsec_sa_entry *sa;
 	struct pre_ld_ipsec_sp_entry *sp;
+	char addr_info[1024];
 
 	pol_info = NLMSG_DATA(nh);
 
@@ -1225,18 +1309,39 @@ process_new_policy(const struct nlmsghdr *nh,
 			ret);
 		return ret;
 	}
-	if (af == AF_INET)
-		rte_memcpy(dst.ip4, &daddr.a4, sizeof(rte_be32_t));
-	else if (af == AF_INET6)
-		rte_memcpy(dst.ip6, daddr.a6, 16);
-	else
-		return -EINVAL;
-	sa = xfm_find_sa_by_dst_addr(&dst, af);
+	sa = xfm_find_sa_by_addrs(&saddr, &daddr, af);
 	if (!sa) {
 		/** TO DO: Add SP to pending list.*/
 		RTE_LOG(ERR, pre_ld, "No SA found\n");
 		return -ENOTSUP;
 	}
+	if (af == AF_INET) {
+		uint8_t *src4, *dst4;
+
+		src4 = (void *)&saddr;
+		dst4 = (void *)&daddr;
+		offset = sprintf(addr_info, "src(%d.%d.%d.%d)/",
+			src4[0], src4[1], src4[2], src4[3]);
+		offset = sprintf(&addr_info[offset],
+			"dst(%d.%d.%d.%d)",
+			dst4[0], dst4[1], dst4[2], dst4[3]);
+	} else if (af == AF_INET6) {
+		uint16_t *src6, *dst6;
+
+		src6 = (void *)&saddr;
+		dst6 = (void *)&daddr;
+		offset = sprintf(addr_info,
+			"src(%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x)/",
+			src6[0], src6[1], src6[2], src6[3],
+			src6[4], src6[5], src6[6], src6[7]);
+		offset = sprintf(&addr_info[offset],
+			"dst(%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x)",
+			dst6[0], dst6[1], dst6[2], dst6[3],
+			dst6[4], dst6[5], dst6[6], dst6[7]);
+	}
+
+	if (offset > 0)
+		RTE_LOG(INFO, pre_ld, "Found SA by %s\n", addr_info);
 
 	sp = rte_zmalloc(NULL, sizeof(struct pre_ld_ipsec_sp_entry),
 		RTE_CACHE_LINE_SIZE);
@@ -1245,7 +1350,11 @@ process_new_policy(const struct nlmsghdr *nh,
 		return -ENOMEM;
 	}
 
-	xfm_insert_new_policy(sp, pol_info, &saddr, af);
+	if (pol_info->dir == XFRM_POLICY_IN)
+		xfm_insert_new_policy(sp, pol_info, &saddr, &daddr, af);
+	else
+		xfm_insert_new_policy(sp, pol_info,
+			&pol_info->sel.saddr, &pol_info->sel.daddr, af);
 
 	ret = 0;
 	if (!sa->session.security.ses) {

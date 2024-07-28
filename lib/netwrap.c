@@ -1238,28 +1238,29 @@ pre_ld_ipsec_dequeue(struct rte_mbuf *pkts[], uint16_t max_pkts,
 }
 
 static inline int
-pre_ld_ipaddr_sp_cmp(union pre_ld_ipsec_addr *src,
-	union pre_ld_ipsec_addr *dst, uint16_t family,
+pre_ld_ipaddr_sp_cmp(const xfrm_address_t *src,
+	const xfrm_address_t *dst, uint16_t family,
 	struct pre_ld_ipsec_sp_entry *sp)
 {
-	if (family == AF_INET) {
-		if (!memcmp(sp->src.ip4,
-			src->ip4, sizeof(rte_be32_t)) &&
-			!memcmp(sp->dst.ip4,
-			dst->ip4, sizeof(rte_be32_t) - 1))
-			return true;
-	} else if (family == AF_INET6) {
-		if (!memcmp(sp->src.ip6, src->ip6, 16) &&
-			!memcmp(sp->dst.ip6, dst->ip6, 16))
-			return true;
-	}
+	uint16_t size = 0;
+
+	if (family == AF_INET)
+		size = sizeof(rte_be32_t);
+	else if (family == AF_INET6)
+		size = sizeof(xfrm_address_t);
+	else
+		return false;
+
+	if (!memcmp(&sp->src, src, size) &&
+		!memcmp(&sp->dst, dst, size))
+		return true;
 
 	return false;
 }
 
 static struct pre_ld_ipsec_sa_entry *
-pre_ld_out_sp_lookup_sa(union pre_ld_ipsec_addr *src,
-	union pre_ld_ipsec_addr *dst, rte_be32_t spi,
+pre_ld_out_sp_lookup_sa(const xfrm_address_t *src,
+	const xfrm_address_t *dst, rte_be32_t spi,
 	uint16_t family)
 {
 	struct pre_ld_ipsec_sp_entry *curr;
@@ -1276,10 +1277,8 @@ pre_ld_out_sp_lookup_sa(union pre_ld_ipsec_addr *src,
 	}
 
 	while (curr) {
-		if (pre_ld_ipaddr_sp_cmp(src, dst,
-			family, curr)) {
-			if (spi != INVALID_ESP_SPI &&
-				spi == curr->spi)
+		if (pre_ld_ipaddr_sp_cmp(src, dst, family, curr)) {
+			if (spi != INVALID_ESP_SPI && spi == curr->spi)
 				return curr->sa;
 			else if (spi == INVALID_ESP_SPI)
 				return curr->sa;
@@ -1290,6 +1289,7 @@ pre_ld_out_sp_lookup_sa(union pre_ld_ipsec_addr *src,
 	return NULL;
 }
 
+
 static struct pre_ld_ipsec_sa_entry *
 pre_ld_single_sa_lookup(struct rte_mbuf *pkt,
 	enum pre_ld_crypto_dir dir)
@@ -1297,7 +1297,7 @@ pre_ld_single_sa_lookup(struct rte_mbuf *pkt,
 	struct rte_ether_hdr *eth;
 	struct rte_ipv4_hdr *ipv4_hdr = NULL;
 	struct rte_ipv6_hdr *ipv6_hdr = NULL;
-	union pre_ld_ipsec_addr src, dst;
+	xfrm_address_t src, dst;
 	struct pre_ld_ipsec_sa_entry *sa = NULL;
 
 	if (dir != EGRESS_CRYPTO_EQ) {
@@ -1310,12 +1310,12 @@ pre_ld_single_sa_lookup(struct rte_mbuf *pkt,
 	eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
 	if (pkt->packet_type & RTE_PTYPE_L3_IPV4) {
 		ipv4_hdr = (void *)(eth + 1);
-		rte_memcpy(src.ip4, &ipv4_hdr->src_addr, sizeof(rte_be32_t));
-		rte_memcpy(dst.ip4, &ipv4_hdr->dst_addr, sizeof(rte_be32_t));
+		rte_memcpy(&src, &ipv4_hdr->src_addr, sizeof(rte_be32_t));
+		rte_memcpy(&dst, &ipv4_hdr->dst_addr, sizeof(rte_be32_t));
 	} else if (pkt->packet_type & RTE_PTYPE_L3_IPV6) {
 		ipv6_hdr = (void *)(eth + 1);
-		rte_memcpy(src.ip6, ipv6_hdr->src_addr, 16);
-		rte_memcpy(dst.ip6, ipv6_hdr->dst_addr, 16);
+		rte_memcpy(&src, ipv6_hdr->src_addr, 16);
+		rte_memcpy(&dst, ipv6_hdr->dst_addr, 16);
 	} else {
 		RTE_LOG(ERR, pre_ld, "Invalid mbuf packet type(%08x)\n",
 			pkt->packet_type);
