@@ -31,19 +31,17 @@ bypass kernel crypto and change TCP MSS.
 3. Gateway setup:
 --------------------------------------------
 
-  $ Copy swanctl-gw.conf to /etc/swanctl/conf.d/swanctl.conf
+  $ Copy ipsec-gw.conf to /etc/ipsec.conf
+  $ Copy ipsec.secrets to /etc/ipsec.secrets
   $ ifconfig ethx 1.1.1.1 up(security port)
-  $ ipsec stop
-  $ ipsec start
-  $ swanctl --load-all
+  $ ip addr add 2.1.1.1/16 dev ethx
+  $ ipsec restart
 
 4. EP platform setup:
 --------------------------------------------
 
-  $ Copy swanctl-ep.conf to /etc/swanctl/conf.d/swanctl.conf
-  $ ipsec stop
-  $ ipsec start
-  $ swanctl --load-all
+  $ Copy ipsec-ep.conf to /etc/ipsec.conf
+  $ Copy ipsec.secrets to /etc/ipsec.secrets
 
   $ export DPRC=dprc.2
   $ export MAX_QUEUES=8
@@ -55,15 +53,9 @@ bypass kernel crypto and change TCP MSS.
      #Assume the DPNIs created are dpni.a-dpni.b, dpni.c, dpni.d(dpmac.x).
   $ ls-addni dpni.c
      #Assume the kernel interface created is ethx.
-  $ export PRE_LOAD_IPSEC_ENABLE=1
-  $ ifconfig ethx 1.1.1.2 promisc up
+  $ ifconfig ethx 1.1.1.2 up
+  $ ip addr add 2.1.1.2/16 dev ethx
   $ echo 1 > /proc/sys/net/core/xfrm_bypass
-
-  If user wants to stroke IPSec manually:
-  $ export PRE_LOAD_USR_STROKE_CONTROL=1
-  then execute following commands on another terminal after starting preload program.
-  $ /usr/lib/ipsec/stroke down host-host1
-  $ /usr/lib/ipsec/stroke up host-host1
 
 5. Test application(iperf3) based on either of upon configurations:
 --------------------------------------------
@@ -75,15 +67,19 @@ Server on gateway:
   $ iperf3 -s
 
 Client on EP:
-  $ LD_PRELOAD=./libnfp.so iperf3 -c 1.1.1.1 -i 1 -t 10 -u -b 10G -l 64
+  $ ipsec stop
+  $ export IPSEC_RESTART=1
+  $ LD_PRELOAD=./libnfp.so iperf3 -c 2.1.1.1 -i 1 -t 10 -u -b 10G -l 64
 
 2) server mode on EP and client mmode on gateway:
 ---------
 
 Server on EP:
+  $ ipsec stop
+  $ export IPSEC_RESTART=1
   $ LD_PRELOAD=./libnfp.so iperf3 -s
 
 Client on gateway:
-  $ iperf3 -c 1.1.1.2 -i 1 -t 10 -u -b 10G -l 64
+  $ iperf3 -c 2.1.1.2 -i 1 -t 10 -u -b 10G -l 64
 
 3) Run network tools based on TCP protocol between gateway and EP while running iperf(udp or tcp) test.
