@@ -106,6 +106,7 @@ static char *s_downlink;
 
 static int s_manual_restart_ipsec;
 static int s_force_ipsec;
+static int s_flow_control;
 
 static uint16_t s_l3_traffic_dump;
 static uint8_t s_l4_traffic_dump;
@@ -2388,7 +2389,10 @@ static int eal_main(void)
 			}
 		}
 		memset(&fc_conf, 0, sizeof(fc_conf));
-		fc_conf.mode = RTE_ETH_FC_NONE;
+		if (s_flow_control)
+			fc_conf.mode = RTE_ETH_FC_FULL;
+		else
+			fc_conf.mode = RTE_ETH_FC_NONE;
 		ret = rte_eth_dev_flow_ctrl_set(portid, &fc_conf);
 		if (ret) {
 			RTE_LOG(WARNING, pre_ld,
@@ -4297,6 +4301,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_FORCE_IPSEC");
 	if (env)
 		s_force_ipsec = atoi(env);
+
+	env = getenv("PRE_LOAD_FLOW_CONTROL_ENABLE");
+	if (env)
+		s_flow_control = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
