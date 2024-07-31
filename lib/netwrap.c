@@ -63,8 +63,12 @@
 
 #define PRE_LD_CONSTRUCTOR_PRIO 65535
 
-#define IPSEC_STROCK_PROCESS_NAME \
+#define PRE_LOAD_USR_APP_NAME_ENV "PRE_LOAD_USR_APP_NAME"
+
+#define IPSEC_STROKE_PROCESS_NAME \
 	"/usr/lib/ipsec/stroke"
+
+static char *s_usr_app_nm;
 
 #ifndef SOCK_TYPE_MASK
 #define SOCK_TYPE_MASK 0xf
@@ -101,7 +105,7 @@ static const char *s_slow_if;
 static char *s_downlink;
 
 static int s_ipsec_enable;
-static int s_usr_stroke_control;
+static int s_manual_restart_ipsec;
 
 static uint16_t s_l3_traffic_dump;
 static uint8_t s_l4_traffic_dump;
@@ -444,17 +448,24 @@ netwrap_get_current_process_name(char *nm)
 }
 
 static int
-netwrap_is_ipsec_stroke_process(void)
+netwrap_is_usr_process(void)
 {
 	int ret;
 	char current_nm[1024];
 
 	ret = netwrap_get_current_process_name(current_nm);
 	if (!ret) {
-		if (!strcmp(IPSEC_STROCK_PROCESS_NAME, current_nm))
+		s_usr_app_nm = getenv(PRE_LOAD_USR_APP_NAME_ENV);
+		if (!s_usr_app_nm) {
+			setenv(PRE_LOAD_USR_APP_NAME_ENV, current_nm, 1);
+			s_usr_app_nm = getenv(PRE_LOAD_USR_APP_NAME_ENV);
+		}
+		if (!strcmp(s_usr_app_nm, current_nm))
 			return true;
-		if (!strcmp("sh", current_nm))
-			return true;
+
+		RTE_LOG(INFO, pre_ld,
+			"This process(%s) is not user app(%s)\n",
+			current_nm, s_usr_app_nm);
 	}
 
 	return false;
@@ -470,12 +481,16 @@ pre_ld_wait_for_sp_ip4_ready(void)
 		!cntx->sp_in || !cntx->sp_out) {
 		RTE_LOG(INFO, pre_ld,
 			"Waiting for xfm negotiate complete\n");
+		if (s_pre_ld_quit)
+			return;
 		sleep(1);
 	}
 
 	while (!cntx->sp_in->sa || !cntx->sp_out->sa) {
 		RTE_LOG(INFO, pre_ld,
 			"Waiting for sa negotiate complete\n");
+		if (s_pre_ld_quit)
+			return;
 		sleep(1);
 	}
 }
@@ -909,9 +924,17 @@ pre_ld_configure_sec_path(uint16_t rx_port,
 	void *sa)
 {
 	struct pre_ld_lcore_conf *lcore;
-	uint16_t lcore_id = s_data_path_core;
+	uint16_t lcore_id;
 	struct pre_ld_lcore_fwd *fwd;
 
+	if (s_data_path_core < 0) {
+		rte_exit(EXIT_FAILURE,
+			"Data path code not specified!\n");
+
+		return;
+	}
+
+	lcore_id = s_data_path_core;
 	lcore = &s_pre_ld_lcore[lcore_id];
 	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
 		rte_exit(EXIT_FAILURE, "Line%d: Too many forwards\n",
@@ -1308,7 +1331,6 @@ pre_ld_out_sp_lookup_sa(const xfrm_address_t *src,
 	return NULL;
 }
 
-
 static struct pre_ld_ipsec_sa_entry *
 pre_ld_single_sa_lookup(struct rte_mbuf *pkt,
 	enum pre_ld_crypto_dir dir)
@@ -1379,7 +1401,6 @@ pre_ld_adjust_ipv4(struct rte_mbuf *pkt,
 		pkt->l2_len = 0;
 		pkt->l3_len = sizeof(*iph4);
 	} else if (dir == INGRESS_CRYPTO_DQ || dir == EGRESS_CRYPTO_DQ) {
-
 		iph4 = rte_pktmbuf_mtod(pkt, void *);
 		rte_memcpy((char *)iph4 - sizeof(struct rte_ether_hdr),
 				priv->cntx, sizeof(struct rte_ether_hdr));
@@ -3093,7 +3114,7 @@ socket(int domain, int type, int protocol)
 
 			return sockfd;
 		}
-		if (netwrap_is_ipsec_stroke_process())
+		if (!netwrap_is_usr_process())
 			return sockfd;
 		if (s_in_pre_loading)
 			return sockfd;
@@ -3131,7 +3152,7 @@ socket(int domain, int type, int protocol)
 
 			return sockfd;
 		}
-		if (netwrap_is_ipsec_stroke_process())
+		if (!netwrap_is_usr_process())
 			return sockfd;
 		if (s_in_pre_loading)
 			return sockfd;
@@ -4150,7 +4171,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
 __attribute__((destructor)) static void netwrap_main_dtor(void)
 {
-	if (netwrap_is_ipsec_stroke_process())
+	if (!netwrap_is_usr_process())
 		return;
 
 	eal_quit();
@@ -4163,32 +4184,60 @@ __attribute__((destructor)) static void netwrap_main_dtor(void)
 	if (s_uplink)
 		rte_free(s_uplink);
 	s_uplink = NULL;
+	unsetenv(PRE_LOAD_USR_APP_NAME_ENV);
 }
 
 static void *
-pre_ld_ipsec_stroke(void *arg)
+pre_ld_ipsec_restart(void *arg)
 {
 #define SWANCTL_CONF_DEFAULT_NAME "host-host1"
 	int ret;
 	char cmd[1024];
 	char *desc = getenv("SWANCTL_CONF_NAME");
+	char *env;
 
-	sleep(2);
-	sprintf(cmd, "%s down %s", IPSEC_STROCK_PROCESS_NAME,
+	env = getenv("IPSEC_RESTART");
+	if (env && atoi(env)) {
+		/** ALERT!: This command starts daemon which will
+		 * prevent DPDK process running again.
+		 * User should perform "ipsec stop" before running
+		 * DPDK next time.
+		 */
+		ret = system("ipsec restart");
+		sleep(2);
+	}
+	env = getenv("SWANCTL_LOAD_ALL");
+	if (env && atoi(env)) {
+		ret = system("swanctl --load-all");
+		sleep(2);
+	}
+	env = getenv("STROKE_DOWN_UP");
+	if (!env || !atoi(env))
+		return arg;
+
+	sprintf(cmd, "%s down %s", IPSEC_STROKE_PROCESS_NAME,
 		desc ? desc : SWANCTL_CONF_DEFAULT_NAME);
 	ret = system(cmd);
 	RTE_LOG(INFO, pre_ld, "%s down %s\n",
-		IPSEC_STROCK_PROCESS_NAME,
+		IPSEC_STROKE_PROCESS_NAME,
 		ret ? "failed" : "success");
 	sleep(1);
-	sprintf(cmd, "%s up %s", IPSEC_STROCK_PROCESS_NAME,
+	sprintf(cmd, "%s up %s", IPSEC_STROKE_PROCESS_NAME,
 		desc ? desc : SWANCTL_CONF_DEFAULT_NAME);
 	ret = system(cmd);
 	RTE_LOG(INFO, pre_ld, "%s up %s\n",
-		IPSEC_STROCK_PROCESS_NAME,
+		IPSEC_STROKE_PROCESS_NAME,
 		ret ? "failed" : "success");
 
 	return arg;
+}
+
+static void
+pre_ld_signal_handler(int signum)
+{
+	RTE_LOG(INFO, pre_ld,
+		"Receive signum(%d)\n", signum);
+	s_pre_ld_quit = 1;
 }
 
 __attribute__((constructor(PRE_LD_CONSTRUCTOR_PRIO)))
@@ -4198,8 +4247,11 @@ static void setup_wrappers(void)
 	int i, ret;
 	pthread_t pid;
 
-	if (netwrap_is_ipsec_stroke_process())
+	if (!netwrap_is_usr_process())
 		return;
+
+	signal(SIGINT, pre_ld_signal_handler);
+	signal(SIGTERM, pre_ld_signal_handler);
 
 	if (!getenv("DPAA2_TX_CONF"))
 		setenv("DPAA2_TX_CONF", "1", 1);
@@ -4229,9 +4281,9 @@ static void setup_wrappers(void)
 	if (env)
 		s_ipsec_enable = atoi(env);
 
-	env = getenv("PRE_LOAD_USR_STROKE_CONTROL");
+	env = getenv("PRE_LOAD_MANUAL_RESTART_IPSEC");
 	if (env)
-		s_usr_stroke_control = atoi(env);
+		s_manual_restart_ipsec = atoi(env);
 
 	env = getenv("PRE_LOAD_IPSEC_BUF_SWAP");
 	if (env)
@@ -4267,6 +4319,7 @@ static void setup_wrappers(void)
 			"CPUs(%d, %d) not detected!\n",
 			s_cpu_start, s_cpu_start + 1);
 	}
+
 	if (s_cpu_start == SYS_CORE_ID ||
 		(s_cpu_start + 1) == SYS_CORE_ID) {
 		rte_exit(EXIT_FAILURE,
@@ -4321,12 +4374,12 @@ static void setup_wrappers(void)
 	}
 
 	if (s_ipsec_enable) {
-		if (!s_usr_stroke_control) {
+		if (!s_manual_restart_ipsec) {
 			ret = pthread_create(&pid, NULL,
-				pre_ld_ipsec_stroke, NULL);
+				pre_ld_ipsec_restart, NULL);
 			if (ret) {
 				rte_exit(EXIT_FAILURE,
-					"Create thread to stroke ipsec failed(%d)\n",
+					"Create thread to restart ipsec failed(%d)\n",
 					ret);
 			}
 		} else {
@@ -4337,6 +4390,12 @@ static void setup_wrappers(void)
 			 */
 		}
 		pre_ld_wait_for_sp_ip4_ready();
+	}
+
+	if (s_pre_ld_quit) {
+		netwrap_main_dtor();
+		RTE_LOG(INFO, pre_ld, "Exit from preload!\n");
+		exit(0);
 	}
 
 	s_in_pre_loading = 0;
