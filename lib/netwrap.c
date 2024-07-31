@@ -104,8 +104,8 @@ static char *s_uplink;
 static const char *s_slow_if;
 static char *s_downlink;
 
-static int s_ipsec_enable;
 static int s_manual_restart_ipsec;
+static int s_force_ipsec;
 
 static uint16_t s_l3_traffic_dump;
 static uint8_t s_l4_traffic_dump;
@@ -471,8 +471,20 @@ netwrap_is_usr_process(void)
 	return false;
 }
 
+static int
+pre_ld_sp_out_ready(void)
+{
+	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+
+	if (LIST_FIRST(&cntx->sp_ipv4_out_list) ||
+		LIST_FIRST(&cntx->sp_ipv6_out_list))
+		return true;
+
+	return false;
+}
+
 static void
-pre_ld_wait_for_sp_ip4_ready(void)
+pre_ld_wait_for_ipsec_ready(void)
 {
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 
@@ -867,7 +879,7 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 	mtu = s_fd_desc[sockfd].tx_port_mtu;
 	max_len = mtu + RTE_ETHER_HDR_LEN;
 	hdr_len = RTE_ETHER_HDR_LEN + IPv4_HDR_LEN;
-	if (s_ipsec_enable)
+	if (pre_ld_sp_out_ready())
 		hdr_len += IPv4_ESP_HDR_LEN + ESP_TAIL_MAX_LEN;
 	while ((len + hdr_len) > max_len) {
 		if (unlikely(count >= MAX_PKT_BURST))
@@ -1656,21 +1668,19 @@ pre_ld_main_loop(void *dummy)
 	}
 	rte_mempool_obj_iter(tx_pool, pre_ld_pktmbuf_init, NULL);
 
-	if (s_ipsec_enable) {
-		rx_ports[XFM_POLICY_IN_ETH_IDX] = s_dir_traffic_cfg.dl_id;
-		tx_ports[XFM_POLICY_IN_ETH_IDX] = s_dir_traffic_cfg.ul_id;
-		rx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ul_id;
-		tx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ext_id;
-		sp_ring[XFM_POLICY_IN_ETH_IDX] =
-			s_port_sp_rings[s_dir_traffic_cfg.dl_id];
-		sp_ring[XFM_POLICY_OUT_ETH_IDX] =
-			s_port_sp_rings[s_dir_traffic_cfg.ul_id];
-		ret = xfm_crypto_init(s_crypto_dev_id, CRYPTO_DEV_QP_NUM,
+	rx_ports[XFM_POLICY_IN_ETH_IDX] = s_dir_traffic_cfg.dl_id;
+	tx_ports[XFM_POLICY_IN_ETH_IDX] = s_dir_traffic_cfg.ul_id;
+	rx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ul_id;
+	tx_ports[XFM_POLICY_OUT_ETH_IDX] = s_dir_traffic_cfg.ext_id;
+	sp_ring[XFM_POLICY_IN_ETH_IDX] =
+		s_port_sp_rings[s_dir_traffic_cfg.dl_id];
+	sp_ring[XFM_POLICY_OUT_ETH_IDX] =
+		s_port_sp_rings[s_dir_traffic_cfg.ul_id];
+	ret = xfm_crypto_init(s_crypto_dev_id, CRYPTO_DEV_QP_NUM,
 			rx_ports, tx_ports, sp_ring, s_pre_ld_rx_pool);
-		if (ret) {
-			RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
-			return ret;
-		}
+	if (ret) {
+		RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
+		return ret;
 	}
 
 for_ever_loop:
@@ -2285,8 +2295,6 @@ static int eal_main(void)
 
 		if (port_type[portid] == EXTERNAL_TYPE) {
 			ext_id = portid;
-			if (!s_ipsec_enable)
-				s_tx_port = ext_id;
 			rxq_num[portid] = 1;
 			txq_num[portid] = 1;
 		} else if (port_type[portid] == UP_LINK_TYPE) {
@@ -2296,8 +2304,7 @@ static int eal_main(void)
 		} else if (port_type[portid] == DOWN_LINK_TYPE) {
 			dl_id = portid;
 			s_rx_port = dl_id;
-			if (s_ipsec_enable)
-				s_tx_port = dl_id;
+			s_tx_port = dl_id;
 			rxq_num[portid] = dev_info[portid].max_rx_queues;
 			txq_num[portid] = dev_info[portid].max_tx_queues;
 		} else if (port_type[portid] == KERNEL_TAP_TYPE) {
@@ -2422,9 +2429,8 @@ static int eal_main(void)
 		if (!s_port_rxq_rings[portid])
 			rte_exit(EXIT_FAILURE, "create %s failed\n", ring_nm);
 
-		if ((port_type[portid] == DOWN_LINK_TYPE ||
-			port_type[portid] == UP_LINK_TYPE) &&
-			s_ipsec_enable) {
+		if (port_type[portid] == DOWN_LINK_TYPE ||
+			port_type[portid] == UP_LINK_TYPE) {
 			sprintf(ring_nm, "port%d_sp_ring", portid);
 			s_port_sp_rings[portid] = rte_ring_create(ring_nm,
 				dev_info[portid].max_rx_queues * 2, 0,
@@ -2442,7 +2448,6 @@ static int eal_main(void)
 			}
 			if ((port_type[portid] == DOWN_LINK_TYPE ||
 				port_type[portid] == UP_LINK_TYPE) &&
-				s_ipsec_enable &&
 				i < (dev_info[portid].max_rx_queues / 2)) {
 				ret = rte_ring_enqueue(s_port_sp_rings[portid],
 					&s_rxq_ids[portid][i]);
@@ -2913,22 +2918,6 @@ fd_init_quit:
 		fwd->poll.tx_rings.tx_ring_num = 1;
 		rte_wmb();
 		lcore->n_fwds++;
-
-		if (s_ipsec_enable) {
-			if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
-				pthread_mutex_unlock(&s_lcore_mutex);
-				rte_exit(EXIT_FAILURE,
-					"Line%d: Too many forwards\n", __LINE__);
-			}
-			fwd = &lcore->fwd[lcore->n_fwds];
-			fwd->poll_type = SEC_COMPLETE;
-			fwd->poll.poll_sec.sec_id = s_crypto_dev_id;
-			fwd->poll.poll_sec.queue_id = CRYPTO_DEV_EGRESS_QP;
-			fwd->fwd_type = HW_PORT;
-			fwd->fwd_dest.fwd_port = s_fd_desc[sockfd].tx_port;
-			rte_wmb();
-			lcore->n_fwds++;
-		}
 	} else {
 		tx_rings = &fwd->poll.tx_rings;
 		tx_rings->tx_ring[tx_rings->tx_ring_num] =
@@ -3131,8 +3120,6 @@ socket(int domain, int type, int protocol)
 			RTE_LOG(INFO, pre_ld,
 				"pre set user Socket FD(%d) created.\n",
 				sockfd);
-			if (s_ipsec_enable)
-				pre_ld_wait_for_sp_ip4_ready();
 		}
 	} else { /* pre init*/
 		LIBC_FUNCTION(socket);
@@ -3168,8 +3155,6 @@ socket(int domain, int type, int protocol)
 			}
 			RTE_LOG(INFO, pre_ld,
 				"user Socket FD(%d) created.\n", sockfd);
-			if (s_ipsec_enable)
-				pre_ld_wait_for_sp_ip4_ready();
 		}
 	}
 
@@ -4277,10 +4262,6 @@ static void setup_wrappers(void)
 	if (env)
 		s_cpu_start = atoi(env);
 
-	env = getenv("PRE_LOAD_IPSEC_ENABLE");
-	if (env)
-		s_ipsec_enable = atoi(env);
-
 	env = getenv("PRE_LOAD_MANUAL_RESTART_IPSEC");
 	if (env)
 		s_manual_restart_ipsec = atoi(env);
@@ -4312,6 +4293,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_L4_DUMP_PROTOCOL");
 	if (env)
 		s_l4_traffic_dump = atoi(env);
+
+	env = getenv("PRE_LOAD_FORCE_IPSEC");
+	if (env)
+		s_force_ipsec = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
@@ -4373,24 +4358,25 @@ static void setup_wrappers(void)
 		exit(EXIT_FAILURE);
 	}
 
-	if (s_ipsec_enable) {
-		if (!s_manual_restart_ipsec) {
-			ret = pthread_create(&pid, NULL,
-				pre_ld_ipsec_restart, NULL);
-			if (ret) {
-				rte_exit(EXIT_FAILURE,
-					"Create thread to restart ipsec failed(%d)\n",
-					ret);
-			}
-		} else {
-			/** Example of stroking ipsec manually on another terminal:
-			 *
-			 /usr/lib/ipsec/stroke down host-host1
-			 /usr/lib/ipsec/stroke up host-host1
-			 */
+	if (!s_manual_restart_ipsec) {
+		ret = pthread_create(&pid, NULL, pre_ld_ipsec_restart, NULL);
+		if (ret) {
+			rte_exit(EXIT_FAILURE,
+				"Create thread to restart ipsec failed(%d)\n",
+				ret);
 		}
-		pre_ld_wait_for_sp_ip4_ready();
+	} else {
+		/** Example of re-start ipsec manually on another terminal:
+		 *
+		 ipsec restart
+		 swanctl --load-all
+		 /usr/lib/ipsec/stroke down host-host1
+		 /usr/lib/ipsec/stroke up host-host1
+		 */
 	}
+
+	if (s_force_ipsec)
+		pre_ld_wait_for_ipsec_ready();
 
 	if (s_pre_ld_quit) {
 		netwrap_main_dtor();
