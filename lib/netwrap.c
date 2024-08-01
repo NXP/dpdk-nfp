@@ -219,6 +219,7 @@ static int s_statistic_print;
 #define MAX_PKT_BURST 32
 #define MEMPOOL_CACHE_SIZE 256
 #define MEMPOOL_ELEM_SIZE 8192
+#define MEMPOOL_USR_SIZE (MEMPOOL_ELEM_SIZE / 8)
 
 /*
  * Configurable number of RX/TX ring descriptors
@@ -1658,7 +1659,7 @@ pre_ld_main_loop(void *dummy)
 		qconf->n_fwds, lcore_id);
 
 	tx_pool = rte_pktmbuf_pool_create_by_ops("tx_self_gen_pool",
-		MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE,
+		MEMPOOL_USR_SIZE, MEMPOOL_CACHE_SIZE,
 		PRE_LD_MP_PRIV_SIZE,
 		PRE_LD_MBUF_MAX_SIZE,
 		rte_socket_id(),
@@ -2694,7 +2695,7 @@ create_local_flow:
 		return -EINVAL;
 
 	sprintf(nm, "rx_ring_%d", sockfd);
-	s_fd_desc[sockfd].rx_ring = rte_ring_create(nm, 2048,
+	s_fd_desc[sockfd].rx_ring = rte_ring_create(nm, MEMPOOL_USR_SIZE,
 			0, RING_F_SP_ENQ | RING_F_SC_DEQ);
 	if (!s_fd_desc[sockfd].rx_ring) {
 		RTE_LOG(ERR, pre_ld,
@@ -2849,7 +2850,7 @@ usr_socket_fd_desc_init(int sockfd,
 	s_fd_desc[sockfd].cpu = -1;
 	sprintf(nm, "tx_pool_fd%d", sockfd);
 	s_fd_desc[sockfd].tx_pool = rte_pktmbuf_pool_create_by_ops(nm,
-			MEMPOOL_ELEM_SIZE, MEMPOOL_CACHE_SIZE,
+			MEMPOOL_USR_SIZE, MEMPOOL_CACHE_SIZE,
 			PRE_LD_MP_PRIV_SIZE, PRE_LD_MBUF_MAX_SIZE,
 			rte_socket_id(), RTE_MBUF_DEFAULT_MEMPOOL_OPS);
 	if (!s_fd_desc[sockfd].tx_pool) {
@@ -2887,8 +2888,8 @@ fd_init_quit:
 		return -EINVAL;
 
 	sprintf(nm, "tx_ring_fd%d", sockfd);
-	s_fd_desc[sockfd].tx_ring = rte_ring_create(nm,
-			2048, 0, RING_F_SP_ENQ | RING_F_SC_DEQ);
+	s_fd_desc[sockfd].tx_ring = rte_ring_create(nm, MEMPOOL_USR_SIZE,
+		0, RING_F_SP_ENQ | RING_F_SC_DEQ);
 
 	pthread_mutex_lock(&s_lcore_mutex);
 	fwd = NULL;
