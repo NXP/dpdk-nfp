@@ -3710,8 +3710,19 @@ accept(int sockfd, struct sockaddr *addr,
 int
 connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-	int connect_value = 0, ret;
+	int connect_value = 0, ret, offset = 0, connect_times = 0;
 	const struct sockaddr_in *sa = (const void *)addr;
+	const struct sockaddr_in6 *ia6 = (const void *)addr;
+	char connect_info[512];
+	char ipl[INET6_ADDRSTRLEN];
+	const uint8_t *ip_addr;
+#define CONNECT_MAX_TIMES 5
+
+	if (unlikely(!libc_connect)) {
+		LIBC_FUNCTION(connect);
+		if (!libc_connect)
+			rte_panic("Get libc %s failed!\n", __func__);
+	}
 
 	if (s_socket_dbg) {
 		RTE_LOG(INFO, pre_ld,
@@ -3721,50 +3732,64 @@ connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	}
 
 	if (IS_USECT_SOCKET(sockfd)) {
-		RTE_LOG(INFO, pre_ld,
-			"%s socket fd:%d with family(%d), len(%d)\n",
-			__func__, sockfd, sa->sin_family, addrlen);
-		if (sa->sin_family != AF_INET &&
-			sa->sin_family != AF_INET6) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: fd:%d, Invalid family(%d)\n",
-				__func__, sockfd, sa->sin_family);
-			return -EINVAL;
-		}
-		if (unlikely(!libc_connect)) {
-			LIBC_FUNCTION(connect);
-			if (!libc_connect)
-				rte_panic("Get libc %s failed!\n", __func__);
-		}
+connect_usr:
 		connect_value = (*libc_connect)(sockfd, addr, addrlen);
-		if (connect_value) {
-			RTE_LOG(ERR, pre_ld,
-				"User socket(%d) get connection failed(%d)\n",
-				sockfd, connect_value);
-
-			return connect_value;
+		connect_times++;
+		if (connect_times < CONNECT_MAX_TIMES && connect_value) {
+			sleep(1);
+			RTE_LOG(WARNING, pre_ld,
+				"Connect user fd:%d failed, try again\n",
+				sockfd);
+			goto connect_usr;
 		}
+		if (connect_value)
+			goto connect_quit;
 
 		ret = netwrap_collect_info(sockfd);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"%s fd:%d, collect info failed(%d)\n",
 				__func__, sockfd, ret);
+			connect_value = ret;
+			goto connect_quit;
 		}
 
-		return socket_create_ingress_flow(sockfd);
-	} else if (libc_connect) {
-		connect_value = (*libc_connect)(sockfd, addr, addrlen);
+		connect_value = socket_create_ingress_flow(sockfd);
 	} else {
-		LIBC_FUNCTION(connect);
-
-		if (libc_connect)
-			connect_value = (*libc_connect)(sockfd, addr, addrlen);
-		else {
-			connect_value = -EACCES;
-			errno = EACCES;
+connect_sys:
+		connect_value = (*libc_connect)(sockfd, addr, addrlen);
+		connect_times++;
+		if (connect_times < CONNECT_MAX_TIMES && connect_value) {
+			sleep(1);
+			RTE_LOG(WARNING, pre_ld,
+				"Connect sys fd:%d failed, try again\n",
+				sockfd);
+			goto connect_sys;
 		}
 	}
+
+connect_quit:
+	if (connect_value)
+		offset = sprintf(connect_info, "failed(%d):", connect_value);
+	else
+		offset = sprintf(connect_info, "successfully:");
+
+	if (sa->sin_family == AF_INET6) {
+		inet_ntop(AF_INET6, &ia6->sin6_addr, ipl, sizeof(ipl));
+		map_ipv4_to_regular_ipv4(ipl);
+		sprintf(&connect_info[offset],
+			"family(%d), port(%04x), addr(%s)",
+			sa->sin_family, rte_be_to_cpu_16(sa->sin_port),
+			ipl);
+	} else {
+		ip_addr = (const void *)&sa->sin_addr.s_addr;
+		sprintf(&connect_info[offset],
+			"family(%d), port(%04x), addr(%d.%d.%d.%d)",
+			sa->sin_family, rte_be_to_cpu_16(sa->sin_port),
+			ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
+	}
+	RTE_LOG(INFO, pre_ld, "Connect fd:%d, addrlen(%d) %s\n",
+		sockfd, addrlen, connect_info);
 
 	return connect_value;
 }
