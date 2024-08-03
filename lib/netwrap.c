@@ -54,6 +54,7 @@
 #include <rte_string_fns.h>
 #include <rte_tm.h>
 #include <rte_ipsec.h>
+#include <rte_tailq.h>
 
 #include <rte_pmd_dpaa2.h>
 #include <nxp/rte_remote_direct_flow.h>
@@ -143,6 +144,18 @@ enum hdr_init_enum {
 		REMOTE_IP_INIT | REMOTE_UDP_INIT
 };
 
+enum pre_ld_statistic_dir {
+	PRE_LD_STAT_RX,
+	PRE_LD_STAT_TX
+};
+
+struct fd_statistic {
+	uint64_t count;
+	uint64_t pkts;
+	uint64_t oh_bytes;
+	uint64_t usr_bytes;
+};
+
 struct fd_desc {
 	int fd;
 	int cpu;
@@ -163,15 +176,12 @@ struct fd_desc {
 	uint16_t rx_port_mtu;
 	uint16_t tx_port_mtu;
 
-	uint64_t tx_count;
-	uint64_t tx_pkts;
-	uint64_t tx_oh_bytes;
-	uint64_t tx_usr_bytes;
+	struct fd_statistic tx_stat;
+	struct fd_statistic rx_stat;
 
-	uint64_t rx_count;
-	uint64_t rx_pkts;
-	uint64_t rx_oh_bytes;
-	uint64_t rx_usr_bytes;
+	/** Update by statistic function only.*/
+	struct fd_statistic tx_old_stat;
+	struct fd_statistic rx_old_stat;
 };
 
 enum pre_ld_crypto_dir {
@@ -295,15 +305,10 @@ enum pre_ld_poll_type {
 	SELF_GEN
 };
 
-struct pre_ld_txr_desc {
-	struct rte_ring **tx_ring;
-	uint16_t tx_ring_num;
-};
-
 union pre_ld_poll {
 	struct pre_ld_port_desc poll_port;
 	struct pre_ld_sec_desc poll_sec;
-	struct pre_ld_txr_desc tx_rings;
+	struct rte_ring *tx_ring;
 };
 
 enum pre_ld_fwd_type {
@@ -320,33 +325,32 @@ union pre_ld_fwd {
 	struct pre_ld_sec_desc fwd_sec;
 };
 
+struct pre_ld_fwd_statistic {
+	uint64_t count;
+	uint64_t pkts;
+	union {
+		uint64_t oh_bytes;
+		uint64_t sec_bytes;
+	};
+};
+
 struct pre_ld_lcore_fwd {
+	TAILQ_ENTRY(pre_ld_lcore_fwd) next;
 	enum pre_ld_poll_type poll_type;
 	union pre_ld_poll poll;
 	enum pre_ld_fwd_type fwd_type;
 	union pre_ld_fwd fwd_dest;
-	uint64_t tx_count;
-	uint64_t tx_pkts;
-	union {
-		uint64_t tx_oh_bytes;
-		uint64_t tx_sec_bytes;
-	};
+	struct pre_ld_fwd_statistic tx_stat;
+	struct pre_ld_fwd_statistic rx_stat;
 
-	uint64_t rx_count;
-	uint64_t rx_pkts;
-	union {
-		uint64_t rx_oh_bytes;
-		uint64_t rx_sec_bytes;
-	};
+	/** Update by statistic function only.*/
+	struct pre_ld_fwd_statistic tx_old_stat;
+	struct pre_ld_fwd_statistic rx_old_stat;
 };
 
-#define MAX_RX_POLLS_PER_LCORE 16
+TAILQ_HEAD(pre_ld_lcore_fwd_list, pre_ld_lcore_fwd);
+static struct pre_ld_lcore_fwd_list s_pre_ld_lists[RTE_MAX_LCORE];
 
-struct pre_ld_lcore_conf {
-	uint16_t n_fwds;
-	struct pre_ld_lcore_fwd fwd[MAX_RX_POLLS_PER_LCORE];
-};
-static struct pre_ld_lcore_conf s_pre_ld_lcore[RTE_MAX_LCORE];
 static pthread_mutex_t s_lcore_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /** Single core support only now.*/
@@ -389,6 +393,24 @@ struct pre_ld_udp_desc {
 #define PRE_LD_MBUF_MAX_SIZE \
 	(PRE_LD_MP_PRIV_SIZE + PRE_LD_MBUF_OFFSET + \
 	RTE_MBUF_DEFAULT_DATAROOM)
+
+static inline void
+pre_ld_insert_fwd_list_safe(struct pre_ld_lcore_fwd_list *list,
+	struct pre_ld_lcore_fwd *fwd)
+{
+	pthread_mutex_lock(&s_lcore_mutex);
+	TAILQ_INSERT_TAIL(list, fwd, next);
+	pthread_mutex_unlock(&s_lcore_mutex);
+}
+
+static inline void
+pre_ld_remove_fwd_list_safe(struct pre_ld_lcore_fwd_list *list,
+	struct pre_ld_lcore_fwd *fwd)
+{
+	pthread_mutex_lock(&s_lcore_mutex);
+	TAILQ_REMOVE(list, fwd, next);
+	pthread_mutex_unlock(&s_lcore_mutex);
+}
 
 static inline int
 convert_ip_addr_to_str(char *str,
@@ -525,19 +547,176 @@ eal_destroy_dpaa2_mux_flow(void)
 	return ret;
 }
 
+static int
+usr_socket_fd_release(int sockfd)
+{
+	int ret = 0, i;
+	uint16_t rx_port, tx_port, nb;
+	struct pre_ld_rx_pool *rx_pool;
+	struct rte_mbuf *free_burst[MAX_PKT_BURST];
+	struct pre_ld_lcore_fwd_list *list = NULL;
+	struct pre_ld_lcore_fwd *fwd, *tfwd;
+	struct rte_ring *tx_ring, *rx_ring;
+
+	pthread_mutex_lock(&s_fd_mutex);
+	rx_port = s_fd_desc[sockfd].rx_port;
+	tx_port = s_fd_desc[sockfd].tx_port;
+	rx_ring = s_fd_desc[sockfd].rx_ring;
+	tx_ring = s_fd_desc[sockfd].tx_ring;
+
+	if (s_data_path_core >= 0)
+		list = &s_pre_ld_lists[s_data_path_core];
+
+	if (s_fd_desc[sockfd].rxq_id &&
+		s_port_rxq_rings[rx_port]) {
+		ret = rte_ring_enqueue(s_port_rxq_rings[rx_port],
+					s_fd_desc[sockfd].rxq_id);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s release *s_fd_desc[%d].rxq_id(%d) failed(%d)\n",
+				__func__, sockfd,
+				*s_fd_desc[sockfd].rxq_id, ret);
+		}
+	}
+	s_fd_desc[sockfd].rxq_id = NULL;
+
+	if (s_fd_desc[sockfd].txq_id &&
+		s_port_txq_rings[tx_port] &&
+		s_fd_desc[sockfd].txq_id != &s_fd_desc[sockfd].def_txq_id) {
+		ret = rte_ring_enqueue(s_port_txq_rings[tx_port],
+					s_fd_desc[sockfd].txq_id);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s release *s_fd_desc[%d].txq_id(%d) failed(%d)\n",
+				__func__, sockfd,
+				*s_fd_desc[sockfd].txq_id, ret);
+		}
+	}
+	s_fd_desc[sockfd].txq_id = NULL;
+
+	if (s_fd_desc[sockfd].flow) {
+		ret = rte_flow_destroy(rx_port,
+				s_fd_desc[sockfd].flow, NULL);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s free s_fd_desc[%d].flow(%p) failed(%d)\n",
+				__func__, sockfd,
+				s_fd_desc[sockfd].flow, ret);
+		}
+		s_fd_desc[sockfd].flow = NULL;
+	}
+
+	if (list) {
+lookup_rxr_fwd:
+		RTE_TAILQ_FOREACH_SAFE(fwd, list, next, tfwd) {
+			if (fwd->fwd_type == RX_RING &&
+				fwd->fwd_dest.rx_ring == rx_ring) {
+				pre_ld_remove_fwd_list_safe(list, fwd);
+				rte_free(fwd);
+				goto lookup_rxr_fwd;
+			}
+		}
+lookup_txr_fwd:
+		RTE_TAILQ_FOREACH_SAFE(fwd, list, next, tfwd) {
+			if (fwd->poll_type == TX_RING &&
+				fwd->poll.tx_ring == tx_ring) {
+				pre_ld_remove_fwd_list_safe(list, fwd);
+				rte_free(fwd);
+				goto lookup_txr_fwd;
+			}
+		}
+	}
+
+	if (rx_ring) {
+dq_rxr_again:
+		nb = rte_ring_dequeue_burst(rx_ring,
+				(void **)free_burst, MAX_PKT_BURST, NULL);
+		if (nb > 0) {
+			rte_pktmbuf_free_bulk(free_burst, nb);
+			goto dq_rxr_again;
+		}
+		rte_ring_free(rx_ring);
+	}
+
+	if (tx_ring) {
+dq_txr_again:
+		nb = rte_ring_dequeue_burst(tx_ring,
+				(void **)free_burst, MAX_PKT_BURST, NULL);
+		if (nb > 0) {
+			rte_pktmbuf_free_bulk(free_burst, nb);
+			goto dq_txr_again;
+		}
+		rte_ring_free(tx_ring);
+	}
+
+	rx_pool = &s_fd_desc[sockfd].rx_buffer;
+	if (rx_pool->rx_bufs) {
+		while (rx_pool->head != rx_pool->tail) {
+			rte_pktmbuf_free(rx_pool->rx_bufs[rx_pool->head]);
+			rx_pool->head = (rx_pool->head + 1) &
+				(rx_pool->max_num - 1);
+		}
+		rte_free(s_fd_desc[sockfd].rx_buffer.rx_bufs);
+	}
+
+	if (s_fd_desc[sockfd].tx_pool) {
+		rte_mempool_free(s_fd_desc[sockfd].tx_pool);
+		s_fd_desc[sockfd].tx_pool = NULL;
+	}
+
+	memset(&s_fd_desc[sockfd], 0, sizeof(struct fd_desc));
+	s_fd_desc[sockfd].fd = INVALID_SOCKFD;
+
+	for (i = 0; i < s_usr_fd_num; i++) {
+		if (s_fd_usr[i] == sockfd &&
+			i != (s_usr_fd_num - 1)) {
+			memmove(&s_fd_usr[i], &s_fd_usr[i + 1],
+				sizeof(int) * (s_usr_fd_num - (i + 1)));
+			break;
+		} else if (s_fd_usr[i] == sockfd) {
+			break;
+		}
+	}
+	s_usr_fd_num--;
+	if (s_max_usr_fd == sockfd) {
+		s_max_usr_fd = INVALID_SOCKFD;
+		for (i = 0; i < s_usr_fd_num; i++) {
+			if (s_fd_usr[i] > s_max_usr_fd)
+				s_max_usr_fd = s_fd_usr[i];
+		}
+	}
+	pthread_mutex_unlock(&s_fd_mutex);
+
+	return ret;
+}
+
 static void eal_quit(void)
 {
 	uint16_t portid, drain, i;
-	int ret;
+	int ret, fd;
+	struct pre_ld_lcore_fwd_list *list;
+	struct pre_ld_lcore_fwd *fwd;
 
 	s_pre_ld_quit = 1;
 	sleep(1);
 
 	while (s_usr_fd_num) {
 		for (i = 0; i < s_usr_fd_num; i++) {
-			if (s_fd_desc[s_fd_usr[i]].fd !=
-				INVALID_SOCKFD)
-				close(s_fd_desc[s_fd_usr[i]].fd);
+			fd = s_fd_desc[s_fd_usr[i]].fd;
+			if (fd != INVALID_SOCKFD) {
+				close(fd);
+				usr_socket_fd_release(fd);
+				break;
+			}
+		}
+	}
+
+	if (s_data_path_core >= 0) {
+		list = &s_pre_ld_lists[s_data_path_core];
+		while (RTE_TAILQ_FIRST(list)) {
+			fwd = RTE_TAILQ_FIRST(list);
+			pre_ld_remove_fwd_list_safe(list, fwd);
+			rte_free(fwd);
 		}
 	}
 
@@ -709,7 +888,7 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 		pkt = ((uint8_t *)desc + desc->offset);
 		if (length <= remain) {
 			rte_memcpy(&buf_u8[total_bytes], pkt, length);
-			s_fd_desc[sockfd].rx_usr_bytes += length;
+			s_fd_desc[sockfd].rx_stat.usr_bytes += length;
 			remain -= length;
 			total_bytes += length;
 			free_burst[i] = mbuf;
@@ -719,7 +898,7 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 				(rx_pool->max_num - 1);
 		} else {
 			rte_memcpy(&buf_u8[total_bytes], pkt, remain);
-			s_fd_desc[sockfd].rx_usr_bytes += remain;
+			s_fd_desc[sockfd].rx_stat.usr_bytes += remain;
 			total_bytes += remain;
 			desc->offset += remain;
 			desc->length -= remain;
@@ -751,12 +930,12 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 				rxq_id, pkts_burst, MAX_PKT_BURST);
 	}
 	for (i = 0; i < nb_rx; i++) {
-		s_fd_desc[sockfd].rx_oh_bytes +=
+		s_fd_desc[sockfd].rx_stat.oh_bytes +=
 			pkts_burst[i]->pkt_len +
 			RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
 	}
-	s_fd_desc[sockfd].rx_pkts += nb_rx;
-	s_fd_desc[sockfd].rx_count++;
+	s_fd_desc[sockfd].rx_stat.pkts += nb_rx;
+	s_fd_desc[sockfd].rx_stat.count++;
 	if (!nb_rx)
 		goto finsh_recv;
 	j = 0;
@@ -769,14 +948,14 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 		length = desc->length;
 		if (remain >= length) {
 			rte_memcpy(&buf_u8[total_bytes], pkt, length);
-			s_fd_desc[sockfd].rx_usr_bytes += length;
+			s_fd_desc[sockfd].rx_stat.usr_bytes += length;
 			remain -= length;
 			total_bytes += length;
 			free_burst[j] = pkts_burst[i];
 			j++;
 		} else {
 			rte_memcpy(&buf_u8[total_bytes], pkt, remain);
-			s_fd_desc[sockfd].rx_usr_bytes += remain;
+			s_fd_desc[sockfd].rx_stat.usr_bytes += remain;
 			remain = 0;
 			total_bytes += remain;
 			desc->offset += remain;
@@ -917,13 +1096,13 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 	}
 	ret = 0;
 	for (i = 0; i < sent; i++) {
-		s_fd_desc[sockfd].tx_usr_bytes += lens[i];
-		s_fd_desc[sockfd].tx_oh_bytes +=
+		s_fd_desc[sockfd].tx_stat.usr_bytes += lens[i];
+		s_fd_desc[sockfd].tx_stat.oh_bytes +=
 			lens[i] + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
 		ret += lens[i];
 	}
-	s_fd_desc[sockfd].tx_pkts += sent;
-	s_fd_desc[sockfd].tx_count += sent;
+	s_fd_desc[sockfd].tx_stat.pkts += sent;
+	s_fd_desc[sockfd].tx_stat.count += sent;
 
 send_err:
 	if (sent < count)
@@ -937,7 +1116,7 @@ pre_ld_configure_sec_path(uint16_t rx_port,
 	uint16_t rxq_id, uint8_t dir, uint16_t tx_port,
 	void *sa)
 {
-	struct pre_ld_lcore_conf *lcore;
+	struct pre_ld_lcore_fwd_list *list;
 	uint16_t lcore_id;
 	struct pre_ld_lcore_fwd *fwd;
 
@@ -949,13 +1128,16 @@ pre_ld_configure_sec_path(uint16_t rx_port,
 	}
 
 	lcore_id = s_data_path_core;
-	lcore = &s_pre_ld_lcore[lcore_id];
-	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
-		rte_exit(EXIT_FAILURE, "Line%d: Too many forwards\n",
-			__LINE__);
+	list = &s_pre_ld_lists[lcore_id];
+	fwd = rte_zmalloc(NULL, sizeof(struct pre_ld_lcore_fwd), 0);
+	if (!fwd) {
+		rte_exit(EXIT_FAILURE,
+			"%s/line%d: data path alloc failed\n",
+			__func__, __LINE__);
+
+		return;
 	}
-	pthread_mutex_lock(&s_lcore_mutex);
-	fwd = &lcore->fwd[lcore->n_fwds];
+
 	fwd->poll_type = RX_QUEUE;
 	fwd->poll.poll_port.port_id = rx_port;
 	fwd->poll.poll_port.queue_id = rxq_id;
@@ -968,18 +1150,21 @@ pre_ld_configure_sec_path(uint16_t rx_port,
 	}
 	fwd->fwd_dest.fwd_sec.sec_id = s_crypto_dev_id;
 	fwd->fwd_dest.fwd_sec.sa = sa;
-	rte_wmb();
-	lcore->n_fwds++;
 
-	if (tx_port == INVALID_PORTID) {
-		pthread_mutex_unlock(&s_lcore_mutex);
+	pre_ld_insert_fwd_list_safe(list, fwd);
+
+	if (tx_port == INVALID_PORTID)
+		return;
+
+	fwd = rte_zmalloc(NULL, sizeof(struct pre_ld_lcore_fwd), 0);
+	if (!fwd) {
+		rte_exit(EXIT_FAILURE,
+			"%s/line%d: data path alloc failed\n",
+			__func__, __LINE__);
+
 		return;
 	}
-	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
-		rte_exit(EXIT_FAILURE, "Line%d: Too many forwards\n",
-			__LINE__);
-	}
-	fwd = &lcore->fwd[lcore->n_fwds];
+
 	fwd->poll_type = SEC_COMPLETE;
 	fwd->poll.poll_sec.sec_id = s_crypto_dev_id;
 	if (dir == XFRM_POLICY_IN)
@@ -989,9 +1174,7 @@ pre_ld_configure_sec_path(uint16_t rx_port,
 
 	fwd->fwd_type = HW_PORT;
 	fwd->fwd_dest.fwd_port = tx_port;
-	rte_wmb();
-	lcore->n_fwds++;
-	pthread_mutex_unlock(&s_lcore_mutex);
+	pre_ld_insert_fwd_list_safe(list, fwd);
 }
 
 static struct rte_flow *
@@ -1040,23 +1223,25 @@ pre_ld_configure_default_flow(uint16_t portid,
 }
 
 static inline void
-pre_ld_add_port_fwd_entry(struct pre_ld_lcore_conf *lcore,
+pre_ld_add_port_fwd_entry(struct pre_ld_lcore_fwd_list *list,
 	uint16_t from_id, uint16_t to_id, uint16_t rxq_id)
 {
 	struct pre_ld_lcore_fwd *fwd;
 
-	fwd = &lcore->fwd[lcore->n_fwds];
+	fwd = rte_zmalloc(NULL, sizeof(struct pre_ld_lcore_fwd), 0);
+	if (!fwd)
+		rte_panic("Data path alloc failed\n");
+
 	fwd->poll_type = RX_QUEUE;
 	fwd->poll.poll_port.port_id = from_id;
 	fwd->poll.poll_port.queue_id = rxq_id;
 	fwd->fwd_type = HW_PORT;
 	fwd->fwd_dest.fwd_port = to_id;
-	rte_wmb();
-	lcore->n_fwds++;
+	pre_ld_insert_fwd_list_safe(list, fwd);
 }
 
 static inline struct rte_flow *
-pre_ld_sw_default_direct(struct pre_ld_lcore_conf *lcore,
+pre_ld_sw_default_direct(struct pre_ld_lcore_fwd_list *lcore,
 	uint32_t prio, uint16_t from_id, uint16_t to_id)
 {
 	struct rte_flow *flow;
@@ -1088,7 +1273,7 @@ pre_ld_def_dir_add(const char *from_nm,
 }
 
 static void
-pre_ld_build_def_direct_traffic(struct pre_ld_lcore_conf *lcore,
+pre_ld_build_def_direct_traffic(struct pre_ld_lcore_fwd_list *lcore,
 	const char *from_nm, const char *to_nm,
 	uint16_t from_id, uint16_t to_id)
 {
@@ -1117,7 +1302,7 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	uint16_t ul_id, uint16_t dl_id, uint16_t tap_id)
 {
 	uint16_t lcore_id;
-	struct pre_ld_lcore_conf *lcore;
+	struct pre_ld_lcore_fwd_list *lcore;
 	char ext_nm[RTE_ETH_NAME_MAX_LEN];
 	char ul_nm[RTE_ETH_NAME_MAX_LEN];
 	char dl_nm[RTE_ETH_NAME_MAX_LEN];
@@ -1132,8 +1317,7 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 		rte_exit(EXIT_FAILURE, "No data path core available\n");
 	lcore_id = s_data_path_core;
 
-	lcore = &s_pre_ld_lcore[lcore_id];
-	pthread_mutex_lock(&s_lcore_mutex);
+	lcore = &s_pre_ld_lists[lcore_id];
 	pre_ld_build_def_direct_traffic(lcore, dl_nm, tap_nm,
 		dl_id, tap_id);
 	pre_ld_build_def_direct_traffic(lcore, tap_nm, dl_nm,
@@ -1142,7 +1326,6 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 		ext_id, ul_id);
 	pre_ld_build_def_direct_traffic(lcore, ul_nm, ext_nm,
 		ul_id, ext_id);
-	pthread_mutex_unlock(&s_lcore_mutex);
 }
 
 static const char *
@@ -1617,12 +1800,10 @@ pre_ld_main_loop(void *dummy)
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint32_t lcore_id;
 	int i, nb_rx, j, fd, ret;
-	uint16_t nb_tx, portid, queueid, nb_txr_burst, crypto_id;
-	struct pre_ld_lcore_conf *qconf;
-	struct pre_ld_lcore_fwd *fwd;
+	uint16_t nb_tx, portid, queueid, crypto_id;
+	struct pre_ld_lcore_fwd_list *list;
+	struct pre_ld_lcore_fwd *fwd, *tfwd;
 	uint64_t bytes_overhead[MAX_PKT_BURST];
-	struct rte_ring *txr;
-	struct pre_ld_txr_desc *tx_rings;
 	struct rte_mempool *tx_pool = NULL;
 	uint16_t rx_ports[XFM_POLICY_ETH_NUM];
 	uint16_t tx_ports[XFM_POLICY_ETH_NUM];
@@ -1645,7 +1826,7 @@ pre_ld_main_loop(void *dummy)
 		return -EINVAL;
 	}
 	lcore_id = rte_lcore_id();
-	qconf = &s_pre_ld_lcore[lcore_id];
+	list = &s_pre_ld_lists[lcore_id];
 	s_data_path_core = lcore_id;
 
 	pre_ld_configure_direct_traffic(s_dir_traffic_cfg.ext_id,
@@ -1655,8 +1836,7 @@ pre_ld_main_loop(void *dummy)
 	pthread_mutex_unlock(&s_dp_init_mutex);
 
 	RTE_LOG(INFO, pre_ld,
-		"entering main loop %d fwds on lcore %u\n",
-		qconf->n_fwds, lcore_id);
+		"entering main loop on lcore %u\n", lcore_id);
 
 	tx_pool = rte_pktmbuf_pool_create_by_ops("tx_self_gen_pool",
 		MEMPOOL_USR_SIZE, MEMPOOL_CACHE_SIZE,
@@ -1693,8 +1873,7 @@ for_ever_loop:
 		return 0;
 	}
 
-	for (i = 0; i < qconf->n_fwds; i++) {
-		fwd = &qconf->fwd[i];
+	RTE_TAILQ_FOREACH_SAFE(fwd, list, next, tfwd) {
 		queueid = INVALID_QUEUEID;
 
 		if (fwd->poll_type == RX_QUEUE) {
@@ -1716,24 +1895,18 @@ for_ever_loop:
 					rte_pktmbuf_dump(stdout, mbufs[j], 60);
 			}
 		} else if (fwd->poll_type == TX_RING) {
-			tx_rings = &fwd->poll.tx_rings;
-			if (!tx_rings->tx_ring_num)
-				continue;
-			nb_txr_burst = MAX_PKT_BURST / tx_rings->tx_ring_num;
-			nb_rx = 0;
-			for (j = 0; j < tx_rings->tx_ring_num; j++) {
-				txr = tx_rings->tx_ring[j];
-				nb_rx += rte_ring_dequeue_burst(txr,
-					(void **)&mbufs[nb_rx], nb_txr_burst,
-					NULL);
-			}
+			nb_rx = rte_ring_dequeue_burst(fwd->poll.tx_ring,
+				(void **)mbufs, MAX_PKT_BURST, NULL);
 			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
-				sprintf(prefix, "Receive from TX ring");
+				sprintf(prefix, "Receive from TX ring(%s)",
+					fwd->poll.tx_ring->name);
 				for (j = 0; j < nb_rx; j++)
 					pre_ld_l3_l4_traffic_dump(mbufs[j], prefix);
 			}
 			if (unlikely(s_dump_traffic_flow && nb_rx > 0)) {
-				RTE_LOG(INFO, pre_ld, "Receive from TX ring\n");
+				RTE_LOG(INFO, pre_ld,
+					"Receive from TX ring(%s)\n",
+					fwd->poll.tx_ring->name);
 				for (j = 0; j < nb_rx; j++)
 					rte_pktmbuf_dump(stdout, mbufs[j], 60);
 			}
@@ -1804,16 +1977,16 @@ for_ever_loop:
 
 		if (fwd->poll_type == SEC_COMPLETE) {
 			for (j = 0; j < nb_rx; j++)
-				fwd->rx_sec_bytes += mbufs[j]->pkt_len;
+				fwd->rx_stat.sec_bytes += mbufs[j]->pkt_len;
 		} else {
 			for (j = 0; j < nb_rx; j++) {
 				bytes_overhead[j] = mbufs[j]->pkt_len +
 					RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
-				fwd->rx_oh_bytes += bytes_overhead[j];
+				fwd->rx_stat.oh_bytes += bytes_overhead[j];
 			}
 		}
-		fwd->rx_pkts += nb_rx;
-		fwd->rx_count++;
+		fwd->rx_stat.pkts += nb_rx;
+		fwd->rx_stat.count++;
 
 		if (fwd->fwd_type == SEC_EGRESS ||
 			fwd->fwd_type == SEC_INGRESS) {
@@ -1864,15 +2037,16 @@ for_ever_loop:
 			nb_tx = 0;
 		}
 		for (j = 0; j < nb_tx; j++) {
-			fwd->tx_oh_bytes += bytes_overhead[j];
+			fwd->tx_stat.oh_bytes += bytes_overhead[j];
 		}
-		fwd->tx_pkts += nb_tx;
-		fwd->tx_count++;
+		fwd->tx_stat.pkts += nb_tx;
+		fwd->tx_stat.count++;
 		if (nb_tx < nb_rx) {
 			rte_pktmbuf_free_bulk(&mbufs[nb_tx],
 				nb_rx - nb_tx);
 		}
 	}
+
 	goto for_ever_loop;
 
 	if (self_gen_pool)
@@ -1990,131 +2164,143 @@ is_cpu_detected(uint32_t lcore_id)
 	return 1;
 }
 
+static inline double
+pre_ld_st_gbps(uint64_t bytes_diff)
+{
+#define PRE_LD_G_SIZE ((double)(1000 * 1000 * 1000))
+#define PRE_LD_ST_G_SIZE (STATISTICS_DELAY_SEC * PRE_LD_G_SIZE)
+	return (double)bytes_diff * 8 / PRE_LD_ST_G_SIZE;
+}
+
+static inline double
+pre_ld_st_mpps(uint64_t pkts_diff)
+{
+#define PRE_LD_M_SIZE ((double)(1000 * 1000))
+#define PRE_LD_ST_M_SIZE (STATISTICS_DELAY_SEC * PRE_LD_M_SIZE)
+	return (double)pkts_diff / PRE_LD_ST_M_SIZE;
+}
+
+static void
+pre_ld_st_fwd_info_and_update(char *info,
+	enum pre_ld_statistic_dir dir,
+	const struct pre_ld_fwd_statistic *fwd_stat,
+	struct pre_ld_fwd_statistic *fwd_old_stat)
+{
+	uint64_t count_diff, pkt_diff, oh_diff;
+	int offset;
+	double gbps;
+
+	count_diff = fwd_stat->count - fwd_old_stat->count;
+	pkt_diff = fwd_stat->pkts - fwd_old_stat->pkts;
+	oh_diff = fwd_stat->oh_bytes - fwd_old_stat->oh_bytes;
+	rte_memcpy(fwd_old_stat, fwd_stat,
+		sizeof(struct pre_ld_fwd_statistic));
+
+	if (count_diff > 0) {
+		offset = sprintf(info,
+			"Average %s burst(%.1f)(%ld/%ld) ",
+			dir == PRE_LD_STAT_RX ? "rx" : "tx",
+			pkt_diff / (double)count_diff,
+			pkt_diff, count_diff);
+	} else {
+		offset = 0;
+	}
+	gbps = pre_ld_st_gbps(oh_diff);
+	offset += sprintf(&info[offset], "%s line: ",
+		dir == PRE_LD_STAT_RX ? "recv" : "send");
+	if (gbps > 1) {
+		sprintf(&info[offset], "%.2fGbps, %.2fMPPS",
+			gbps, pre_ld_st_mpps(pkt_diff));
+	} else {
+		sprintf(&info[offset], "%.2fMbps, %.2fMPPS",
+			gbps * 1000, pre_ld_st_mpps(pkt_diff));
+	}
+}
+
+static void
+pre_ld_st_fd_info_and_update(int fd,
+	enum pre_ld_statistic_dir dir,
+	const struct fd_statistic *fd_stat,
+	struct fd_statistic *fd_old_stat)
+{
+	uint64_t pkt_diff, oh_diff, usr_diff;
+	double oh_gbps, usr_gbps;
+	char info[1024];
+	int offset;
+
+	oh_diff = fd_stat->oh_bytes - fd_old_stat->oh_bytes;
+	usr_diff = fd_stat->usr_bytes - fd_old_stat->usr_bytes;
+	pkt_diff = fd_stat->pkts - fd_old_stat->pkts;
+	oh_gbps = pre_ld_st_gbps(oh_diff);
+	usr_gbps = pre_ld_st_gbps(usr_diff);
+	offset = sprintf(info, "FD(%d) %s ",
+		fd, dir == PRE_LD_STAT_RX ? "recv" : "send");
+	if (oh_gbps > 1) {
+		offset += sprintf(&info[offset], "line: %.2fGbps, ",
+			oh_gbps);
+	} else {
+		offset += sprintf(&info[offset], "line: %.2fMbps, ",
+			oh_gbps * 1000);
+	}
+	if (usr_gbps > 1) {
+		offset += sprintf(&info[offset],
+			"usr: %.2fGbps,  %.2fMPPS\n",
+			usr_gbps, pre_ld_st_mpps(pkt_diff));
+	} else {
+		offset += sprintf(&info[offset],
+			"usr: %.2fMbps,  %.2fMPPS\n",
+			usr_gbps * 1000, pre_ld_st_mpps(pkt_diff));
+	}
+	RTE_LOG(INFO, pre_ld, "%s", info);
+	rte_memcpy(fd_old_stat, fd_stat, sizeof(struct fd_statistic));
+}
+
 static void *
 pre_ld_data_path_statistics(void *arg)
 {
-	uint16_t i, j;
-	struct pre_ld_lcore_conf *qconf;
-	struct pre_ld_txr_desc *tx_rings;
+	uint16_t i;
+	struct pre_ld_lcore_fwd_list *list;
+	struct pre_ld_lcore_fwd *fwd, *tfwd;
 	char poll_info[512], fwd_info[512];
 	char rx_stat_info[512], tx_stat_info[512];
 	const char *space = "        ";
-	int offset, fd;
-	uint64_t tx_old_count[MAX_RX_POLLS_PER_LCORE];
-	uint64_t tx_old_pkts[MAX_RX_POLLS_PER_LCORE];
-	uint64_t tx_old_oh_bytes[MAX_RX_POLLS_PER_LCORE];
-
-	uint64_t rx_old_count[MAX_RX_POLLS_PER_LCORE];
-	uint64_t rx_old_pkts[MAX_RX_POLLS_PER_LCORE];
-	uint64_t rx_old_oh_bytes[MAX_RX_POLLS_PER_LCORE];
-
-	uint64_t tx_old_fd_pkts[MAX_RX_POLLS_PER_LCORE];
-	uint64_t tx_old_fd_oh_bytes[MAX_RX_POLLS_PER_LCORE];
-	uint64_t tx_old_fd_usr_bytes[MAX_RX_POLLS_PER_LCORE];
-
-	uint64_t rx_old_fd_pkts[MAX_RX_POLLS_PER_LCORE];
-	uint64_t rx_old_fd_oh_bytes[MAX_RX_POLLS_PER_LCORE];
-	uint64_t rx_old_fd_usr_bytes[MAX_RX_POLLS_PER_LCORE];
-
-	uint64_t count_diff, pkt_diff, oh_diff;
-
-	memset(tx_old_count, 0, sizeof(tx_old_count));
-	memset(tx_old_pkts, 0, sizeof(tx_old_pkts));
-	memset(tx_old_oh_bytes, 0, sizeof(tx_old_oh_bytes));
-
-	memset(rx_old_count, 0, sizeof(rx_old_count));
-	memset(rx_old_pkts, 0, sizeof(rx_old_pkts));
-	memset(rx_old_oh_bytes, 0, sizeof(rx_old_oh_bytes));
-
-	memset(tx_old_fd_pkts, 0, sizeof(tx_old_fd_pkts));
-	memset(tx_old_fd_oh_bytes, 0, sizeof(tx_old_fd_oh_bytes));
-	memset(tx_old_fd_usr_bytes, 0, sizeof(tx_old_fd_usr_bytes));
-
-	memset(rx_old_fd_pkts, 0, sizeof(rx_old_fd_pkts));
-	memset(rx_old_fd_oh_bytes, 0, sizeof(rx_old_fd_oh_bytes));
-	memset(rx_old_fd_usr_bytes, 0, sizeof(rx_old_fd_usr_bytes));
+	int fd;
 
 statistics_loop:
 	if (s_data_path_core < 0)
 		goto usr_fd_statistics;
 
-	qconf = &s_pre_ld_lcore[s_data_path_core];
-	for (i = 0; i < qconf->n_fwds; i++) {
-		if (qconf->fwd[i].poll_type == RX_QUEUE) {
+	list = &s_pre_ld_lists[s_data_path_core];
+	i = 0;
+	RTE_TAILQ_FOREACH_SAFE(fwd, list, next, tfwd) {
+		if (fwd->poll_type == RX_QUEUE) {
 			sprintf(poll_info, "Poll from port%d/queue%d",
-				qconf->fwd[i].poll.poll_port.port_id,
-				qconf->fwd[i].poll.poll_port.queue_id);
-		} else if (qconf->fwd[i].poll_type == TX_RING) {
-			tx_rings = &qconf->fwd[i].poll.tx_rings;
-			offset = sprintf(poll_info, "Poll from tx rings:");
-			for (j = 0; j < tx_rings->tx_ring_num; j++) {
-				offset += sprintf(&poll_info[offset],
-					" (%s)", tx_rings->tx_ring[j]->name);
-			}
-		} else if (qconf->fwd[i].poll_type == SELF_GEN) {
+				fwd->poll.poll_port.port_id,
+				fwd->poll.poll_port.queue_id);
+		} else if (fwd->poll_type == TX_RING) {
+			sprintf(poll_info, "Poll from tx ring(%s)",
+				fwd->poll.tx_ring->name);
+		} else if (fwd->poll_type == SELF_GEN) {
 			sprintf(poll_info, "self gen tx frames");
 		} else {
 			sprintf(poll_info, "Err poll type(%d)",
-				qconf->fwd[i].poll_type);
+				fwd->poll_type);
 		}
-		if (qconf->fwd[i].fwd_type == HW_PORT) {
+		if (fwd->fwd_type == HW_PORT) {
 			sprintf(fwd_info, "then forward to port%d",
-				qconf->fwd[i].fwd_dest.fwd_port);
-		} else if (qconf->fwd[i].fwd_type == RX_RING) {
+				fwd->fwd_dest.fwd_port);
+		} else if (fwd->fwd_type == RX_RING) {
 			sprintf(fwd_info, "then forward to rx ring(%s)",
-				qconf->fwd[i].fwd_dest.rx_ring->name);
+				fwd->fwd_dest.rx_ring->name);
 		} else {
 			sprintf(fwd_info, "then drop");
 		}
-		count_diff = qconf->fwd[i].tx_count - tx_old_count[i];
-		pkt_diff = qconf->fwd[i].tx_pkts - tx_old_pkts[i];
-		oh_diff = qconf->fwd[i].tx_oh_bytes -
-			tx_old_oh_bytes[i];
-		tx_old_count[i] = qconf->fwd[i].tx_count;
-		tx_old_pkts[i] = qconf->fwd[i].tx_pkts;
-		tx_old_oh_bytes[i] = qconf->fwd[i].tx_oh_bytes;
 
-		if (count_diff > 0) {
-			offset = sprintf(tx_stat_info,
-				"Average tx burst(%.1f)(%ld/%ld) ",
-				pkt_diff / (double)count_diff,
-				pkt_diff, count_diff);
-		} else {
-			offset = 0;
-		}
-		offset += sprintf(&tx_stat_info[offset],
-			"send line: %.2fGbps, %.2fMPPS",
-			(double)oh_diff * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000 * 1000)),
-			(double)pkt_diff * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000)));
+		pre_ld_st_fwd_info_and_update(tx_stat_info,
+			PRE_LD_STAT_TX, &fwd->tx_stat, &fwd->tx_old_stat);
 
-		count_diff = qconf->fwd[i].rx_count - rx_old_count[i];
-		pkt_diff = qconf->fwd[i].rx_pkts - rx_old_pkts[i];
-		oh_diff = qconf->fwd[i].rx_oh_bytes -
-			rx_old_oh_bytes[i];
-		rx_old_count[i] = qconf->fwd[i].rx_count;
-		rx_old_pkts[i] = qconf->fwd[i].rx_pkts;
-		rx_old_oh_bytes[i] = qconf->fwd[i].rx_oh_bytes;
-		if (count_diff > 0) {
-			offset = sprintf(rx_stat_info,
-				"Average rx burst(%.1f)(%ld/%ld) ",
-				pkt_diff / (double)count_diff,
-				pkt_diff, count_diff);
-		} else {
-			offset = 0;
-		}
-
-		sprintf(&rx_stat_info[offset],
-			"recv line: %.2fGbps, %.2fMPPS",
-			(double)oh_diff * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000 * 1000)),
-			(double)pkt_diff * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000)));
+		pre_ld_st_fwd_info_and_update(rx_stat_info,
+			PRE_LD_STAT_RX, &fwd->rx_stat, &fwd->rx_old_stat);
 
 		RTE_LOG(INFO, pre_ld,
 			"FWD[%d] on core%d:\n%s%s %s\n%s%s\n%s%s\n\n",
@@ -2122,6 +2308,7 @@ statistics_loop:
 			space, poll_info, fwd_info,
 			space, rx_stat_info,
 			space, tx_stat_info);
+		i++;
 	}
 
 usr_fd_statistics:
@@ -2131,41 +2318,14 @@ usr_fd_statistics:
 	fd = s_fd_usr[s_usr_fd_num - 1];
 	for (i = 0; i < s_usr_fd_num; i++) {
 		fd = s_fd_usr[i];
-		RTE_LOG(INFO, pre_ld,
-			"FD(%d) send line: %.2fGbps, usr: %.2fGbps, %.2fMPPS\n",
-			fd, (double)(s_fd_desc[fd].tx_oh_bytes -
-			tx_old_fd_oh_bytes[i]) * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000 * 1000)),
-			(double)(s_fd_desc[fd].tx_usr_bytes -
-			tx_old_fd_usr_bytes[i]) * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000 * 1000)),
-			(double)(s_fd_desc[fd].tx_pkts -
-			tx_old_fd_pkts[i]) * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000)));
-		tx_old_fd_oh_bytes[i] = s_fd_desc[fd].tx_oh_bytes;
-		tx_old_fd_usr_bytes[i] = s_fd_desc[fd].tx_usr_bytes;
-		tx_old_fd_pkts[i] = s_fd_desc[fd].tx_pkts;
 
-		RTE_LOG(INFO, pre_ld,
-			"FD(%d) recv line: %.2fGbps, usr: %.2fGbps, %.2fMPPS\n",
-			fd, (double)(s_fd_desc[fd].rx_oh_bytes -
-			rx_old_fd_oh_bytes[i]) * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000 * 1000)),
-			(double)(s_fd_desc[fd].rx_usr_bytes -
-			rx_old_fd_usr_bytes[i]) * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000 * 1000)),
-			(double)(s_fd_desc[fd].rx_pkts -
-			rx_old_fd_pkts[i]) * 8 /
-			(STATISTICS_DELAY_SEC *
-			(double)(1000 * 1000)));
-		rx_old_fd_oh_bytes[i] = s_fd_desc[fd].rx_oh_bytes;
-		rx_old_fd_usr_bytes[i] = s_fd_desc[fd].rx_usr_bytes;
-		rx_old_fd_pkts[i] = s_fd_desc[fd].rx_pkts;
+		pre_ld_st_fd_info_and_update(fd, PRE_LD_STAT_TX,
+			&s_fd_desc[fd].tx_stat,
+			&s_fd_desc[fd].tx_old_stat);
+
+		pre_ld_st_fd_info_and_update(fd, PRE_LD_STAT_RX,
+			&s_fd_desc[fd].rx_stat,
+			&s_fd_desc[fd].rx_old_stat);
 	}
 
 statistics_continue:
@@ -2595,7 +2755,7 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 	char config_str[256];
 	int ret, udp_src = 0, udp_dst = 0;
 	uint16_t rxq_id, offset = 0;
-	struct pre_ld_lcore_conf *lcore;
+	struct pre_ld_lcore_fwd_list *list;
 	struct pre_ld_lcore_fwd *fwd;
 	char nm[RTE_MEMZONE_NAMESIZE];
 	static int default_created;
@@ -2690,9 +2850,7 @@ create_local_flow:
 	if (s_data_path_core < 0)
 		return 0;
 
-	lcore = &s_pre_ld_lcore[s_data_path_core];
-	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE)
-		return -EINVAL;
+	list = &s_pre_ld_lists[s_data_path_core];
 
 	sprintf(nm, "rx_ring_%d", sockfd);
 	s_fd_desc[sockfd].rx_ring = rte_ring_create(nm, MEMPOOL_USR_SIZE,
@@ -2703,24 +2861,27 @@ create_local_flow:
 		return -ENOMEM;
 	}
 
-	pthread_mutex_lock(&s_lcore_mutex);
-	fwd = &lcore->fwd[lcore->n_fwds];
+	fwd = rte_zmalloc(NULL, sizeof(struct pre_ld_lcore_fwd), 0);
+	if (!fwd) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: data path alloc failed\n", __func__);
+		return -ENOMEM;
+	}
+
 	fwd->poll_type = RX_QUEUE;
 	fwd->poll.poll_port.port_id = s_fd_desc[sockfd].rx_port;
 	fwd->poll.poll_port.queue_id = rxq_id;
 	offset += sprintf(&fwd_info[offset],
-		"FWD[%d]: RX from port%d, queue%d ",
-		lcore->n_fwds, fwd->poll.poll_port.port_id,
+		"RX from port%d, queue%d ",
+		fwd->poll.poll_port.port_id,
 		fwd->poll.poll_port.queue_id);
 	fwd->fwd_type = RX_RING;
 	fwd->fwd_dest.rx_ring = s_fd_desc[sockfd].rx_ring;
 	offset += sprintf(&fwd_info[offset],
 		"then forward to rx ring(%s)\r\n",
 		fwd->fwd_dest.rx_ring->name);
-	rte_wmb();
 	RTE_LOG(INFO, pre_ld, "%s", fwd_info);
-	lcore->n_fwds++;
-	pthread_mutex_unlock(&s_lcore_mutex);
+	pre_ld_insert_fwd_list_safe(list, fwd);
 
 	return 0;
 }
@@ -2742,11 +2903,10 @@ static int
 usr_socket_fd_desc_init(int sockfd,
 	uint16_t rx_port, uint16_t tx_port)
 {
-	int ret = 0, found = 0;
-	struct pre_ld_lcore_conf *lcore;
+	int ret = 0;
+	struct pre_ld_lcore_fwd_list *list;
 	struct pre_ld_lcore_fwd *fwd;
-	struct pre_ld_txr_desc *tx_rings;
-	uint16_t n_fwds, mtu;
+	uint16_t mtu;
 	char nm[64];
 
 	pthread_mutex_lock(&s_fd_mutex);
@@ -2883,135 +3043,26 @@ fd_init_quit:
 	if (!s_dir_traffic_cfg.valid)
 		return 0;
 
-	lcore = &s_pre_ld_lcore[s_data_path_core];
-	if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE)
-		return -EINVAL;
+	list = &s_pre_ld_lists[s_data_path_core];
 
 	sprintf(nm, "tx_ring_fd%d", sockfd);
 	s_fd_desc[sockfd].tx_ring = rte_ring_create(nm, MEMPOOL_USR_SIZE,
 		0, RING_F_SP_ENQ | RING_F_SC_DEQ);
 
-	pthread_mutex_lock(&s_lcore_mutex);
-	fwd = NULL;
-	for (n_fwds = 0; n_fwds < lcore->n_fwds; n_fwds++) {
-		fwd = &lcore->fwd[n_fwds];
-		if (fwd->poll_type == TX_RING &&
-			fwd->fwd_type == HW_PORT &&
-			fwd->fwd_dest.fwd_port == tx_port) {
-			found = 1;
-			break;
-		}
-	}
-	if (!found) {
-		if (lcore->n_fwds >= MAX_RX_POLLS_PER_LCORE) {
-			rte_exit(EXIT_FAILURE, "Line%d: Too many forwards\n",
-				__LINE__);
-		}
-		fwd = &lcore->fwd[lcore->n_fwds];
-		fwd->poll.tx_rings.tx_ring = rte_malloc(NULL,
-			sizeof(void *) * MAX_USR_FD_NUM, 0);
-		if (!fwd->poll.tx_rings.tx_ring) {
-			RTE_LOG(ERR, pre_ld,
-				"Alloc tx rings failed\n");
-			goto fwd_configure_quit;
-		}
-		fwd->poll_type = TX_RING;
-		fwd->poll.tx_rings.tx_ring[0] = s_fd_desc[sockfd].tx_ring;
-		fwd->fwd_type = HW_PORT;
-		fwd->fwd_dest.fwd_port = s_fd_desc[sockfd].tx_port;
-		rte_wmb();
-		fwd->poll.tx_rings.tx_ring_num = 1;
-		rte_wmb();
-		lcore->n_fwds++;
-	} else {
-		tx_rings = &fwd->poll.tx_rings;
-		tx_rings->tx_ring[tx_rings->tx_ring_num] =
-			s_fd_desc[sockfd].tx_ring;
-		rte_wmb();
-		tx_rings->tx_ring_num++;
+	fwd = rte_zmalloc(NULL, sizeof(struct pre_ld_lcore_fwd), 0);
+	if (!fwd) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: data path alloc failed\n", __func__);
+		return -ENOMEM;
 	}
 
-fwd_configure_quit:
-	pthread_mutex_unlock(&s_lcore_mutex);
+	fwd->poll_type = TX_RING;
+	fwd->poll.tx_ring = s_fd_desc[sockfd].tx_ring;
+	fwd->fwd_type = HW_PORT;
+	fwd->fwd_dest.fwd_port = s_fd_desc[sockfd].tx_port;
+	pre_ld_insert_fwd_list_safe(list, fwd);
 
 	return 0;
-}
-
-static int
-usr_socket_fd_release(int sockfd)
-{
-	int ret = 0, ret_tmp, i;
-	uint16_t rx_port, tx_port;
-
-	pthread_mutex_lock(&s_fd_mutex);
-	rx_port = s_fd_desc[sockfd].rx_port;
-	tx_port = s_fd_desc[sockfd].tx_port;
-
-	if (s_fd_desc[sockfd].rxq_id &&
-		s_port_rxq_rings[rx_port]) {
-		ret_tmp = rte_ring_enqueue(s_port_rxq_rings[rx_port],
-					s_fd_desc[sockfd].rxq_id);
-		if (ret_tmp) {
-			RTE_LOG(ERR, pre_ld,
-				"%s release *s_fd_desc[%d].rxq_id(%d) failed(%d)\n",
-				__func__, sockfd,
-				*s_fd_desc[sockfd].rxq_id, ret_tmp);
-			ret = ret_tmp;
-		}
-	}
-	s_fd_desc[sockfd].rxq_id = NULL;
-
-	if (s_fd_desc[sockfd].txq_id &&
-		s_port_txq_rings[tx_port] &&
-		s_fd_desc[sockfd].txq_id != &s_fd_desc[sockfd].def_txq_id) {
-		ret_tmp = rte_ring_enqueue(s_port_txq_rings[tx_port],
-					s_fd_desc[sockfd].txq_id);
-		if (ret_tmp) {
-			RTE_LOG(ERR, pre_ld,
-				"%s release *s_fd_desc[%d].txq_id(%d) failed(%d)\n",
-				__func__, sockfd,
-				*s_fd_desc[sockfd].txq_id, ret_tmp);
-			ret = ret_tmp;
-		}
-	}
-	s_fd_desc[sockfd].txq_id = NULL;
-
-	if (s_fd_desc[sockfd].flow) {
-		ret_tmp = rte_flow_destroy(rx_port,
-				s_fd_desc[sockfd].flow, NULL);
-		if (ret_tmp) {
-			RTE_LOG(ERR, pre_ld,
-				"%s free s_fd_desc[%d].flow(%p) failed(%d)\n",
-				__func__, sockfd,
-				s_fd_desc[sockfd].flow, ret_tmp);
-			ret = ret_tmp;
-		}
-		s_fd_desc[sockfd].flow = NULL;
-	}
-	memset(&s_fd_desc[sockfd], 0, sizeof(struct fd_desc));
-	s_fd_desc[sockfd].fd = INVALID_SOCKFD;
-
-	for (i = 0; i < s_usr_fd_num; i++) {
-		if (s_fd_usr[i] == sockfd &&
-			i != (s_usr_fd_num - 1)) {
-			memmove(&s_fd_usr[i], &s_fd_usr[i + 1],
-				sizeof(int) * (s_usr_fd_num - (i + 1)));
-			break;
-		} else if (s_fd_usr[i] == sockfd) {
-			break;
-		}
-	}
-	s_usr_fd_num--;
-	if (s_max_usr_fd == sockfd) {
-		s_max_usr_fd = INVALID_SOCKFD;
-		for (i = 0; i < s_usr_fd_num; i++) {
-			if (s_fd_usr[i] > s_max_usr_fd)
-				s_max_usr_fd = s_fd_usr[i];
-		}
-	}
-	pthread_mutex_unlock(&s_fd_mutex);
-
-	return ret;
 }
 
 static void
@@ -4264,6 +4315,11 @@ static void setup_wrappers(void)
 
 	if (!netwrap_is_usr_process())
 		return;
+
+	for (i = 0; i < RTE_MAX_LCORE; i++) {
+		s_pre_ld_lists[i].tqh_first = NULL;
+		s_pre_ld_lists[i].tqh_last = &s_pre_ld_lists[i].tqh_first;
+	}
 
 	signal(SIGINT, pre_ld_signal_handler);
 	signal(SIGTERM, pre_ld_signal_handler);
