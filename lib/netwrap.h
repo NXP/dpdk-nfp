@@ -49,4 +49,7 @@ void
 pre_ld_configure_sec_path(uint16_t rx_port,
 	uint16_t rxq_id, uint8_t dir, uint16_t tx_port, void *sa);
 
+extern void
+eal_lcore_non_eal_release(uint32_t lcore_id);
+
 #endif /* __NETWRAP_COMMON_H__ */

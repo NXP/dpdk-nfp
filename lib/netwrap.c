@@ -108,6 +108,7 @@ static char *s_downlink;
 static int s_manual_restart_ipsec;
 static int s_force_ipsec;
 static int s_flow_control;
+static int s_force_eal_thread;
 
 static uint16_t s_l3_traffic_dump;
 static uint8_t s_l4_traffic_dump;
@@ -156,10 +157,18 @@ struct fd_statistic {
 	uint64_t usr_bytes;
 };
 
+struct fd_thread_desc {
+	uint32_t cpu;
+	uint32_t *lcore;
+	pthread_t thread;
+};
+
 struct fd_desc {
 	int fd;
-	int cpu;
-	pthread_t thread;
+	int closing_state;
+	int eal_thread;
+	int eal_thread_nb;
+	struct fd_thread_desc th_desc[RTE_MAX_LCORE];
 	struct eth_ipv4_udp_hdr hdr;
 	enum hdr_init_enum hdr_init;
 	uint16_t rx_port;
@@ -547,6 +556,41 @@ eal_destroy_dpaa2_mux_flow(void)
 	return ret;
 }
 
+static void
+usr_socket_fd_set_closing_state(int sockfd)
+{
+	pthread_mutex_lock(&s_fd_mutex);
+	s_fd_desc[sockfd].closing_state = 1;
+	pthread_mutex_unlock(&s_fd_mutex);
+}
+
+static void
+usr_socket_fd_remove(int sockfd)
+{
+	int i;
+
+	pthread_mutex_lock(&s_fd_mutex);
+	for (i = 0; i < s_usr_fd_num; i++) {
+		if (s_fd_usr[i] == sockfd &&
+			i != (s_usr_fd_num - 1)) {
+			memmove(&s_fd_usr[i], &s_fd_usr[i + 1],
+				sizeof(int) * (s_usr_fd_num - (i + 1)));
+			break;
+		} else if (s_fd_usr[i] == sockfd) {
+			break;
+		}
+	}
+	s_usr_fd_num--;
+	if (s_max_usr_fd == sockfd) {
+		s_max_usr_fd = INVALID_SOCKFD;
+		for (i = 0; i < s_usr_fd_num; i++) {
+			if (s_fd_usr[i] > s_max_usr_fd)
+				s_max_usr_fd = s_fd_usr[i];
+		}
+	}
+	pthread_mutex_unlock(&s_fd_mutex);
+}
+
 static int
 usr_socket_fd_release(int sockfd)
 {
@@ -557,6 +601,7 @@ usr_socket_fd_release(int sockfd)
 	struct pre_ld_lcore_fwd_list *list = NULL;
 	struct pre_ld_lcore_fwd *fwd, *tfwd;
 	struct rte_ring *tx_ring, *rx_ring;
+	struct fd_thread_desc *th_desc;
 
 	pthread_mutex_lock(&s_fd_mutex);
 	rx_port = s_fd_desc[sockfd].rx_port;
@@ -664,27 +709,18 @@ dq_txr_again:
 		s_fd_desc[sockfd].tx_pool = NULL;
 	}
 
+	for (i = 0; i < s_fd_desc[sockfd].eal_thread_nb; i++) {
+		th_desc = &s_fd_desc[sockfd].th_desc[i];
+		if (th_desc->cpu != LCORE_ID_ANY)
+			eal_lcore_non_eal_release(th_desc->cpu);
+		th_desc->cpu = LCORE_ID_ANY;
+		if (th_desc->lcore)
+			*th_desc->lcore = LCORE_ID_ANY;
+	}
+
 	memset(&s_fd_desc[sockfd], 0, sizeof(struct fd_desc));
 	s_fd_desc[sockfd].fd = INVALID_SOCKFD;
 
-	for (i = 0; i < s_usr_fd_num; i++) {
-		if (s_fd_usr[i] == sockfd &&
-			i != (s_usr_fd_num - 1)) {
-			memmove(&s_fd_usr[i], &s_fd_usr[i + 1],
-				sizeof(int) * (s_usr_fd_num - (i + 1)));
-			break;
-		} else if (s_fd_usr[i] == sockfd) {
-			break;
-		}
-	}
-	s_usr_fd_num--;
-	if (s_max_usr_fd == sockfd) {
-		s_max_usr_fd = INVALID_SOCKFD;
-		for (i = 0; i < s_usr_fd_num; i++) {
-			if (s_fd_usr[i] > s_max_usr_fd)
-				s_max_usr_fd = s_fd_usr[i];
-		}
-	}
 	pthread_mutex_unlock(&s_fd_mutex);
 
 	return ret;
@@ -705,7 +741,6 @@ static void eal_quit(void)
 			fd = s_fd_desc[s_fd_usr[i]].fd;
 			if (fd != INVALID_SOCKFD) {
 				close(fd);
-				usr_socket_fd_release(fd);
 				break;
 			}
 		}
@@ -726,7 +761,7 @@ static void eal_quit(void)
 			ret);
 	}
 	RTE_ETH_FOREACH_DEV(portid) {
-		if (portid == s_tx_port) {
+		if (portid == s_tx_port && rte_lcore_id() != LCORE_ID_ANY) {
 drain_again:
 			drain = rte_pmd_dpaa2_clean_tx_conf(portid, 0);
 			if (drain)
@@ -755,15 +790,24 @@ drain_again:
 static int
 eal_data_path_thread_register(struct fd_desc *desc)
 {
-	int ret, cpu, new_cpu, lcore;
+	int ret, new_cpu, lcore, i;
+	uint32_t cpu;
 	rte_cpuset_t cpuset;
-	pthread_t thread = pthread_self();
+	struct fd_thread_desc *th_desc;
+	pthread_t thread;
 
-	cpu = sched_getcpu();
-	if (likely((desc->cpu == cpu &&
-		thread == desc->thread) ||
-		thread == s_main_td))
+	if (!desc->eal_thread)
 		return 0;
+
+	thread = pthread_self();
+	cpu = sched_getcpu();
+	for (i = 0; i < desc->eal_thread_nb; i++) {
+		th_desc = &desc->th_desc[i];
+		if (likely((th_desc->cpu == cpu &&
+			thread == th_desc->thread) ||
+			thread == s_main_td))
+			return 0;
+	}
 
 register_again:
 	ret = rte_thread_register();
@@ -800,11 +844,26 @@ register_again:
 
 		return -EINVAL;
 	}
-	desc->cpu = new_cpu;
-	desc->thread = pthread_self();
+
+	pthread_mutex_lock(&s_fd_mutex);
+	if (desc->eal_thread_nb >= RTE_MAX_LCORE) {
+		RTE_LOG(ERR, pre_ld,
+			"Too many threads allocated for FD(%d)\n",
+			desc->fd);
+		pthread_mutex_unlock(&s_fd_mutex);
+
+		return -EINVAL;
+	}
+	th_desc = &desc->th_desc[desc->eal_thread_nb];
+	th_desc->cpu = new_cpu;
+	th_desc->thread = pthread_self();
+	th_desc->lcore = &RTE_PER_LCORE(_lcore_id);
+	desc->eal_thread_nb++;
 	RTE_LOG(INFO, pre_ld,
-		"Register thread(%ld) of FD(%d) from cpu(%d) to cpu(%d)\n",
-		pthread_self(), desc->fd, cpu, desc->cpu);
+		"Register %d thread(s)(%ld) of FD(%d) from cpu(%d) to cpu(%d)\n",
+		desc->eal_thread_nb, pthread_self(),
+		desc->fd, cpu, new_cpu);
+	pthread_mutex_unlock(&s_fd_mutex);
 
 	return 0;
 }
@@ -2899,11 +2958,24 @@ socket_hdr_init(struct eth_ipv4_udp_hdr *hdr)
 	hdr->ip_hdr.next_proto_id = IPPROTO_UDP;
 }
 
+static void
+usr_socket_fd_add(int sockfd)
+{
+	pthread_mutex_lock(&s_fd_mutex);
+	s_fd_usr[s_usr_fd_num] = sockfd;
+	s_usr_fd_num++;
+	if (s_max_usr_fd < 0)
+		s_max_usr_fd = sockfd;
+	else if (sockfd > s_max_usr_fd)
+		s_max_usr_fd = sockfd;
+	pthread_mutex_unlock(&s_fd_mutex);
+}
+
 static int
 usr_socket_fd_desc_init(int sockfd,
 	uint16_t rx_port, uint16_t tx_port)
 {
-	int ret = 0;
+	int ret = 0, i;
 	struct pre_ld_lcore_fwd_list *list;
 	struct pre_ld_lcore_fwd *fwd;
 	uint16_t mtu;
@@ -2979,8 +3051,13 @@ usr_socket_fd_desc_init(int sockfd,
 		RTE_LOG(INFO, pre_ld,
 			"port%d: TXQ[%d] allocated for socket(%d)\n",
 			tx_port, *s_fd_desc[sockfd].txq_id, sockfd);
+		s_fd_desc[sockfd].eal_thread = 1;
 	} else {
 		s_fd_desc[sockfd].txq_id = NULL;
+		if (s_force_eal_thread)
+			s_fd_desc[sockfd].eal_thread = 1;
+		else
+			s_fd_desc[sockfd].eal_thread = 0;
 	}
 
 	s_fd_desc[sockfd].rx_port = rx_port;
@@ -2999,15 +3076,12 @@ usr_socket_fd_desc_init(int sockfd,
 
 	s_fd_desc[sockfd].hdr_init = HDR_INIT_NONE;
 
-	s_fd_usr[s_usr_fd_num] = sockfd;
-	s_usr_fd_num++;
-	if (s_max_usr_fd < 0)
-		s_max_usr_fd = sockfd;
-	else if (sockfd > s_max_usr_fd)
-		s_max_usr_fd = sockfd;
-
 	s_fd_desc[sockfd].fd = sockfd;
-	s_fd_desc[sockfd].cpu = -1;
+	s_fd_desc[sockfd].eal_thread_nb = 0;
+	memset(s_fd_desc[sockfd].th_desc, 0,
+		sizeof(struct fd_thread_desc) * RTE_MAX_LCORE);
+	for (i = 0; i < RTE_MAX_LCORE; i++)
+		s_fd_desc[sockfd].th_desc[i].cpu = LCORE_ID_ANY;
 	sprintf(nm, "tx_pool_fd%d", sockfd);
 	s_fd_desc[sockfd].tx_pool = rte_pktmbuf_pool_create_by_ops(nm,
 			MEMPOOL_USR_SIZE, MEMPOOL_CACHE_SIZE,
@@ -3173,6 +3247,7 @@ socket(int domain, int type, int protocol)
 					"Init FD desc failed(%d)\n", ret);
 				exit(EXIT_FAILURE);
 			}
+			usr_socket_fd_add(sockfd);
 			RTE_LOG(INFO, pre_ld,
 				"pre set user Socket FD(%d) created.\n",
 				sockfd);
@@ -3209,6 +3284,7 @@ socket(int domain, int type, int protocol)
 					"Init FD desc failed(%d)\n", ret);
 				exit(EXIT_FAILURE);
 			}
+			usr_socket_fd_add(sockfd);
 			RTE_LOG(INFO, pre_ld,
 				"user Socket FD(%d) created.\n", sockfd);
 		}
@@ -3238,6 +3314,8 @@ shutdown(int sockfd, int how)
 	}
 
 	if (IS_USECT_SOCKET(sockfd)) {
+		usr_socket_fd_set_closing_state(sockfd);
+		usr_socket_fd_remove(sockfd);
 		if (libc_shutdown)
 			shutdown_value = (*libc_shutdown)(sockfd, how);
 		ret = usr_socket_fd_release(sockfd);
@@ -3275,6 +3353,8 @@ close(int sockfd)
 	}
 
 	if (IS_USECT_SOCKET(sockfd)) {
+		usr_socket_fd_set_closing_state(sockfd);
+		usr_socket_fd_remove(sockfd);
 		RTE_LOG(INFO, pre_ld,
 			"%s socket fd:%d, libc_close:%p\n", __func__,
 			sockfd, libc_close);
@@ -3859,6 +3939,12 @@ read(int sockfd, void *buf, size_t len)
 	}
 
 	if (IS_USECT_SOCKET(sockfd)) {
+		if (unlikely(s_fd_desc[sockfd].closing_state)) {
+			RTE_LOG(WARNING, pre_ld,
+				"%s: user FD(%d) is in closing state!\n",
+				__func__, sockfd);
+			return 0;
+		}
 		if (s_fd_desc[sockfd].flow)
 			return eal_recv(sockfd, buf, len, 0);
 	}
@@ -3909,6 +3995,12 @@ write(int sockfd, const void *buf, size_t len)
 	}
 
 	if (likely(IS_USECT_SOCKET(sockfd))) {
+		if (unlikely(s_fd_desc[sockfd].closing_state)) {
+			RTE_LOG(WARNING, pre_ld,
+				"%s: user FD(%d) is in closing state!\n",
+				__func__, sockfd);
+			return 0;
+		}
 		if (unlikely((s_fd_desc[sockfd].hdr_init &
 			HDR_INIT_ALL) != HDR_INIT_ALL)) {
 			ret = netwrap_collect_info(sockfd);
@@ -3955,6 +4047,12 @@ recv(int sockfd, void *buf, size_t len, int flags)
 	}
 
 	if (IS_USECT_SOCKET(sockfd)) {
+		if (unlikely(s_fd_desc[sockfd].closing_state)) {
+			RTE_LOG(WARNING, pre_ld,
+				"%s: user FD(%d) is in closing state!\n",
+				__func__, sockfd);
+			return 0;
+		}
 		if (s_fd_desc[sockfd].flow)
 			return eal_recv(sockfd, buf, len, flags);
 	}
@@ -4005,6 +4103,12 @@ send(int sockfd, const void *buf, size_t len, int flags)
 	}
 
 	if (likely(IS_USECT_SOCKET(sockfd))) {
+		if (unlikely(s_fd_desc[sockfd].closing_state)) {
+			RTE_LOG(WARNING, pre_ld,
+				"%s: user FD(%d) is in closing state!\n",
+				__func__, sockfd);
+			return 0;
+		}
 		if (unlikely((s_fd_desc[sockfd].hdr_init &
 			HDR_INIT_ALL) != HDR_INIT_ALL)) {
 			ret = netwrap_collect_info(sockfd);
@@ -4387,6 +4491,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_FLOW_CONTROL_ENABLE");
 	if (env)
 		s_flow_control = atoi(env);
+
+	env = getenv("PRE_LOAD_FORCE_EAL_THREAD");
+	if (env)
+		s_force_eal_thread = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
