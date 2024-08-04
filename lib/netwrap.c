@@ -2339,6 +2339,13 @@ statistics_loop:
 		} else if (fwd->poll_type == TX_RING) {
 			sprintf(poll_info, "Poll from tx ring(%s)",
 				fwd->poll.tx_ring->name);
+		} else if (fwd->poll_type == SEC_COMPLETE) {
+			sprintf(poll_info, "Poll %s from SEC%d/queue%d",
+				fwd->poll.poll_sec.queue_id ==
+				CRYPTO_DEV_INGRESS_QP ?
+				"decap" : "encap",
+				fwd->poll.poll_sec.sec_id,
+				fwd->poll.poll_sec.queue_id);
 		} else if (fwd->poll_type == SELF_GEN) {
 			sprintf(poll_info, "self gen tx frames");
 		} else {
@@ -2351,6 +2358,14 @@ statistics_loop:
 		} else if (fwd->fwd_type == RX_RING) {
 			sprintf(fwd_info, "then forward to rx ring(%s)",
 				fwd->fwd_dest.rx_ring->name);
+		} else if (fwd->fwd_type == SEC_EGRESS) {
+			sprintf(fwd_info, "then encap to SEC%d/queue%d",
+				fwd->fwd_dest.fwd_sec.sec_id,
+				fwd->fwd_dest.fwd_sec.queue_id);
+		} else if (fwd->fwd_type == SEC_INGRESS) {
+			sprintf(fwd_info, "then decap to SEC%d/queue%d",
+				fwd->fwd_dest.fwd_sec.sec_id,
+				fwd->fwd_dest.fwd_sec.queue_id);
 		} else {
 			sprintf(fwd_info, "then drop");
 		}
