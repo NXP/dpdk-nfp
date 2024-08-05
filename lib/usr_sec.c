@@ -1356,6 +1356,11 @@ process_new_policy(const struct nlmsghdr *nh,
 		xfm_insert_new_policy(sp, pol_info,
 			&pol_info->sel.saddr, &pol_info->sel.daddr, af);
 
+	rte_memcpy(&sp->sel_src, &pol_info->sel.saddr,
+		sizeof(xfrm_address_t));
+	rte_memcpy(&sp->sel_dst, &pol_info->sel.daddr,
+		sizeof(xfrm_address_t));
+
 	ret = 0;
 	if (!sa->session.security.ses) {
 		ret = xfm_apply_sa(sa, pol_info, sec_id);
@@ -1447,8 +1452,8 @@ static int process_del_policy(const struct nlmsghdr *nh)
 	curr = LIST_FIRST(head);
 
 	while (curr) {
-		src = &curr->src;
-		dst = &curr->dst;
+		src = &curr->sel_src;
+		dst = &curr->sel_dst;
 		if (!memcmp(src, &pol_id->sel.saddr, size) &&
 			!memcmp(dst, &pol_id->sel.daddr, size))
 			break;
@@ -1468,7 +1473,7 @@ static int process_del_policy(const struct nlmsghdr *nh)
 	}
 
 	rte_memcpy(src_info, &pol_id->sel.saddr, size);
-	rte_memcpy(dst_info, &pol_id->sel.saddr, size);
+	rte_memcpy(dst_info, &pol_id->sel.daddr, size);
 
 	if (pol_id->sel.family == AF_INET) {
 		sprintf(addr_info,

@@ -118,6 +118,8 @@ struct pre_ld_ipsec_sp_entry {
 	LIST_ENTRY(pre_ld_ipsec_sp_entry) next;
 	xfrm_address_t src;
 	xfrm_address_t dst;
+	xfrm_address_t sel_src;
+	xfrm_address_t sel_dst;
 	rte_be32_t spi;
 	uint16_t family;
 	uint32_t priority;
