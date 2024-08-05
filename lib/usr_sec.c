@@ -53,7 +53,7 @@
 #include <rte_thread.h>
 #include <rte_launch.h>
 
-#include "usr_sec.h"
+#include "netwrap.h"
 
 static char s_dump_prefix[sizeof("PRE_LD_IPSEC: ") - 1];
 #define DUMP_PREFIX s_dump_prefix
@@ -78,27 +78,6 @@ struct xfm_auth_support {
 	const char *name;
 	enum rte_crypto_auth_algorithm algo;
 };
-
-struct xfm_mem_ctx {
-	struct rte_mempool *session_pool;
-	struct rte_mempool *session_priv_pool;
-};
-
-struct xfm_msg_param {
-	uint16_t sec_id;
-	uint16_t rx_ports[XFM_POLICY_ETH_NUM];
-	uint16_t tx_ports[XFM_POLICY_ETH_NUM];
-	struct rte_ring *sp_rxq_ring[XFM_POLICY_ETH_NUM];
-};
-
-static struct xfm_msg_param s_msg_param;
-
-#define SESS_MP_NB_OBJS 1024
-#define SESS_MP_CACHE_SZ 64
-
-#define CRYPT_DEV_QUEUE_DESC 2048
-
-static struct xfm_mem_ctx s_xfm_mem_ctx;
 
 static const struct xfm_ciph_support s_xfm_cipher[] = {
 	{
@@ -144,7 +123,9 @@ static const struct xfm_auth_support s_auth_xfm[] = {
 
 static struct pre_ld_ipsec_cntx s_pre_ld_ipsec_cntx;
 
-static int s_kernel_sp_sa_clear = 1;
+static int s_kernel_sp_sa_clear;
+
+static double s_xfm_cycs_per_us;
 
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void)
 {
@@ -446,6 +427,103 @@ static int nl_parse_attrs(struct nlattr *na, int len,
 	return 0;
 }
 
+static struct pre_ld_ipsec_sp_entry *
+xfm_sp_find_same_attr(struct pre_ld_ipsec_sp_entry *sp)
+{
+	struct pre_ld_ipsec_sp_head *head = sp->head;
+	struct pre_ld_ipsec_sp_entry *found = NULL;
+
+	found = LIST_FIRST(head);
+	while (found) {
+		if (found != sp &&
+			!memcmp(&sp->src, &found->src,
+				sizeof(xfrm_address_t)) &&
+			!memcmp(&sp->dst, &found->dst,
+				sizeof(xfrm_address_t))) {
+			if (sp->dir == XFRM_POLICY_OUT)
+				break;
+			else if (sp->dir == XFRM_POLICY_IN &&
+				sp->spi == found->spi)
+				break;
+		}
+		found = LIST_NEXT(found, next);
+	}
+
+	return found;
+}
+
+static int
+xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
+{
+	struct rte_flow_error error;
+	uint16_t port_id;
+
+	if (sp->flow) {
+		RTE_LOG(WARNING, pre_ld,
+			"%s: Policy flow (index=%d) has been created!\n",
+			__func__, sp->ingress_queue.index);
+
+		return -EEXIST;
+	}
+
+	port_id = sp->entry_to_sec->poll.poll_port.port_id;
+
+	sp->flow = rte_flow_create(port_id, &sp->attr,
+			sp->flow_item, sp->action, &error);
+	if (sp->flow) {
+		RTE_LOG(INFO, pre_ld,
+			"%s: Policy flow (index=%d) create successfully\n",
+			__func__, sp->ingress_queue.index);
+
+		RTE_LOG(INFO, pre_ld,
+			"%s: Steer %s flow from port%d flow%d to port%d\n",
+			__func__, sp->dir == XFRM_POLICY_IN ?
+			"Ingress" : "Egress",
+			port_id,
+			*sp->entry_to_sec->poll.poll_port.queue_id,
+			sp->entry_from_sec->dest.dest_port);
+
+		return 0;
+	}
+
+	RTE_LOG(ERR, pre_ld,
+		"%s: Policy flow (index=%d) create failed(%s)\n",
+		__func__, sp->ingress_queue.index, error.message);
+
+	return -EIO;
+}
+
+static int
+process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
+{
+	int ret = 0;
+	struct rte_flow_error error;
+	uint16_t port_id = sp->entry_to_sec->poll.poll_port.port_id;
+	struct pre_ld_ipsec_sp_entry *pending;
+
+	pending = xfm_sp_find_same_attr(sp);
+
+	LIST_REMOVE(sp, next);
+	if (port_id != INVALID_PORTID && sp->flow) {
+		ret = rte_flow_destroy(port_id, sp->flow, &error);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s: Policy flow destroy failed(%s)\n",
+				__func__, error.message);
+		}
+	}
+
+	pre_ld_deconfigure_sec_path(sp);
+	if (sp->sa)
+		sp->sa->sp = NULL;
+	rte_free(sp);
+
+	if (pending && !pending->flow)
+		xfm_sp_flow_hw_create(pending);
+
+	return ret;
+}
+
 static struct pre_ld_ipsec_sa_entry *
 xfm_find_sa_by_addrs(const xfrm_address_t *src,
 	const xfrm_address_t *dst, uint16_t family)
@@ -454,6 +532,7 @@ xfm_find_sa_by_addrs(const xfrm_address_t *src,
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 	struct pre_ld_ipsec_sa_entry *curr = LIST_FIRST(&cntx->sa_list);
 	uint16_t size = 0;
+	struct pre_ld_ipsec_sa_entry *found = NULL;
 
 	if (family == AF_INET)
 		size = sizeof(rte_be32_t);
@@ -475,17 +554,25 @@ xfm_find_sa_by_addrs(const xfrm_address_t *src,
 			curr = LIST_NEXT(curr, next);
 			continue;
 		}
-		if (!src && dst && !memcmp(dst, &curr->dst, size))
-			return curr;
-		if (!dst && src && !memcmp(src, &curr->src, size))
-			return curr;
-		if (src && !memcmp(src, &curr->src, size) &&
-			dst && !memcmp(dst, &curr->dst, size))
-			return curr;
+		if ((!src && dst && !memcmp(dst, &curr->dst, size)) ||
+			(!dst && src && !memcmp(src, &curr->src, size)) ||
+			(src && !memcmp(src, &curr->src, size) &&
+			dst && !memcmp(dst, &curr->dst, size))) {
+			if ((found && found->created_cyc < curr->created_cyc) ||
+				!found)
+				found = curr;
+		}
 		curr = LIST_NEXT(curr, next);
 	}
 
-	return NULL;
+	if (found && found->sp) {
+		RTE_LOG(WARNING, pre_ld,
+			"%s: the SA found is associated to SP!\n",
+			__func__);
+		return NULL;
+	}
+
+	return found;
 }
 
 int
@@ -752,6 +839,8 @@ update_sa:
 
 	sa_entry->session.type = RTE_SECURITY_ACTION_TYPE_LOOKASIDE_PROTOCOL;
 
+	sa_entry->created_cyc = rte_get_timer_cycles();
+
 quit:
 	if (ret) {
 		if (new_sa)
@@ -770,6 +859,7 @@ quit:
 			curr = LIST_NEXT(curr, next);
 		LIST_INSERT_AFTER(curr, sa_entry, next);
 	}
+	sa_entry->sec_id = -1;
 
 	return 0;
 }
@@ -801,7 +891,8 @@ xfm_sa_entry_dir_config(struct pre_ld_ipsec_sa_entry *sa_entry,
 }
 
 static int
-process_notif_sa(const struct nlmsghdr *nh, int len, int update)
+process_notif_sa(const struct nlmsghdr *nh, int len,
+	int update)
 {
 	struct xfrm_usersa_info *sa_info;
 	struct xfm_ipsec_sa_params sa_params;
@@ -834,31 +925,51 @@ process_notif_sa(const struct nlmsghdr *nh, int len, int update)
 	}
 
 	ret = xfm_to_sa_entry(&sa_params, sa_info, update);
+	/** We can't apply SA to HW now until SA is associated to SP
+	 * to get direction.
+	 */
 
 	return ret;
 }
 
-static void
-xfm_del_sa_from_sp_list(struct pre_ld_ipsec_sa_entry *del,
-	struct pre_ld_ipsec_sp_entry *sp_head)
+static int
+process_del_sa_entry(struct pre_ld_ipsec_sa_entry *sa)
 {
-	struct pre_ld_ipsec_sp_entry *curr = sp_head;
+	int ret = 0;
+	void *ctx;
 
-	while (curr) {
-		if (curr->sa == del)
-			curr->sa = NULL;
-		curr = LIST_NEXT(curr, next);
+	LIST_REMOVE(sa, next);
+	if (sa->sec_id >= 0) {
+		ctx = rte_cryptodev_get_sec_ctx(sa->sec_id);
+		ret = rte_security_session_destroy(ctx,
+				sa->session.security.ses);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s: destroy session failed(%d)\n",
+				__func__, ret);
+		}
 	}
+	RTE_LOG(INFO, pre_ld,
+		"Delete SA %s spi(%08x), lifetime(%.2f s)\n",
+		sa->sess_conf.ipsec.direction ==
+		RTE_SECURITY_IPSEC_SA_DIR_INGRESS ?
+		"IN" : "OUT", sa->sess_conf.ipsec.spi,
+		(rte_get_timer_cycles() - sa->created_cyc) /
+		(s_xfm_cycs_per_us * 1000 * 1000));
+	rte_free(sa);
+
+	return ret;
 }
 
 static int process_del_sa(const struct nlmsghdr *nh)
 {
 	struct xfrm_usersa_id *usersa_id;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
-	struct pre_ld_ipsec_sa_entry *curr, *del = NULL;
+	struct pre_ld_ipsec_sa_entry *curr;
 	uint8_t addr[16];
 	char addr_info[128];
 	uint16_t info_offset = 0, size = 0;
+	uint32_t cpu_spi;
 
 	usersa_id = NLMSG_DATA(nh);
 
@@ -867,33 +978,23 @@ static int process_del_sa(const struct nlmsghdr *nh)
 	else if (usersa_id->family == AF_INET6)
 		size = 16;
 
-	RTE_LOG(INFO, pre_ld,
-		"XFRM delete spi(0x%08x)\n",
-		rte_be_to_cpu_32(usersa_id->spi));
+	cpu_spi = rte_be_to_cpu_32(usersa_id->spi);
 
 	curr = LIST_FIRST(&cntx->sa_list);
 
 	while (curr) {
 		if (usersa_id->family == curr->family &&
-			!memcmp(&usersa_id->daddr, &curr->dst, size)) {
-			del = curr;
+			!memcmp(&usersa_id->daddr, &curr->dst, size) &&
+			cpu_spi == curr->sess_conf.ipsec.spi)
 			break;
-		}
+
 		curr = LIST_NEXT(curr, next);
 	}
 
-	if (del) {
-		xfm_del_sa_from_sp_list(del,
-			LIST_FIRST(&cntx->sp_ipv4_in_list));
-		xfm_del_sa_from_sp_list(del,
-			LIST_FIRST(&cntx->sp_ipv6_in_list));
-		xfm_del_sa_from_sp_list(del,
-			LIST_FIRST(&cntx->sp_ipv4_out_list));
-		xfm_del_sa_from_sp_list(del,
-			LIST_FIRST(&cntx->sp_ipv6_out_list));
-		LIST_REMOVE(del, next);
-		rte_free(del);
-		return 0;
+	if (curr) {
+		if (curr->sp)
+			process_del_policy_entry(curr->sp);
+		return process_del_sa_entry(curr);
 	}
 
 	rte_memcpy(addr, &usersa_id->daddr, size);
@@ -952,175 +1053,72 @@ dump_new_policy(const struct xfrm_userpolicy_info *pol_info)
 }
 
 static int
-xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp,
-	int parse_spi, uint16_t rx_port, uint16_t tc, uint16_t tc_idx,
-	uint16_t *flow_index, uint16_t tx_port, void *sa)
+xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp)
 {
-	struct rte_flow_attr flow_attr;
-	struct rte_flow_item flow_item[3];
-	struct rte_flow_action flow_action[2];
-	struct rte_flow_item_ipv4 spec_ip4, mask_ip4;
-	struct rte_flow_item_ipv6 spec_ip6, mask_ip6;
-	struct rte_flow_item_esp spec_esp, mask_esp;
-	struct rte_flow_action_queue ingress_queue;
-	struct rte_flow_error error;
-	void *flow;
-
-	memset(&flow_attr, 0, sizeof(struct rte_flow_attr));
-	memset(flow_item, 0, 3 * sizeof(struct rte_flow_item));
-	memset(flow_action, 0, 2 * sizeof(struct rte_flow_action));
-	memset(&spec_ip4, 0, sizeof(struct rte_flow_item_ipv4));
-	memset(&mask_ip4, 0, sizeof(struct rte_flow_item_ipv4));
-	memset(&spec_ip6, 0, sizeof(struct rte_flow_item_ipv6));
-	memset(&mask_ip6, 0, sizeof(struct rte_flow_item_ipv6));
-	memset(&spec_esp, 0, sizeof(struct rte_flow_item_esp));
-	memset(&mask_esp, 0, sizeof(struct rte_flow_item_esp));
-	memset(&error, 0, sizeof(struct rte_flow_error));
-
-	flow_attr.group = tc;
-	flow_attr.priority = tc_idx;
-	flow_attr.ingress = 1;
+	struct pre_ld_ipsec_sp_entry *same;
+	int ret;
 
 	if (sp->family == AF_INET) {
-		flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV4;
-		rte_memcpy(&spec_ip4.hdr.src_addr, &sp->src,
+		sp->flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV4;
+		rte_memcpy(&sp->ipv4_spec.hdr.src_addr, &sp->src,
 			sizeof(rte_be32_t));
-		rte_memcpy(&spec_ip4.hdr.dst_addr, &sp->dst,
+		rte_memcpy(&sp->ipv4_spec.hdr.dst_addr, &sp->dst,
 			sizeof(rte_be32_t));
-		mask_ip4.hdr.src_addr = 0xffffffff;
-		mask_ip4.hdr.dst_addr = 0xffffffff;
-		flow_item[0].spec = &spec_ip4;
-		flow_item[0].mask = &mask_ip4;
+		sp->ipv4_mask.hdr.src_addr = 0xffffffff;
+		sp->ipv4_mask.hdr.dst_addr = 0xffffffff;
+		sp->flow_item[0].spec = &sp->ipv4_spec;
+		sp->flow_item[0].mask = &sp->ipv4_mask;
 	} else if (sp->family == AF_INET6) {
-		flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV6;
-		rte_memcpy(spec_ip6.hdr.src_addr, &sp->src, 16);
-		rte_memcpy(spec_ip6.hdr.dst_addr, &sp->dst, 16);
-		memset(mask_ip6.hdr.src_addr, 0xff, 16);
-		memset(mask_ip6.hdr.dst_addr, 0xff, 16);
-		flow_item[0].spec = &spec_ip6;
-		flow_item[0].mask = &mask_ip6;
+		sp->flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV6;
+		rte_memcpy(sp->ipv6_spec.hdr.src_addr, &sp->src, 16);
+		rte_memcpy(sp->ipv6_spec.hdr.dst_addr, &sp->dst, 16);
+		memset(sp->ipv6_mask.hdr.src_addr, 0xff, 16);
+		memset(sp->ipv6_mask.hdr.dst_addr, 0xff, 16);
+		sp->flow_item[0].spec = &sp->ipv6_spec;
+		sp->flow_item[0].mask = &sp->ipv6_mask;
 	} else {
 		RTE_LOG(ERR, pre_ld,
 			"%s: Invalid IP family(%d)\n", __func__, sp->family);
 		return -EINVAL;
 	}
 
-	if (parse_spi) {
-		flow_item[1].type = RTE_FLOW_ITEM_TYPE_ESP;
-		spec_esp.hdr.spi = sp->spi;
-		mask_esp.hdr.spi = 0xffffffff;
-		flow_item[1].spec = &spec_esp;
-		flow_item[1].mask = &mask_esp;
-		flow_item[2].type = RTE_FLOW_ITEM_TYPE_END;
+	if (sp->dir == XFRM_POLICY_IN) {
+		sp->flow_item[1].type = RTE_FLOW_ITEM_TYPE_ESP;
+		sp->esp_spec.hdr.spi = sp->spi;
+		sp->esp_mask.hdr.spi = 0xffffffff;
+		sp->flow_item[1].spec = &sp->esp_spec;
+		sp->flow_item[1].mask = &sp->esp_mask;
+		sp->flow_item[2].type = RTE_FLOW_ITEM_TYPE_END;
 	} else {
-		flow_item[1].type = RTE_FLOW_ITEM_TYPE_END;
+		sp->flow_item[1].type = RTE_FLOW_ITEM_TYPE_END;
 	}
 
-	memset(&ingress_queue, 0, sizeof(struct rte_flow_action_queue));
-	ingress_queue.index = *flow_index;
-	flow_action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
-	flow_action[0].conf = &ingress_queue;
-	flow_action[1].type = RTE_FLOW_ACTION_TYPE_END;
+	sp->action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+	sp->action[0].conf = &sp->ingress_queue;
+	sp->action[1].type = RTE_FLOW_ACTION_TYPE_END;
 
-	flow = rte_flow_create(rx_port, &flow_attr,
-		flow_item, flow_action, &error);
-	if (flow) {
-		RTE_LOG(INFO, pre_ld,
-			"%s: Policy flow (index=%d) create successfully\n",
-			__func__, *flow_index);
-		rte_memcpy(&sp->action, flow_action,
-			sizeof(struct rte_flow_action));
-		rte_memcpy(&sp->attr, &flow_attr,
-			sizeof(struct rte_flow_attr));
-		if (sp->family == AF_INET) {
-			rte_memcpy(&sp->ipv4_spec, &spec_ip4,
-				sizeof(struct rte_flow_item_ipv4));
-		} else {
-			rte_memcpy(&sp->ipv6_spec, &spec_ip6,
-				sizeof(struct rte_flow_item_ipv6));
-		}
-		if (parse_spi) {
-			rte_memcpy(&sp->esp_spec, &spec_esp,
-				sizeof(struct rte_flow_item_esp));
-		}
-		sp->flow = flow;
-		sp->flow_idx = flow_index;
-		sp->port_idx = rx_port;
-
-		pre_ld_configure_sec_path(rx_port, *flow_index,
-			sp->dir, tx_port, sa);
-
-		RTE_LOG(ERR, pre_ld,
-			"%s: Steer %s flow from port%d flow%d to port%d\n",
-			__func__, parse_spi ? "Ingress" : "Egress",
-			rx_port, *flow_index, tx_port);
-		return 0;
-	}
-
-	RTE_LOG(ERR, pre_ld,
-		"%s: Policy flow (index=%d) create failed(%s)\n", __func__,
-		*flow_index, error.message);
-
-	return -EIO;
-}
-
-static int
-xfm_del_sp_in_flow(struct pre_ld_ipsec_sp_entry *sp)
-{
-	int ret;
-	struct rte_flow_error err;
-
-	if (!sp->flow)
-		return 0;
-	if (sp->port_idx != INVALID_PORTID && sp->flow) {
-		ret = rte_flow_destroy(sp->port_idx, sp->flow, &err);
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: Policy flow (index=%d) destroy failed(%s)\n",
-				__func__, *sp->flow_idx, err.message);
-			return ret;
-		}
-	}
-	sp->port_idx = INVALID_PORTID;
 	sp->flow = NULL;
 
-	ret = rte_ring_enqueue(sp->flow_idx_ring, sp->flow_idx);
-	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Free flow index(%d) to %s failed(%d)\n",
-			__func__, *sp->flow_idx,
-			sp->flow_idx_ring->name, ret);
-	}
-	sp->flow_idx_ring = NULL;
-	sp->flow_idx = NULL;
+	ret = pre_ld_configure_sec_path(sp);
+	if (ret)
+		return ret;
 
-	return ret;
+	same = xfm_sp_find_same_attr(sp);
+
+	if (same) {
+		RTE_LOG(INFO, pre_ld,
+			"Same policy(%s) exists, postpone applying policy to HW\n",
+			same->dir == XFRM_POLICY_IN ? "IN" : "OUT");
+
+		return 0;
+	}
+
+	return xfm_sp_flow_hw_create(sp);
 }
 
 static int
-xfm_policy_hw_offload(struct pre_ld_ipsec_sp_entry *sp,
-	uint16_t rx_port, uint16_t *flow_idx, uint16_t tx_port,
-	void *sa)
-{
-	int ret, parse_spi;
-	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
-
-	parse_spi = sp->dir == XFRM_POLICY_IN ? 1 : 0;
-	ret = xfm_steer_sp_flow(sp, parse_spi, rx_port, 0, *flow_idx, flow_idx,
-		tx_port, sa);
-	if (!ret) {
-		if (sp->dir == XFRM_POLICY_IN)
-			cntx->sp_in = sp;
-		else
-			cntx->sp_out = sp;
-	}
-
-	return ret;
-}
-
-static int
-xfm_create_session_by_sa(struct xfm_mem_ctx *mem_ctx,
-	struct pre_ld_ipsec_sa_entry *sa, uint8_t dev_id)
+xfm_create_session_by_sa(struct pre_ld_ipsec_sa_entry *sa,
+	uint8_t dev_id, struct rte_mempool *mp)
 {
 	struct rte_security_ctx *ctx;
 	struct rte_ipsec_session *ips = &sa->session;
@@ -1131,11 +1129,12 @@ xfm_create_session_by_sa(struct xfm_mem_ctx *mem_ctx,
 	ctx = rte_cryptodev_get_sec_ctx(dev_id);
 
 	ips->security.ses = rte_security_session_create(ctx,
-		&sa->sess_conf, mem_ctx->session_priv_pool);
+		&sa->sess_conf, mp);
 	if (!ips->security.ses) {
 		RTE_LOG(ERR, pre_ld, "Lookaside Session init failed\n");
 		return -EINVAL;
 	}
+	sa->sec_id = dev_id;
 
 	return 0;
 }
@@ -1143,65 +1142,32 @@ xfm_create_session_by_sa(struct xfm_mem_ctx *mem_ctx,
 static int
 xfm_apply_sa(struct pre_ld_ipsec_sa_entry *sa,
 	const struct xfrm_userpolicy_info *pol_info,
-	uint8_t sec_dev_id)
+	uint8_t sec_dev_id, struct rte_mempool *mp)
 {
 	xfm_sa_entry_dir_config(sa,
 		pol_info->dir == XFRM_POLICY_IN ? 1 : 0);
-	return xfm_create_session_by_sa(&s_xfm_mem_ctx, sa, sec_dev_id);
+	return xfm_create_session_by_sa(sa, sec_dev_id, mp);
 }
 
-static void
+static int
 xfm_sa_sp_associate(struct pre_ld_ipsec_sp_entry *sp,
-	struct pre_ld_ipsec_sa_entry *sa, uint8_t dir,
-	uint16_t rx_ports[], uint16_t tx_ports[],
-	struct rte_ring *sp_rxq_rings[])
+	struct pre_ld_ipsec_sa_entry *sa, uint8_t dir)
 {
 	int ret;
-	uint16_t *sp_rxq_id = NULL;
-	uint16_t rx_port_id, tx_port_id;
-	struct rte_ring *r;
 
 	sp->dir = dir;
 	sp->spi = rte_cpu_to_be_32(sa->sess_conf.ipsec.spi);
-	sp->sa = sa;
 
-	if (dir == XFRM_POLICY_IN) {
-		rx_port_id = rx_ports[XFM_POLICY_IN_ETH_IDX];
-		tx_port_id = tx_ports[XFM_POLICY_IN_ETH_IDX];
-		r = sp_rxq_rings[XFM_POLICY_IN_ETH_IDX];
-	} else if (dir == XFRM_POLICY_OUT) {
-		rx_port_id = rx_ports[XFM_POLICY_OUT_ETH_IDX];
-		tx_port_id = tx_ports[XFM_POLICY_OUT_ETH_IDX];
-		r = sp_rxq_rings[XFM_POLICY_OUT_ETH_IDX];
-	} else {
-		return;
-	}
-
-	if (rx_port_id == INVALID_PORTID)
-		return;
-	ret = rte_ring_dequeue(r, (void **)&sp_rxq_id);
+	ret = xfm_steer_sp_flow(sp);
 	if (ret) {
 		RTE_LOG(ERR, pre_ld,
-			"No SP RXQ from ring(%s)\n", r->name);
-
-		return;
-	}
-
-	ret = xfm_policy_hw_offload(sp, rx_port_id, sp_rxq_id,
-		tx_port_id, sa);
-	if (ret) {
-		RTE_LOG(WARNING, pre_ld,
-			"Policy in HW offload failed(%d)\n", ret);
-		ret = rte_ring_enqueue(r, sp_rxq_id);
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: Free flow index(%d) to %s failed(%d)\n",
-				__func__, *sp_rxq_id,
-				r->name, ret);
-		}
+			"Steer policy by HW failed(%d)\n", ret);
 	} else {
-		sp->flow_idx_ring = r;
+		sp->sa = sa;
+		sa->sp = sp;
 	}
+
+	return ret;
 }
 
 static void
@@ -1276,12 +1242,12 @@ xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 			curr = LIST_NEXT(curr, next);
 		LIST_INSERT_AFTER(curr, sp, next);
 	}
+	sp->head = head;
 }
 
 static int
 process_new_policy(const struct nlmsghdr *nh,
-	uint16_t sec_id, uint16_t rx_ports[], uint16_t tx_ports[],
-	struct rte_ring *sp_rxq_rings[])
+	uint8_t sec_id, struct rte_mempool *mp)
 {
 	struct xfrm_userpolicy_info *pol_info;
 	int ret = 0, af, offset = 0;
@@ -1292,15 +1258,15 @@ process_new_policy(const struct nlmsghdr *nh,
 
 	pol_info = NLMSG_DATA(nh);
 
-	dump_new_policy(pol_info);
-
 	if (pol_info->dir != XFRM_POLICY_IN &&
 		pol_info->dir != XFRM_POLICY_OUT) {
-		RTE_LOG(INFO, pre_ld,
+		RTE_LOG(DEBUG, pre_ld,
 			"Don't configure policy (dir=%d)\n",
 			pol_info->dir);
 		return 0;
 	}
+
+	dump_new_policy(pol_info);
 
 	ret = do_spdget(pol_info->index, &saddr, &daddr, &af);
 	if (ret) {
@@ -1309,12 +1275,7 @@ process_new_policy(const struct nlmsghdr *nh,
 			ret);
 		return ret;
 	}
-	sa = xfm_find_sa_by_addrs(&saddr, &daddr, af);
-	if (!sa) {
-		/** TO DO: Add SP to pending list.*/
-		RTE_LOG(ERR, pre_ld, "No SA found\n");
-		return -ENOTSUP;
-	}
+
 	if (af == AF_INET) {
 		uint8_t *src4, *dst4;
 
@@ -1322,7 +1283,7 @@ process_new_policy(const struct nlmsghdr *nh,
 		dst4 = (void *)&daddr;
 		offset = sprintf(addr_info, "src(%d.%d.%d.%d)/",
 			src4[0], src4[1], src4[2], src4[3]);
-		offset = sprintf(&addr_info[offset],
+		offset += sprintf(&addr_info[offset],
 			"dst(%d.%d.%d.%d)",
 			dst4[0], dst4[1], dst4[2], dst4[3]);
 	} else if (af == AF_INET6) {
@@ -1334,14 +1295,25 @@ process_new_policy(const struct nlmsghdr *nh,
 			"src(%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x)/",
 			src6[0], src6[1], src6[2], src6[3],
 			src6[4], src6[5], src6[6], src6[7]);
-		offset = sprintf(&addr_info[offset],
+		offset += sprintf(&addr_info[offset],
 			"dst(%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x)",
 			dst6[0], dst6[1], dst6[2], dst6[3],
 			dst6[4], dst6[5], dst6[6], dst6[7]);
+	} else {
+		RTE_LOG(ERR, pre_ld, "Invalid AF(%d) got by SPD\n", af);
+		return -EINVAL;
 	}
 
-	if (offset > 0)
-		RTE_LOG(INFO, pre_ld, "Found SA by %s\n", addr_info);
+	sa = xfm_find_sa_by_addrs(&saddr, &daddr, af);
+	if (!sa) {
+		/** TO DO: Add SP to pending list.*/
+		RTE_LOG(ERR, pre_ld, "No SA found by %s\n", addr_info);
+		return -ENOTSUP;
+	}
+
+	sprintf(&addr_info[offset], "/spi(%08x)",
+		sa->sess_conf.ipsec.spi);
+	RTE_LOG(INFO, pre_ld, "Found SA: %s\n", addr_info);
 
 	sp = rte_zmalloc(NULL, sizeof(struct pre_ld_ipsec_sp_entry),
 		RTE_CACHE_LINE_SIZE);
@@ -1361,9 +1333,11 @@ process_new_policy(const struct nlmsghdr *nh,
 	rte_memcpy(&sp->sel_dst, &pol_info->sel.daddr,
 		sizeof(xfrm_address_t));
 
+	sp->crypt_id = sec_id;
+
 	ret = 0;
 	if (!sa->session.security.ses) {
-		ret = xfm_apply_sa(sa, pol_info, sec_id);
+		ret = xfm_apply_sa(sa, pol_info, sec_id, mp);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"Create session failed(%d)\n", ret);
@@ -1375,8 +1349,13 @@ process_new_policy(const struct nlmsghdr *nh,
 	}
 
 	if (!ret) {
-		xfm_sa_sp_associate(sp, sa, pol_info->dir,
-			rx_ports, tx_ports, sp_rxq_rings);
+		ret = xfm_sa_sp_associate(sp, sa, pol_info->dir);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"SA/SP associate failed!\n");
+
+			return ret;
+		}
 		if (s_kernel_sp_sa_clear) {
 			ret = do_spddel(pol_info->index);
 			if (ret) {
@@ -1412,7 +1391,6 @@ static int process_del_policy(const struct nlmsghdr *nh)
 	struct pre_ld_ipsec_sp_entry *curr;
 	void *src, *dst;
 	uint64_t size, offset = 0;
-	int ret;
 	char addr_info[256], src_info[16], dst_info[16];
 
 	pol_id = NLMSG_DATA(nh);
@@ -1460,17 +1438,8 @@ static int process_del_policy(const struct nlmsghdr *nh)
 		curr = LIST_NEXT(curr, next);
 	}
 
-	if (curr) {
-		cntx->sp_in = NULL;
-		LIST_REMOVE(curr, next);
-		ret = xfm_del_sp_in_flow(curr);
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM del in policy: remove HW flow failed(%d)\n",
-				ret);
-		}
-		return 0;
-	}
+	if (curr)
+		return process_del_policy_entry(curr);
 
 	rte_memcpy(src_info, &pol_id->sel.saddr, size);
 	rte_memcpy(dst_info, &pol_id->sel.daddr, size);
@@ -1514,10 +1483,16 @@ static int process_flush_policy(void)
 
 static int
 resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
-	uint16_t sec_id, uint16_t rx_ports[], uint16_t tx_ports[],
-	struct rte_ring *sp_rxq_rings[])
+	uint16_t sec_id, struct rte_mempool *mp)
 {
 	int ret = 0;
+	struct xfrm_usersa_info *xsinfo = NULL;
+	struct xfrm_user_expire *xexp = NULL;
+	struct xfrm_userpolicy_info	*xpol = NULL;
+	struct xfrm_user_polexpire *xpexp = NULL;
+	uint8_t *src, *dst;
+	uint16_t *src16, *dst16;
+	char src_addr[128], dst_addr[128];
 
 	switch (nh->nlmsg_type) {
 	case XFRM_MSG_UPDSA:
@@ -1562,8 +1537,7 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		break;
 	case XFRM_MSG_UPDPOLICY:
 		RTE_LOG(INFO, pre_ld, "XFRM update policy start\n");
-		ret = process_new_policy(nh, sec_id, rx_ports, tx_ports,
-			sp_rxq_rings);
+		ret = process_new_policy(nh, sec_id, mp);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM update policy failed(%d)\n\n", ret);
@@ -1573,8 +1547,7 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		break;
 	case XFRM_MSG_NEWPOLICY:
 		RTE_LOG(INFO, pre_ld, "XFRM new policy start\n");
-		ret = process_new_policy(nh, sec_id, rx_ports, tx_ports,
-			sp_rxq_rings);
+		ret = process_new_policy(nh, sec_id, mp);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM new policy failed(%d)\n\n", ret);
@@ -1603,14 +1576,36 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		}
 		break;
 	case XFRM_MSG_POLEXPIRE:
-		RTE_LOG(INFO, pre_ld, "XFRM policy expire start\n");
-		ret = 0;
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM policy expire failed(%d)\n\n", ret);
+		xpexp = NLMSG_DATA(nh);
+		xpol = &xpexp->pol;
+		if (xpol->sel.family == AF_INET) {
+			src = (void *)&xpol->sel.saddr;
+			dst = (void *)&xpol->sel.daddr;
+			sprintf(src_addr, "%d.%d.%d.%d",
+				src[0], src[1], src[2], src[3]);
+			sprintf(dst_addr, "%d.%d.%d.%d",
+				dst[0], dst[1], dst[2], dst[3]);
+		} else if (xpol->sel.family == AF_INET6) {
+			src16 = (void *)&xpol->sel.saddr;
+			dst16 = (void *)&xpol->sel.daddr;
+			sprintf(src_addr,
+				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+				src16[0], src16[1], src16[2], src16[3],
+				src16[4], src16[5], src16[6], src16[7]);
+			sprintf(dst_addr,
+				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+				dst16[0], dst16[1], dst16[2], dst16[3],
+				dst16[4], dst16[5], dst16[6], dst16[7]);
 		} else {
-			RTE_LOG(INFO, pre_ld, "XFRM policy expire done\n\n");
+			sprintf(src_addr, "Invalid family(%d)",
+				xpol->sel.family);
+			sprintf(dst_addr, "Invalid family(%d)",
+				xpol->sel.family);
 		}
+		RTE_LOG(INFO, pre_ld,
+			"XFRM %s SP(src=%s/dst=%s) expire\n",
+			xpol->dir == XFRM_POLICY_IN ? "in" : "out",
+			src_addr, dst_addr);
 		break;
 	case XFRM_MSG_FLUSHPOLICY:
 		RTE_LOG(INFO, pre_ld, "XFRM flush policy start\n");
@@ -1622,6 +1617,35 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 			RTE_LOG(INFO, pre_ld, "XFRM flush policy done\n\n");
 		}
 		break;
+	case XFRM_MSG_EXPIRE:
+		xexp = NLMSG_DATA(nh);
+		xsinfo = &xexp->state;
+		if (xsinfo->family == AF_INET) {
+			src = (void *)&xsinfo->saddr;
+			dst = (void *)&xsinfo->id.daddr;
+			sprintf(src_addr, "%d.%d.%d.%d",
+				src[0], src[1], src[2], src[3]);
+			sprintf(dst_addr, "%d.%d.%d.%d",
+				dst[0], dst[1], dst[2], dst[3]);
+		} else if (xsinfo->family == AF_INET6) {
+			src16 = (void *)&xsinfo->saddr;
+			dst16 = (void *)&xsinfo->id.daddr;
+			sprintf(src_addr,
+				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+				src16[0], src16[1], src16[2], src16[3],
+				src16[4], src16[5], src16[6], src16[7]);
+			sprintf(dst_addr,
+				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+				dst16[0], dst16[1], dst16[2], dst16[3],
+				dst16[4], dst16[5], dst16[6], dst16[7]);
+		} else {
+			sprintf(src_addr, "Invalid family(%d)", xsinfo->family);
+			sprintf(dst_addr, "Invalid family(%d)", xsinfo->family);
+		}
+		RTE_LOG(INFO, pre_ld,
+			"XFRM SA(src=%s/dst=%s/spi=0x%08x) expire\n",
+			src_addr, dst_addr, rte_be_to_cpu_32(xsinfo->id.spi));
+		break;
 	default:
 		RTE_LOG(INFO, pre_ld,
 			"\nXFRM msg type(%d) not support\n\n",
@@ -1630,6 +1654,20 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 	}
 
 	return ret;
+}
+
+static void
+xfm_calculate_cycles_per_us(void)
+{
+	uint64_t start_cycles, end_cycles;
+
+	start_cycles = rte_get_timer_cycles();
+	rte_delay_ms(1000);
+	end_cycles = rte_get_timer_cycles();
+	s_xfm_cycs_per_us = (end_cycles - start_cycles) / (1000 * 1000);
+	RTE_LOG(INFO, pre_ld,
+		"Cycles per us is: %ld\n",
+		(unsigned long)s_xfm_cycs_per_us);
 }
 
 static void *xfrm_msg_loop(void *data)
@@ -1643,8 +1681,9 @@ static void *xfrm_msg_loop(void *data)
 	struct msghdr msg;
 	struct nlmsghdr *nh;
 	cpu_set_t cpuset;
-	struct xfm_msg_param *param = data;
-	uint16_t sec_id = param->sec_id;
+	const struct pre_ld_crypt_param *param = data;
+	uint8_t sec_id = param->crypt_dev;
+	struct rte_mempool *mp = param->sess_priv_pool;
 
 	/* Set this cpu-affinity to CPU 0 */
 	CPU_ZERO(&cpuset);
@@ -1677,6 +1716,8 @@ static void *xfrm_msg_loop(void *data)
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
 
+	xfm_calculate_cycles_per_us();
+
 	/* XFRM notification loop */
 	while (1) {
 		len = recvmsg(xfrm_sd, &msg, 0);
@@ -1704,8 +1745,7 @@ static void *xfrm_msg_loop(void *data)
 				break;
 			}
 
-			ret = resolve_xfrm_notif(nh, len, sec_id, param->rx_ports,
-				param->tx_ports, param->sp_rxq_ring);
+			ret = resolve_xfrm_notif(nh, len, sec_id, mp);
 			if (ret && ret != -EBADMSG)
 				break;
 		}
@@ -1717,136 +1757,17 @@ static void *xfrm_msg_loop(void *data)
 	return data;
 }
 
-static int
-xfm_cryptodev_init(uint8_t crypt_dev, uint16_t qp_nb)
-{
-	struct rte_cryptodev_config dev_conf;
-	struct rte_cryptodev_qp_conf qp_conf;
-	uint16_t qp;
-	struct rte_cryptodev_info cdev_info;
-
-	rte_cryptodev_info_get(crypt_dev, &cdev_info);
-
-	dev_conf.socket_id = 0;
-	dev_conf.nb_queue_pairs = qp_nb;
-	dev_conf.ff_disable = RTE_CRYPTODEV_FF_ASYMMETRIC_CRYPTO;
-
-	if (rte_cryptodev_configure(crypt_dev, &dev_conf)) {
-		rte_panic("Failed to initialize cryptodev %u\n",
-			crypt_dev);
-	}
-
-	qp_conf.nb_descriptors = CRYPT_DEV_QUEUE_DESC;
-	qp_conf.mp_session = s_xfm_mem_ctx.session_pool;
-	for (qp = 0; qp < dev_conf.nb_queue_pairs; qp++)
-		if (rte_cryptodev_queue_pair_setup(crypt_dev, qp,
-				&qp_conf, dev_conf.socket_id)) {
-			rte_exit(EXIT_FAILURE,
-				"Failed to setup pq%u for cryptodev %d\n",
-				qp, crypt_dev);
-		}
-
-	if (rte_cryptodev_start(crypt_dev)) {
-		rte_exit(EXIT_FAILURE,
-			"Failed to start cryptodev %u\n",
-			crypt_dev);
-	}
-
-	return 0;
-}
-
-static int
-xfm_session_pool_create(uint8_t crypt_dev,
-	struct rte_mempool *mbuf_pool)
-{
-	size_t max_sz, sz;
-	void *sec_ctx;
-	char mp_name[RTE_MEMPOOL_NAMESIZE];
-	struct rte_mempool *sess_mp;
-
-	max_sz = 0;
-	sz = rte_cryptodev_sym_get_private_session_size(crypt_dev);
-	if (sz > max_sz)
-		max_sz = sz;
-
-	/* Get security context of the crypto device */
-	sec_ctx = rte_cryptodev_get_sec_ctx(crypt_dev);
-	if (sec_ctx) {
-		/* Get size of security session */
-		sz = rte_security_session_get_size(sec_ctx);
-		if (sz > max_sz)
-			max_sz = sz;
-	}
-
-	s_xfm_mem_ctx.session_pool = mbuf_pool;
-	if (!s_xfm_mem_ctx.session_pool)
-		rte_exit(EXIT_FAILURE, "Cannot init session pool\n");
-
-	snprintf(mp_name, RTE_MEMPOOL_NAMESIZE, "sess_mp_priv");
-	sess_mp = rte_mempool_create(mp_name, SESS_MP_NB_OBJS,
-			max_sz, SESS_MP_CACHE_SZ, 0, NULL, NULL, NULL,
-			NULL, 0, 0);
-	s_xfm_mem_ctx.session_priv_pool = sess_mp;
-	if (!s_xfm_mem_ctx.session_priv_pool)
-		rte_exit(EXIT_FAILURE, "Cannot init session priv pool\n");
-
-	return 0;
-}
-
-static int
-xfrm_setup_msgloop(uint16_t sec_id, uint16_t rx_ports[],
-	uint16_t tx_ports[], struct rte_ring *sp_rxq_ring[])
+int
+xfrm_setup_msgloop(void *param)
 {
 	int ret;
 	pthread_t tid;
 
-	s_msg_param.sec_id = sec_id;
-	rte_memcpy(s_msg_param.rx_ports, rx_ports,
-		sizeof(uint16_t) * XFM_POLICY_ETH_NUM);
-	rte_memcpy(s_msg_param.tx_ports, tx_ports,
-		sizeof(uint16_t) * XFM_POLICY_ETH_NUM);
-	rte_memcpy(s_msg_param.sp_rxq_ring, sp_rxq_ring,
-		sizeof(struct rte_ring *) * XFM_POLICY_ETH_NUM);
-
-	ret = pthread_create(&tid, NULL, xfrm_msg_loop, &s_msg_param);
+	ret = pthread_create(&tid, NULL, xfrm_msg_loop, param);
 	if (ret) {
 		RTE_LOG(ERR, pre_ld,
 			"XFRM message thread create failed(%d)\n",
 			ret);
 	}
 	return ret;
-}
-
-int
-xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
-	uint16_t rx_ports[], uint16_t tx_ports[],
-	struct rte_ring *sp_ring[],
-	struct rte_mempool *mbuf_pool)
-{
-	int ret;
-
-	ret = xfm_session_pool_create(crypt_dev, mbuf_pool);
-	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Crypto session pool create failed(%d)\n",
-			ret);
-
-		return ret;
-	}
-	ret = xfm_cryptodev_init(crypt_dev, qp_nb);
-	if (ret) {
-		RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
-
-		return ret;
-	}
-	ret = xfrm_setup_msgloop(crypt_dev, rx_ports, tx_ports, sp_ring);
-	if (ret) {
-		RTE_LOG(ERR, pre_ld, "IPSec msg setup failed(%d)\n", ret);
-
-		return ret;
-	}
-
-	RTE_LOG(INFO, pre_ld, "Crypto init successfully\n");
-
-	return 0;
 }

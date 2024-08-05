@@ -52,8 +52,6 @@
 #include <rte_ipsec.h>
 #include <rte_flow.h>
 
-#include "netwrap.h"
-
 #ifndef bool
 #define bool int
 #endif
@@ -95,71 +93,6 @@ enum pre_ld_ipsec_sa_flag {
 	IP6_TRANSPORT = (1 << 4)
 };
 
-struct pre_ld_ipsec_sa_entry {
-	LIST_ENTRY(pre_ld_ipsec_sa_entry) next;
-	struct rte_ipsec_session session;
-	uint64_t seq;
-	enum pre_ld_ipsec_sa_flag sa_flags;
-	uint16_t family;
-	xfrm_address_t src;
-	xfrm_address_t dst;
-	uint8_t cipher_key[MAX_SEC_KEY_SIZE];
-	uint16_t cipher_key_len;
-	uint8_t auth_key[MAX_SEC_KEY_SIZE];
-	uint16_t auth_key_len;
-	uint16_t portid;
-
-	struct rte_crypto_sym_xform auth_xform;
-	struct rte_crypto_sym_xform ciph_xform;
-	struct rte_security_session_conf sess_conf;
-};
-
-struct pre_ld_ipsec_sp_entry {
-	LIST_ENTRY(pre_ld_ipsec_sp_entry) next;
-	xfrm_address_t src;
-	xfrm_address_t dst;
-	xfrm_address_t sel_src;
-	xfrm_address_t sel_dst;
-	rte_be32_t spi;
-	uint16_t family;
-	uint32_t priority;
-	uint32_t index;
-	uint8_t dir;
-
-	struct rte_flow_action action;
-	struct rte_flow_attr attr;
-	union {
-		struct rte_flow_item_ipv4 ipv4_spec;
-		struct rte_flow_item_ipv6 ipv6_spec;
-	};
-	struct rte_flow_item_esp esp_spec;
-	struct rte_flow *flow;
-	uint16_t *flow_idx;
-	struct rte_ring *flow_idx_ring;
-	uint16_t port_idx;
-
-	struct pre_ld_ipsec_sa_entry *sa;
-};
-
-struct pre_ld_ipsec_sa_head {
-	struct pre_ld_ipsec_sa_entry *lh_first;
-};
-
-struct pre_ld_ipsec_sp_head {
-	struct pre_ld_ipsec_sp_entry *lh_first;
-};
-
-struct pre_ld_ipsec_cntx {
-	struct pre_ld_ipsec_sa_head sa_list;
-	struct pre_ld_ipsec_sp_head sp_ipv4_in_list;
-	struct pre_ld_ipsec_sp_head sp_ipv6_in_list;
-	struct pre_ld_ipsec_sp_head sp_ipv4_out_list;
-	struct pre_ld_ipsec_sp_head sp_ipv6_out_list;
-
-	struct pre_ld_ipsec_sp_entry *sp_in;
-	struct pre_ld_ipsec_sp_entry *sp_out;
-};
-
 struct pre_ld_ipsec_priv {
 	struct pre_ld_ipsec_sa_entry *sa;
 	struct rte_crypto_op cop;
@@ -199,13 +132,10 @@ struct xfm_ipsec_sa_params {
 	struct xfrm_encap_tmpl encp;
 };
 
-int
-xfm_crypto_init(uint8_t crypt_dev, uint16_t qp_nb,
-	uint16_t rx_ports[], uint16_t tx_ports[],
-	struct rte_ring *sp_ring[],
-	struct rte_mempool *mbuf_pool);
-
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void);
+
+int
+xfrm_setup_msgloop(void *data);
 
 int
 xfm_find_sa_addrs_by_sp_addrs(const xfrm_address_t *src,

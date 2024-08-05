@@ -17,7 +17,7 @@
 #include <linux/pfkeyv2.h>
 
 #include <stdbool.h>
-#include "usr_sec.h"
+#include "netwrap.h"
 
 #define PFKEY_UNUNIT64(a) ((a) << 3)
 #define PFKEY_UNIT64(a) ((a) >> 3)
