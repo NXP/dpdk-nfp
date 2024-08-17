@@ -37,12 +37,15 @@
 struct pre_ld_port_desc {
 	uint16_t port_id;
 	uint16_t *queue_id;
+	void *flow;
 };
+
+struct pre_ld_sp_node;
 
 struct pre_ld_sec_desc {
 	uint16_t sec_id;
 	uint16_t *queue_id;
-	void *sp;
+	struct pre_ld_sp_node *sp_list;
 };
 
 enum pre_ld_dir_poll_type {
@@ -66,6 +69,8 @@ enum pre_ld_dir_dest_type {
 	DROP
 };
 
+#define INVALID_ESP_SPI 0
+
 union pre_ld_dir_dest {
 	uint16_t dest_port;
 	struct rte_ring *rx_ring;
@@ -81,8 +86,15 @@ struct pre_ld_dir_statistic {
 	};
 };
 
+enum pre_ld_dir_entry_state {
+	PRE_LD_DIR_ENTRY_RUNNING = 1,
+	PRE_LD_DIR_ENTRY_STOPPING = 2,
+	PRE_LD_DIR_ENTRY_STOPPED = 3
+};
+
 struct pre_ld_direct_entry {
 	TAILQ_ENTRY(pre_ld_direct_entry) next;
+	enum pre_ld_dir_entry_state state;
 	enum pre_ld_dir_poll_type poll_type;
 	union pre_ld_dir_poll poll;
 	enum pre_ld_dir_dest_type dest_type;
@@ -129,7 +141,6 @@ struct pre_ld_ipsec_sp_entry {
 	xfrm_address_t dst;
 	xfrm_address_t sel_src;
 	xfrm_address_t sel_dst;
-	rte_be32_t spi;
 	uint16_t family;
 	uint32_t priority;
 	uint32_t index;
@@ -158,6 +169,11 @@ struct pre_ld_ipsec_sp_entry {
 	struct pre_ld_ipsec_sp_head *head;
 };
 
+struct pre_ld_sp_node {
+	struct pre_ld_ipsec_sp_entry *sp;
+	struct pre_ld_sp_node *next;
+};
+
 struct pre_ld_ipsec_sa_head {
 	struct pre_ld_ipsec_sa_entry *lh_first;
 };
@@ -174,10 +190,17 @@ struct pre_ld_ipsec_cntx {
 	struct pre_ld_ipsec_sp_head sp_ipv6_out_list;
 };
 
+#define dcbf(p) { asm volatile("dc cvac, %0" : : "r"(p) : "memory"); }
+#define dccivac(p) { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
+
 int
 pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp);
 void
 pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp);
+int
+pre_ld_attach_sec_path(struct pre_ld_ipsec_sp_entry *sp);
+int
+pre_ld_detach_sec_path(struct pre_ld_ipsec_sp_entry *sp);
 
 extern void
 eal_lcore_non_eal_release(uint32_t lcore_id);

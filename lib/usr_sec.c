@@ -32,6 +32,7 @@
 #include <assert.h>
 #include <linux/rtnetlink.h>
 #include <sys/msg.h>
+#include <sys/queue.h>
 
 #include <rte_random.h>
 #include <rte_debug.h>
@@ -52,6 +53,7 @@
 #include <rte_log.h>
 #include <rte_thread.h>
 #include <rte_launch.h>
+#include <rte_tailq.h>
 
 #include "netwrap.h"
 
@@ -121,11 +123,23 @@ static const struct xfm_auth_support s_auth_xfm[] = {
 	},
 };
 
+static int s_ipsec_ib_flow_ip_addr_extract;
+
 static struct pre_ld_ipsec_cntx s_pre_ld_ipsec_cntx;
 
 static int s_kernel_sp_sa_clear;
 
 static double s_xfm_cycs_per_us;
+
+struct pre_ld_xfm_flow {
+	TAILQ_ENTRY(pre_ld_xfm_flow) next;
+	struct rte_flow *flow;
+	int flow_ref;
+};
+
+TAILQ_HEAD(pre_ld_xfm_flow_list, pre_ld_xfm_flow);
+static struct pre_ld_xfm_flow_list s_xfm_flow_list =
+	TAILQ_HEAD_INITIALIZER(s_xfm_flow_list);
 
 struct pre_ld_ipsec_cntx *xfm_get_cntx(void)
 {
@@ -427,36 +441,13 @@ static int nl_parse_attrs(struct nlattr *na, int len,
 	return 0;
 }
 
-static struct pre_ld_ipsec_sp_entry *
-xfm_sp_find_same_attr(struct pre_ld_ipsec_sp_entry *sp)
-{
-	struct pre_ld_ipsec_sp_head *head = sp->head;
-	struct pre_ld_ipsec_sp_entry *found = NULL;
-
-	found = LIST_FIRST(head);
-	while (found) {
-		if (found != sp &&
-			!memcmp(&sp->src, &found->src,
-				sizeof(xfrm_address_t)) &&
-			!memcmp(&sp->dst, &found->dst,
-				sizeof(xfrm_address_t))) {
-			if (sp->dir == XFRM_POLICY_OUT)
-				break;
-			else if (sp->dir == XFRM_POLICY_IN &&
-				sp->spi == found->spi)
-				break;
-		}
-		found = LIST_NEXT(found, next);
-	}
-
-	return found;
-}
-
 static int
 xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 {
 	struct rte_flow_error error;
+	struct pre_ld_xfm_flow *xfm_flow;
 	uint16_t port_id;
+	int ret;
 
 	if (sp->flow) {
 		RTE_LOG(WARNING, pre_ld,
@@ -471,6 +462,22 @@ xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 	sp->flow = rte_flow_create(port_id, &sp->attr,
 			sp->flow_item, sp->action, &error);
 	if (sp->flow) {
+		xfm_flow = rte_zmalloc(NULL,
+			sizeof(struct pre_ld_xfm_flow), 0);
+		if (!xfm_flow) {
+			ret = rte_flow_destroy(port_id, sp->flow, &error);
+			if (ret) {
+				RTE_LOG(INFO, pre_ld,
+					"%s: destroy flow failed(%d)\n",
+					__func__, ret);
+			}
+			sp->flow = NULL;
+
+			return -ENOMEM;
+		}
+		xfm_flow->flow = sp->flow;
+		xfm_flow->flow_ref = 1;
+		sp->entry_to_sec->poll.poll_port.flow = sp->flow;
 		RTE_LOG(INFO, pre_ld,
 			"%s: Policy flow (index=%d) create successfully\n",
 			__func__, sp->ingress_queue.index);
@@ -482,6 +489,8 @@ xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 			port_id,
 			*sp->entry_to_sec->poll.poll_port.queue_id,
 			sp->entry_from_sec->dest.dest_port);
+
+		TAILQ_INSERT_TAIL(&s_xfm_flow_list, xfm_flow, next);
 
 		return 0;
 	}
@@ -499,50 +508,65 @@ process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 	int ret = 0;
 	struct rte_flow_error error;
 	uint16_t port_id = sp->entry_to_sec->poll.poll_port.port_id;
-	struct pre_ld_ipsec_sp_entry *pending;
-
-	pending = xfm_sp_find_same_attr(sp);
+	struct pre_ld_xfm_flow *xfm_flow = NULL, *txfm_flow;
+	struct pre_ld_xfm_flow_list *flow_list = &s_xfm_flow_list;
 
 	LIST_REMOVE(sp, next);
-	if (port_id != INVALID_PORTID && sp->flow) {
+
+	RTE_TAILQ_FOREACH_SAFE(xfm_flow, flow_list, next, txfm_flow) {
+		if (xfm_flow->flow == sp->flow) {
+			xfm_flow->flow_ref--;
+			break;
+		}
+	}
+	if (!xfm_flow)
+		return -ENODATA;
+
+	if (!xfm_flow->flow_ref) {
 		ret = rte_flow_destroy(port_id, sp->flow, &error);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"%s: Policy flow destroy failed(%s)\n",
 				__func__, error.message);
 		}
+
+		pre_ld_deconfigure_sec_path(sp);
+		TAILQ_REMOVE(flow_list, xfm_flow, next);
+		rte_free(xfm_flow);
+	} else {
+		ret = pre_ld_detach_sec_path(sp);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"%s: detach sp failed(%d)\n",
+				__func__, ret);
+		}
 	}
 
-	pre_ld_deconfigure_sec_path(sp);
-	if (sp->sa)
-		sp->sa->sp = NULL;
 	rte_free(sp);
-
-	if (pending && !pending->flow)
-		xfm_sp_flow_hw_create(pending);
 
 	return ret;
 }
 
-static struct pre_ld_ipsec_sa_entry *
+static int
 xfm_find_sa_by_addrs(const xfrm_address_t *src,
-	const xfrm_address_t *dst, uint16_t family)
+	const xfrm_address_t *dst, uint16_t family,
+	struct pre_ld_ipsec_sa_entry *sa[], int max)
 {
 	struct rte_security_ipsec_xform *ipsec;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 	struct pre_ld_ipsec_sa_entry *curr = LIST_FIRST(&cntx->sa_list);
 	uint16_t size = 0;
-	struct pre_ld_ipsec_sa_entry *found = NULL;
+	int num = 0, i, inserted;
 
 	if (family == AF_INET)
 		size = sizeof(rte_be32_t);
 	else if (family == AF_INET6)
 		size = 16;
 	else
-		return NULL;
+		return -EINVAL;
 
 	if (!src && !dst)
-		return NULL;
+		return -EINVAL;
 
 	while (curr) {
 		ipsec = &curr->sess_conf.ipsec;
@@ -554,25 +578,35 @@ xfm_find_sa_by_addrs(const xfrm_address_t *src,
 			curr = LIST_NEXT(curr, next);
 			continue;
 		}
-		if ((!src && dst && !memcmp(dst, &curr->dst, size)) ||
-			(!dst && src && !memcmp(src, &curr->src, size)) ||
-			(src && !memcmp(src, &curr->src, size) &&
-			dst && !memcmp(dst, &curr->dst, size))) {
-			if ((found && found->created_cyc < curr->created_cyc) ||
-				!found)
-				found = curr;
+		if (src && memcmp(src, &curr->src, size))
+			goto continue_next;
+		if (dst && memcmp(dst, &curr->dst, size))
+			goto continue_next;
+		if (curr->sp)
+			goto continue_next;
+
+		if (num >= max)
+			return num;
+		inserted = 0;
+		for (i = 0; i < num; i++) {
+			if (curr->created_cyc < sa[i]->created_cyc) {
+				memmove(&sa[i + 1], &sa[i],
+					sizeof(void *) * (num - i));
+				sa[i] = curr;
+				inserted = 1;
+				num++;
+				break;
+			}
 		}
+		if (!inserted)	{
+			sa[num] = curr;
+			num++;
+		}
+continue_next:
 		curr = LIST_NEXT(curr, next);
 	}
 
-	if (found && found->sp) {
-		RTE_LOG(WARNING, pre_ld,
-			"%s: the SA found is associated to SP!\n",
-			__func__);
-		return NULL;
-	}
-
-	return found;
+	return num;
 }
 
 int
@@ -623,12 +657,18 @@ xfm_find_sa_addrs_by_sp_addrs(const xfrm_address_t *src,
 	}
 
 	if (curr) {
-		if (sa_src)
+		if (sa_src) {
+			if (!curr->sa)
+				return -ENODATA;
 			rte_memcpy(sa_src, &curr->sa->src,
 				sizeof(xfrm_address_t));
-		if (sa_dst)
+		}
+		if (sa_dst) {
+			if (!curr->sa)
+				return -ENODATA;
 			rte_memcpy(sa_dst, &curr->sa->dst,
 				sizeof(xfrm_address_t));
+		}
 
 		return 0;
 	}
@@ -970,6 +1010,7 @@ static int process_del_sa(const struct nlmsghdr *nh)
 	char addr_info[128];
 	uint16_t info_offset = 0, size = 0;
 	uint32_t cpu_spi;
+	int ret;
 
 	usersa_id = NLMSG_DATA(nh);
 
@@ -992,8 +1033,15 @@ static int process_del_sa(const struct nlmsghdr *nh)
 	}
 
 	if (curr) {
-		if (curr->sp)
-			process_del_policy_entry(curr->sp);
+		if (curr->sp) {
+			ret = process_del_policy_entry(curr->sp);
+			if (ret) {
+				RTE_LOG(ERR, pre_ld,
+					"%s: Delete policy entry failed(%d)\n",
+					__func__, ret);
+			}
+		}
+
 		return process_del_sa_entry(curr);
 	}
 
@@ -1053,67 +1101,80 @@ dump_new_policy(const struct xfrm_userpolicy_info *pol_info)
 }
 
 static int
-xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp)
+xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp,
+	rte_be32_t spi, struct rte_flow *flow)
 {
-	struct pre_ld_ipsec_sp_entry *same;
-	int ret;
+	int ret, idx = 0;
+	struct pre_ld_xfm_flow *xfm_flow, *txfm_flow;
+	struct pre_ld_xfm_flow_list *flow_list = &s_xfm_flow_list;
 
-	if (sp->family == AF_INET) {
-		sp->flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV4;
+	if (sp->family == AF_INET &&
+		(sp->dir == XFRM_POLICY_OUT ||
+		s_ipsec_ib_flow_ip_addr_extract)) {
+		sp->flow_item[idx].type = RTE_FLOW_ITEM_TYPE_IPV4;
 		rte_memcpy(&sp->ipv4_spec.hdr.src_addr, &sp->src,
 			sizeof(rte_be32_t));
 		rte_memcpy(&sp->ipv4_spec.hdr.dst_addr, &sp->dst,
 			sizeof(rte_be32_t));
 		sp->ipv4_mask.hdr.src_addr = 0xffffffff;
 		sp->ipv4_mask.hdr.dst_addr = 0xffffffff;
-		sp->flow_item[0].spec = &sp->ipv4_spec;
-		sp->flow_item[0].mask = &sp->ipv4_mask;
-	} else if (sp->family == AF_INET6) {
-		sp->flow_item[0].type = RTE_FLOW_ITEM_TYPE_IPV6;
+		sp->flow_item[idx].spec = &sp->ipv4_spec;
+		sp->flow_item[idx].mask = &sp->ipv4_mask;
+		idx++;
+	} else if (sp->family == AF_INET6 &&
+		(sp->dir == XFRM_POLICY_OUT ||
+		s_ipsec_ib_flow_ip_addr_extract)) {
+		sp->flow_item[idx].type = RTE_FLOW_ITEM_TYPE_IPV6;
 		rte_memcpy(sp->ipv6_spec.hdr.src_addr, &sp->src, 16);
 		rte_memcpy(sp->ipv6_spec.hdr.dst_addr, &sp->dst, 16);
 		memset(sp->ipv6_mask.hdr.src_addr, 0xff, 16);
 		memset(sp->ipv6_mask.hdr.dst_addr, 0xff, 16);
-		sp->flow_item[0].spec = &sp->ipv6_spec;
-		sp->flow_item[0].mask = &sp->ipv6_mask;
-	} else {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Invalid IP family(%d)\n", __func__, sp->family);
-		return -EINVAL;
+		sp->flow_item[idx].spec = &sp->ipv6_spec;
+		sp->flow_item[idx].mask = &sp->ipv6_mask;
+		idx++;
 	}
 
 	if (sp->dir == XFRM_POLICY_IN) {
-		sp->flow_item[1].type = RTE_FLOW_ITEM_TYPE_ESP;
-		sp->esp_spec.hdr.spi = sp->spi;
+		sp->flow_item[idx].type = RTE_FLOW_ITEM_TYPE_ESP;
+		sp->esp_spec.hdr.spi = spi;
 		sp->esp_mask.hdr.spi = 0xffffffff;
-		sp->flow_item[1].spec = &sp->esp_spec;
-		sp->flow_item[1].mask = &sp->esp_mask;
-		sp->flow_item[2].type = RTE_FLOW_ITEM_TYPE_END;
-	} else {
-		sp->flow_item[1].type = RTE_FLOW_ITEM_TYPE_END;
+		sp->flow_item[idx].spec = &sp->esp_spec;
+		sp->flow_item[idx].mask = &sp->esp_mask;
+		idx++;
 	}
+	if (!idx) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: Invalid IP family(%d) or direction(%d)\n",
+			__func__, sp->family, sp->dir);
+		return -EINVAL;
+	}
+
+	sp->flow_item[idx].type = RTE_FLOW_ITEM_TYPE_END;
 
 	sp->action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
 	sp->action[0].conf = &sp->ingress_queue;
 	sp->action[1].type = RTE_FLOW_ACTION_TYPE_END;
 
-	sp->flow = NULL;
+	sp->flow = flow;
 
-	ret = pre_ld_configure_sec_path(sp);
-	if (ret)
-		return ret;
-
-	same = xfm_sp_find_same_attr(sp);
-
-	if (same) {
-		RTE_LOG(INFO, pre_ld,
-			"Same policy(%s) exists, postpone applying policy to HW\n",
-			same->dir == XFRM_POLICY_IN ? "IN" : "OUT");
-
-		return 0;
+	if (!sp->flow) {
+		ret = pre_ld_configure_sec_path(sp);
+		if (ret)
+			return ret;
+		ret = xfm_sp_flow_hw_create(sp);
+	} else {
+		ret = pre_ld_attach_sec_path(sp);
+		if (ret)
+			return ret;
+		RTE_TAILQ_FOREACH_SAFE(xfm_flow, flow_list, next, txfm_flow) {
+			if (xfm_flow->flow == sp->flow) {
+				xfm_flow->flow_ref++;
+				break;
+			}
+		}
 	}
 
-	return xfm_sp_flow_hw_create(sp);
+	return ret;
 }
 
 static int
@@ -1151,23 +1212,22 @@ xfm_apply_sa(struct pre_ld_ipsec_sa_entry *sa,
 
 static int
 xfm_sa_sp_associate(struct pre_ld_ipsec_sp_entry *sp,
-	struct pre_ld_ipsec_sa_entry *sa, uint8_t dir)
+	struct pre_ld_ipsec_sa_entry *sa, struct rte_flow *flow)
 {
 	int ret;
 
-	sp->dir = dir;
-	sp->spi = rte_cpu_to_be_32(sa->sess_conf.ipsec.spi);
-
-	ret = xfm_steer_sp_flow(sp);
+	ret = xfm_steer_sp_flow(sp,
+		rte_cpu_to_be_32(sa->sess_conf.ipsec.spi), flow);
 	if (ret) {
 		RTE_LOG(ERR, pre_ld,
 			"Steer policy by HW failed(%d)\n", ret);
-	} else {
-		sp->sa = sa;
-		sa->sp = sp;
+		return ret;
 	}
 
-	return ret;
+	sp->sa = sa;
+	sa->sp = sp;
+
+	return 0;
 }
 
 static void
@@ -1234,6 +1294,7 @@ xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 	sp->index = pol_info->index;
 	sp->family = af;
 	sp->sa = NULL;
+	sp->dir = pol_info->dir;
 
 	if (!curr) {
 		LIST_INSERT_HEAD(head, sp, next);
@@ -1245,14 +1306,58 @@ xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 	sp->head = head;
 }
 
+static struct rte_flow *
+xfm_find_policy_flow_by_rule(uint32_t spi,
+	xfrm_address_t *src, xfrm_address_t *dst, int af)
+{
+	struct pre_ld_ipsec_sp_entry *curr;
+	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+	struct pre_ld_ipsec_sp_head *head;
+
+	if (spi == INVALID_ESP_SPI) {
+		if (af == AF_INET)
+			head = &cntx->sp_ipv4_out_list;
+		else
+			head = &cntx->sp_ipv6_out_list;
+	} else {
+		if (af == AF_INET)
+			head = &cntx->sp_ipv4_in_list;
+		else
+			head = &cntx->sp_ipv6_in_list;
+	}
+	curr = LIST_FIRST(head);
+
+	while (curr) {
+		if (memcmp(&curr->src, src, sizeof(xfrm_address_t)))
+			goto continue_next;
+		if (memcmp(&curr->dst, dst, sizeof(xfrm_address_t)))
+			goto continue_next;
+		if (spi == INVALID_ESP_SPI)
+			break;
+		if (curr->sa &&
+			curr->sa->sess_conf.ipsec.spi == spi)
+			break;
+continue_next:
+		curr = LIST_NEXT(curr, next);
+	}
+
+	if (curr)
+		return curr->flow;
+
+	return NULL;
+}
+
 static int
 process_new_policy(const struct nlmsghdr *nh,
 	uint8_t sec_id, struct rte_mempool *mp)
 {
+#define MAX_SA_NUM 10
 	struct xfrm_userpolicy_info *pol_info;
-	int ret = 0, af, offset = 0;
+	struct rte_flow *flow;
+	int ret = 0, af, offset = 0, num, i;
 	xfrm_address_t saddr, daddr;
-	struct pre_ld_ipsec_sa_entry *sa;
+	uint32_t spi;
+	struct pre_ld_ipsec_sa_entry *sas[MAX_SA_NUM], *sa = NULL;
 	struct pre_ld_ipsec_sp_entry *sp;
 	char addr_info[1024];
 
@@ -1304,16 +1409,39 @@ process_new_policy(const struct nlmsghdr *nh,
 		return -EINVAL;
 	}
 
-	sa = xfm_find_sa_by_addrs(&saddr, &daddr, af);
-	if (!sa) {
+	num = xfm_find_sa_by_addrs(&saddr, &daddr, af, sas, MAX_SA_NUM);
+	if (num <= 0) {
 		/** TO DO: Add SP to pending list.*/
 		RTE_LOG(ERR, pre_ld, "No SA found by %s\n", addr_info);
 		return -ENOTSUP;
+	}
+	for (i = 0; i < num; i++) {
+		if (!sas[i]->sp) {
+			sa = sas[i];
+			break;
+		}
+	}
+	if (!sa) {
+		RTE_LOG(ERR, pre_ld,
+			"%d SA(s) have been associated to SP\n", num);
+		return -EINVAL;
 	}
 
 	sprintf(&addr_info[offset], "/spi(%08x)",
 		sa->sess_conf.ipsec.spi);
 	RTE_LOG(INFO, pre_ld, "Found SA: %s\n", addr_info);
+
+	if (pol_info->dir == XFRM_POLICY_IN) {
+		spi = sa->sess_conf.ipsec.spi;
+	} else {
+		spi = INVALID_ESP_SPI;
+		/** Use selector addresses as rule of policy out.*/
+		rte_memcpy(&saddr, &pol_info->sel.saddr,
+			sizeof(xfrm_address_t));
+		rte_memcpy(&daddr, &pol_info->sel.daddr,
+			sizeof(xfrm_address_t));
+	}
+	flow = xfm_find_policy_flow_by_rule(spi, &saddr, &daddr, af);
 
 	sp = rte_zmalloc(NULL, sizeof(struct pre_ld_ipsec_sp_entry),
 		RTE_CACHE_LINE_SIZE);
@@ -1322,11 +1450,7 @@ process_new_policy(const struct nlmsghdr *nh,
 		return -ENOMEM;
 	}
 
-	if (pol_info->dir == XFRM_POLICY_IN)
-		xfm_insert_new_policy(sp, pol_info, &saddr, &daddr, af);
-	else
-		xfm_insert_new_policy(sp, pol_info,
-			&pol_info->sel.saddr, &pol_info->sel.daddr, af);
+	xfm_insert_new_policy(sp, pol_info, &saddr, &daddr, af);
 
 	rte_memcpy(&sp->sel_src, &pol_info->sel.saddr,
 		sizeof(xfrm_address_t));
@@ -1349,7 +1473,7 @@ process_new_policy(const struct nlmsghdr *nh,
 	}
 
 	if (!ret) {
-		ret = xfm_sa_sp_associate(sp, sa, pol_info->dir);
+		ret = xfm_sa_sp_associate(sp, sa, flow);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"SA/SP associate failed!\n");
@@ -1367,15 +1491,18 @@ process_new_policy(const struct nlmsghdr *nh,
 					"Delete policy[%d] in kernel successfully\n",
 					pol_info->index);
 			}
-			ret = do_saddel(sp->spi);
-			if (ret) {
-				RTE_LOG(ERR, pre_ld,
-					"Delete SA(spi=%08x) in kernel failed(%d)\n",
-					sp->spi, ret);
-			} else {
-				RTE_LOG(INFO, pre_ld,
-					"Delete SA(spi=%08x) in kernel successfully\n",
-					sp->spi);
+			if (sp->sa) {
+				spi = sp->sa->sess_conf.ipsec.spi;
+				ret = do_saddel(spi);
+				if (ret) {
+					RTE_LOG(ERR, pre_ld,
+						"Delete SA(spi=%08x) in kernel failed(%d)\n",
+						spi, ret);
+				} else {
+					RTE_LOG(INFO, pre_ld,
+						"Delete SA(spi=%08x) in kernel successfully\n",
+						spi);
+				}
 			}
 		}
 	}
@@ -1433,7 +1560,8 @@ static int process_del_policy(const struct nlmsghdr *nh)
 		src = &curr->sel_src;
 		dst = &curr->sel_dst;
 		if (!memcmp(src, &pol_id->sel.saddr, size) &&
-			!memcmp(dst, &pol_id->sel.daddr, size))
+			!memcmp(dst, &pol_id->sel.daddr, size) &&
+			curr->index == pol_id->index)
 			break;
 		curr = LIST_NEXT(curr, next);
 	}
@@ -1684,6 +1812,7 @@ static void *xfrm_msg_loop(void *data)
 	const struct pre_ld_crypt_param *param = data;
 	uint8_t sec_id = param->crypt_dev;
 	struct rte_mempool *mp = param->sess_priv_pool;
+	char *env;
 
 	/* Set this cpu-affinity to CPU 0 */
 	CPU_ZERO(&cpuset);
@@ -1717,6 +1846,10 @@ static void *xfrm_msg_loop(void *data)
 	msg.msg_iovlen = 1;
 
 	xfm_calculate_cycles_per_us();
+
+	env = getenv("IPSEC_IB_FLOW_IP_ADDR_EXTRACT");
+	if (env)
+		s_ipsec_ib_flow_ip_addr_extract = atoi(env);
 
 	/* XFRM notification loop */
 	while (1) {

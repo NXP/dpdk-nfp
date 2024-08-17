@@ -74,7 +74,6 @@ static char *s_usr_app_nm;
 #define SOCK_TYPE_MASK 0xf
 #endif
 #define INVALID_SOCKFD (-1)
-#define INVALID_ESP_SPI 0
 
 static int s_socket_pre_set;
 static int s_in_pre_loading;
@@ -111,7 +110,6 @@ static const char *s_slow_if;
 static char *s_downlink;
 
 static int s_manual_restart_ipsec;
-static int s_force_ipsec;
 static int s_flow_control;
 static int s_force_eal_thread;
 
@@ -372,6 +370,8 @@ pre_ld_insert_dir_list_safe(struct pre_ld_lcore_direct_list *list,
 	struct pre_ld_direct_entry *dir)
 {
 	pthread_mutex_lock(&s_lcore_mutex);
+	dir->state = PRE_LD_DIR_ENTRY_RUNNING;
+	dcbf(&dir->state);
 	TAILQ_INSERT_TAIL(list, dir, next);
 	pthread_mutex_unlock(&s_lcore_mutex);
 }
@@ -381,6 +381,13 @@ pre_ld_remove_dir_list_safe(struct pre_ld_lcore_direct_list *list,
 	struct pre_ld_direct_entry *dir)
 {
 	pthread_mutex_lock(&s_lcore_mutex);
+	dir->state = PRE_LD_DIR_ENTRY_STOPPING;
+	dcbf(&dir->state);
+	while (dir->state != PRE_LD_DIR_ENTRY_STOPPED) {
+		dccivac(&dir->state);
+		if (s_pre_ld_quit)
+			break;
+	}
 	TAILQ_REMOVE(list, dir, next);
 	pthread_mutex_unlock(&s_lcore_mutex);
 }
@@ -644,30 +651,6 @@ pre_ld_sp_out_ready(void)
 	return false;
 }
 
-static void
-pre_ld_wait_for_ipsec_ready(void)
-{
-	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
-	struct pre_ld_ipsec_sp_entry *sp_in, *sp_out;
-
-	while (!LIST_FIRST(&cntx->sp_ipv4_out_list) ||
-		!LIST_FIRST(&cntx->sp_ipv4_in_list)) {
-		RTE_LOG(INFO, pre_ld, "Waiting for new SP notification\n");
-		if (s_pre_ld_quit)
-			return;
-		sleep(1);
-	}
-
-	sp_in = LIST_FIRST(&cntx->sp_ipv4_in_list);
-	sp_out = LIST_FIRST(&cntx->sp_ipv4_out_list);
-	while (!sp_in->sa || !sp_out->sa) {
-		RTE_LOG(INFO, pre_ld, "Waiting for SA notification\n");
-		if (s_pre_ld_quit)
-			return;
-		sleep(1);
-	}
-}
-
 static int
 eal_destroy_dpaa2_mux_flow(void)
 {
@@ -735,12 +718,8 @@ usr_socket_fd_release(int sockfd)
 		tx_ring = tx_entry->poll.tx_ring;
 		list = &s_pre_ld_lists[s_data_path_core];
 		pre_ld_remove_dir_list_safe(list, rx_entry);
-		/** Delay some time to drain the traffic.*/
-		usleep(100000);
 		desc->dp_desc.entry_desc.rx_entry = NULL;
 		pre_ld_remove_dir_list_safe(list, tx_entry);
-		/** Delay some time to drain the traffic.*/
-		usleep(100000);
 		desc->dp_desc.entry_desc.tx_entry = NULL;
 	}
 
@@ -1306,7 +1285,7 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	sprintf(src_info, "Port%d/rxq%d", rx_port, *queue_id);
 	sprintf(sec_info, "Sec%d/queue%d", sec_id, *sec_qid);
 	pre_ld_remove_dir_list_safe(list, entry_to_sec);
-	/** Delay some time to drain the traffic.*/
+	/** Drain outstanding  SEC queue.*/
 	usleep(100000);
 	ret = rte_ring_enqueue(s_port_rxq_rings[rx_port], queue_id);
 	if (ret) {
@@ -1344,6 +1323,7 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	uint16_t lcore_id, rx_port, tx_port;
 	struct pre_ld_direct_entry *dir_to_sec;
 	struct pre_ld_direct_entry *dir_from_sec;
+	struct pre_ld_sp_node *sp_node;
 	enum pre_ld_dir_dest_type dest_type;
 	enum pre_ld_dir_poll_type poll_type;
 	uint16_t *rxq_id, *crypt_qid;
@@ -1381,6 +1361,17 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 
 		return -ENOMEM;
 	}
+	sp_node = rte_zmalloc(NULL, sizeof(struct pre_ld_sp_node), 0);
+	if (!sp_node) {
+		rte_free(dir_to_sec);
+		rte_exit(EXIT_FAILURE,
+			"%s/line%d: sp node alloc failed\n",
+			__func__, __LINE__);
+
+		return -ENOMEM;
+	}
+	sp_node->sp = sp;
+	sp_node->next = NULL;
 
 	ret = rte_ring_dequeue(s_port_rxq_rings[rx_port],
 		(void **)&rxq_id);
@@ -1409,11 +1400,12 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	dir_to_sec->poll_type = RX_QUEUE;
 	dir_to_sec->poll.poll_port.port_id = rx_port;
 	dir_to_sec->poll.poll_port.queue_id = rxq_id;
+	dir_to_sec->poll.poll_port.flow = sp->flow;
 	dir_to_sec->dest_type = dest_type;
 
 	dir_to_sec->dest.dest_sec.queue_id = crypt_qid;
 	dir_to_sec->dest.dest_sec.sec_id = sp->crypt_id;
-	dir_to_sec->dest.dest_sec.sp = sp;
+	dir_to_sec->dest.dest_sec.sp_list = sp_node;
 
 	dir_from_sec = rte_zmalloc(NULL,
 		sizeof(struct pre_ld_direct_entry), 0);
@@ -1430,7 +1422,7 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 		return -ENOMEM;
 	}
 
-	dir_from_sec->poll.poll_sec.sp = sp;
+	dir_from_sec->poll.poll_sec.sp_list = NULL;
 	dir_from_sec->poll_type = poll_type;
 	dir_from_sec->poll.poll_sec.queue_id = crypt_qid;
 	dir_from_sec->poll.poll_sec.sec_id = sp->crypt_id;
@@ -1448,6 +1440,112 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 
 	pre_ld_insert_dir_list_safe(list, dir_to_sec);
 	pre_ld_insert_dir_list_safe(list, dir_from_sec);
+
+	return 0;
+}
+
+int
+pre_ld_attach_sec_path(struct pre_ld_ipsec_sp_entry *sp)
+{
+	struct pre_ld_lcore_direct_list *list;
+	struct pre_ld_direct_entry *entry, *tentry, *found = NULL;
+	struct pre_ld_sp_node *curr, *prev, *sp_node;
+	enum pre_ld_dir_poll_type poll_type;
+	uint16_t lcore_id, sec_id, *queue_id;
+
+	if (s_data_path_core < 0) {
+		rte_exit(EXIT_FAILURE,
+			"Data path code not specified!\n");
+
+		return -EINVAL;
+	}
+	lcore_id = s_data_path_core;
+	list = &s_pre_ld_lists[lcore_id];
+
+	RTE_TAILQ_FOREACH_SAFE(entry, list, next, tentry) {
+		if (entry->poll_type == RX_QUEUE &&
+			entry->poll.poll_port.flow == sp->flow) {
+			found = entry;
+			break;
+		}
+	}
+
+	if (!found)
+		return -EACCES;
+
+	curr = found->dest.dest_sec.sp_list;
+	prev = NULL;
+	while (curr) {
+		prev = curr;
+		curr = curr->next;
+	}
+	if (!prev) {
+		RTE_LOG(ERR, pre_ld, "%s: No SP on SEC path\n",
+			__func__);
+		return -EINVAL;
+	}
+	sp_node = rte_malloc(NULL, sizeof(struct pre_ld_sp_node), 0);
+	if (!sp_node)
+		return -ENOMEM;
+	sp_node->sp = sp;
+	sp_node->next = NULL;
+
+	prev->next = sp_node;
+
+	sp->entry_to_sec = found;
+	poll_type = sp->dir == XFRM_POLICY_IN ?
+		SEC_IN_COMPLETE : SEC_EG_COMPLETE;
+	sec_id = found->dest.dest_sec.sec_id;
+	queue_id = found->dest.dest_sec.queue_id;
+	found = NULL;
+	RTE_TAILQ_FOREACH_SAFE(entry, list, next, tentry) {
+		if (entry->poll_type == poll_type &&
+			entry->poll.poll_sec.sec_id == sec_id &&
+			entry->poll.poll_sec.queue_id == queue_id) {
+			found = entry;
+			break;
+		}
+	}
+	sp->entry_from_sec = found;
+
+	return 0;
+}
+
+int
+pre_ld_detach_sec_path(struct pre_ld_ipsec_sp_entry *sp)
+{
+	struct pre_ld_sp_node *curr, *prev;
+
+	if (!sp->entry_to_sec)
+		return -EACCES;
+
+	curr = sp->entry_to_sec->dest.dest_sec.sp_list;
+	prev = NULL;
+	while (curr) {
+		if (curr->sp == sp)
+			break;
+		prev = curr;
+		curr = curr->next;
+	}
+	if (!curr) {
+		RTE_LOG(ERR, pre_ld, "%s: No SP found on SEC path\n",
+			__func__);
+		return -EINVAL;
+	}
+	if (prev)
+		prev->next = curr->next;
+	else
+		sp->entry_to_sec->dest.dest_sec.sp_list = curr->next;
+
+	/** Drain outstanding  SEC queue.*/
+	usleep(100000);
+
+	if (!sp->entry_to_sec->dest.dest_sec.sp_list) {
+		RTE_LOG(WARNING, pre_ld,
+			"%s: SEC path should be deconfigured\n",
+			__func__);
+	}
+	rte_free(curr);
 
 	return 0;
 }
@@ -1923,9 +2021,10 @@ pre_ld_direct_to_crypto(struct pre_ld_direct_entry *entry,
 	else
 		return 0;
 
-	if (likely(entry->dest.dest_sec.sp)) {
-		sp = entry->dest.dest_sec.sp;
-		sa = sp->sa;
+	if (likely(entry->dest.dest_sec.sp_list)) {
+		sp = entry->dest.dest_sec.sp_list->sp;
+		if (likely(sp && sp->sa))
+			sa = sp->sa;
 	}
 
 	if (unlikely(!sa))
@@ -2047,6 +2146,15 @@ for_ever_loop:
 
 	RTE_TAILQ_FOREACH_SAFE(entry, list, next, tentry) {
 		queueid = INVALID_QUEUEID;
+		if (unlikely(entry->state != PRE_LD_DIR_ENTRY_RUNNING)) {
+			if (entry->state == PRE_LD_DIR_ENTRY_STOPPING) {
+				/** Delay some time to drain traffic.*/
+				usleep(1000);
+				entry->state = PRE_LD_DIR_ENTRY_STOPPED;
+				dcbf(&entry->state);
+			}
+			continue;
+		}
 
 		if (entry->poll_type == RX_QUEUE) {
 			portid = entry->poll.poll_port.port_id;
@@ -4516,10 +4624,6 @@ static void setup_wrappers(void)
 	if (env)
 		s_l4_traffic_dump = atoi(env);
 
-	env = getenv("PRE_LOAD_FORCE_IPSEC");
-	if (env)
-		s_force_ipsec = atoi(env);
-
 	env = getenv("PRE_LOAD_FLOW_CONTROL_ENABLE");
 	if (env)
 		s_flow_control = atoi(env);
@@ -4600,9 +4704,6 @@ static void setup_wrappers(void)
 		 /usr/lib/ipsec/stroke up host-host1
 		 */
 	}
-
-	if (s_force_ipsec)
-		pre_ld_wait_for_ipsec_ready();
 
 	if (s_pre_ld_quit) {
 		netwrap_main_dtor();
