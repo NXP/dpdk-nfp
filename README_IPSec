@@ -31,10 +31,12 @@ bypass kernel crypto and change TCP MSS.
 3. Gateway setup:
 --------------------------------------------
 
+  # Support rekey from gateway by "ipsec-gw.conf".
   $ Copy ipsec-gw.conf to /etc/ipsec.conf
   $ Copy ipsec.secrets to /etc/ipsec.secrets
   $ ifconfig ethx 1.1.1.1 up(security port)
   $ ip addr add 2.1.1.1/16 dev ethx
+  $ route del -net 2.1.0.0 netmask 255.255.0.0 dev ethx
   $ ipsec restart
 
 4. EP platform setup:
@@ -47,6 +49,7 @@ bypass kernel crypto and change TCP MSS.
   $ export MAX_QUEUES=8
   $ export FS_ENTRIES=8
   $ export MAX_TCS=1
+  $ export DPSECI_QUEUES=8
   $ source ./dynamic_dpl.sh dpni-dpni dpni dpmac.x #DPMAC as external port.
     or
   $ source ./dynamic_dpl.sh dpni-dpni dpni         #PCIe EP as external port.
@@ -55,9 +58,11 @@ bypass kernel crypto and change TCP MSS.
      #Assume the kernel interface created is ethx.
   $ ifconfig ethx 1.1.1.2 up
   $ ip addr add 2.1.1.2/16 dev ethx
+  $ route del -net 2.1.0.0 netmask 255.255.0.0 dev ethx
   $ echo 1 > /proc/sys/net/core/xfrm_bypass
 
-5. Test application(iperf3) based on either of upon configurations:
+5. Test application(iperf3) based on upon configurations, multiple sockets and bi-directions are supported:
+   User can verify by parameter "[--bidir] [-P 2]" of iperf3 client mode:
 --------------------------------------------
 
 1) server mode on gateway and client mode on EP:
@@ -67,19 +72,17 @@ Server on gateway:
   $ iperf3 -s
 
 Client on EP:
-  $ ipsec stop
-  $ export IPSEC_RESTART=1
-  $ LD_PRELOAD=./libnfp.so iperf3 -c 2.1.1.1 -i 1 -t 10 -u -b 10G -l 64
+  $ LD_PRELOAD=./libnfp.so iperf3 -c 2.1.1.1 -i 1 -t 100 -u -b 10G -l 64 [--bidir] [-P 2]
+  $ ipsec restart #(Run from another terminal)
 
 2) server mode on EP and client mmode on gateway:
 ---------
 
 Server on EP:
-  $ ipsec stop
-  $ export IPSEC_RESTART=1
   $ LD_PRELOAD=./libnfp.so iperf3 -s
+  $ ipsec restart #(Run from another terminal)
 
 Client on gateway:
-  $ iperf3 -c 2.1.1.2 -i 1 -t 10 -u -b 10G -l 64
+  $ iperf3 -c 2.1.1.2 -i 1 -t 100 -u -b 10G -l 64 [--bidir] [-P 2]
 
 3) Run network tools based on TCP protocol between gateway and EP while running iperf(udp or tcp) test.
