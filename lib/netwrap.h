@@ -48,6 +48,14 @@ struct pre_ld_sec_desc {
 	struct pre_ld_sp_node *sp_list;
 };
 
+struct pre_ld_ring {
+	char name[RTE_MEMZONE_NAMESIZE];
+	uint16_t pre_ld_head;
+	uint16_t pre_ld_tail;
+	uint16_t pre_ld_size;
+	void **pre_ld_elems;
+};
+
 enum pre_ld_dir_poll_type {
 	RX_QUEUE,
 	TX_RING,
@@ -63,6 +71,7 @@ union pre_ld_dir_poll {
 
 enum pre_ld_dir_dest_type {
 	HW_PORT,
+	PRE_LD_RX_RING,
 	RX_RING,
 	SEC_INGRESS,
 	SEC_EGRESS,
@@ -73,6 +82,7 @@ enum pre_ld_dir_dest_type {
 
 union pre_ld_dir_dest {
 	uint16_t dest_port;
+	struct pre_ld_ring *pre_ld_rx_ring;
 	struct rte_ring *rx_ring;
 	struct pre_ld_sec_desc dest_sec;
 };

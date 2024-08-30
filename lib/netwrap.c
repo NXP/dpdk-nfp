@@ -113,6 +113,8 @@ static int s_manual_restart_ipsec;
 static int s_flow_control;
 static int s_force_eal_thread;
 
+static int s_fd_rte_ring;
+
 static uint16_t s_l3_traffic_dump;
 static uint8_t s_l4_traffic_dump;
 
@@ -364,6 +366,85 @@ struct pre_ld_udp_desc {
 #define PRE_LD_MBUF_MAX_SIZE \
 	(PRE_LD_MP_PRIV_SIZE + PRE_LD_MBUF_OFFSET + \
 	RTE_MBUF_DEFAULT_DATAROOM)
+
+static struct pre_ld_ring *
+pre_ld_ring_create(const char *name, uint16_t size)
+{
+	struct pre_ld_ring *_r;
+	int ret;
+
+	_r = rte_zmalloc(NULL, sizeof(struct pre_ld_ring), 0);
+	if (!_r)
+		return NULL;
+	ret = strlcpy(_r->name, name, RTE_MEMZONE_NAMESIZE);
+	if (ret < 0 || ret >= RTE_MEMZONE_NAMESIZE) {
+		rte_free(_r);
+
+		return NULL;
+	}
+
+	size = rte_align32pow2(size + 1);
+
+	_r->pre_ld_elems = rte_zmalloc(NULL,
+		size * sizeof(void *), RTE_CACHE_LINE_SIZE);
+	if (!_r->pre_ld_elems) {
+		rte_free(_r);
+
+		return NULL;
+	}
+	_r->pre_ld_head = 0;
+	_r->pre_ld_tail = 0;
+	_r->pre_ld_size = size;
+
+	return _r;
+}
+
+static void
+pre_ld_ring_free(struct pre_ld_ring *plr)
+{
+	rte_free(plr->pre_ld_elems);
+	rte_free(plr);
+}
+
+static inline uint16_t
+pre_ld_ring_eq(struct pre_ld_ring *plr, void **elem, uint16_t num)
+{
+	uint16_t idx = 0, pos;
+
+	pos = plr->pre_ld_tail;
+	while (((pos + 1) & (plr->pre_ld_size - 1)) !=
+		plr->pre_ld_head) {
+		plr->pre_ld_elems[pos] = elem[idx];
+		idx++;
+		pos = (pos + 1) & (plr->pre_ld_size - 1);
+		if (idx == num)
+			break;
+	}
+	rte_io_wmb();
+	plr->pre_ld_tail = pos;
+
+	return idx;
+}
+
+static inline uint16_t
+pre_ld_ring_dq(struct pre_ld_ring *plr, void **elem, uint16_t num)
+{
+	uint16_t idx = 0, pos;
+
+	pos = plr->pre_ld_head;
+	while (plr->pre_ld_tail != pos) {
+		elem[idx] = plr->pre_ld_elems[pos];
+		idx++;
+		pos = (pos + 1) & (plr->pre_ld_size - 1);
+		if (idx == num)
+			break;
+	}
+	rte_io_wmb();
+	rte_io_rmb();
+	plr->pre_ld_head = pos;
+
+	return idx;
+}
 
 static inline void
 pre_ld_insert_dir_list_safe(struct pre_ld_lcore_direct_list *list,
@@ -699,6 +780,7 @@ usr_socket_fd_release(int sockfd)
 	struct rte_mbuf *free_burst[MAX_PKT_BURST];
 	struct pre_ld_lcore_direct_list *list = NULL;
 	struct rte_ring *tx_ring = NULL, *rx_ring = NULL;
+	struct pre_ld_ring *pre_ld_rx_ring = NULL;
 	struct fd_thread_desc *th_desc;
 	struct fd_desc *desc = &s_fd_desc[sockfd];
 	struct pre_ld_direct_entry *rx_entry;
@@ -714,7 +796,10 @@ usr_socket_fd_release(int sockfd)
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
 		rx_port = rx_entry->poll.poll_port.port_id;
 		rxq_id = rx_entry->poll.poll_port.queue_id;
-		rx_ring = rx_entry->dest.rx_ring;
+		if (rx_entry->dest_type == RX_RING)
+			rx_ring = rx_entry->dest.rx_ring;
+		else
+			pre_ld_rx_ring = rx_entry->dest.pre_ld_rx_ring;
 		tx_ring = tx_entry->poll.tx_ring;
 		list = &s_pre_ld_lists[s_data_path_core];
 		pre_ld_remove_dir_list_safe(list, rx_entry);
@@ -743,6 +828,17 @@ again:
 			goto again;
 		}
 		desc->flow = NULL;
+	}
+
+	if (pre_ld_rx_ring) {
+dq_pre_ld_rxr_again:
+		nb = pre_ld_ring_dq(pre_ld_rx_ring,
+				(void **)free_burst, MAX_PKT_BURST);
+		if (nb > 0) {
+			rte_pktmbuf_free_bulk(free_burst, nb);
+			goto dq_pre_ld_rxr_again;
+		}
+		pre_ld_ring_free(pre_ld_rx_ring);
 	}
 
 	if (rx_ring) {
@@ -979,6 +1075,8 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 		RTE_LOG(WARNING, pre_ld,
 			"FD(%d): UDP offset = %d, IPV6 or tunnel frame?\n",
 			sockfd, l4_offset);
+		rte_pktmbuf_dump(stdout, mbuf, 60);
+		return -EINVAL;
 	}
 
 	udp_hdr = rte_pktmbuf_mtod_offset(mbuf, void *, l4_offset);
@@ -988,6 +1086,8 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 			"FD(%d): UDP RX ERR(src %04x!=%04x, dst %04x!=%04x)\n",
 			sockfd, udp_hdr->src_port, flow_hdr->dst_port,
 			udp_hdr->dst_port, flow_hdr->src_port);
+		rte_pktmbuf_dump(stdout, mbuf, 60);
+		return -EINVAL;
 	}
 	length = rte_be_to_cpu_16(udp_hdr->dgram_len) -
 		sizeof(struct rte_udp_hdr);
@@ -1074,9 +1174,12 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 			/** FD close*/
 			goto finsh_recv;
 		}
-		if (likely(rx_entry)) {
+		if (rx_entry->dest_type == RX_RING) {
 			nb_rx = rte_ring_dequeue_burst(rx_entry->dest.rx_ring,
 				(void **)pkts_burst, MAX_PKT_BURST, NULL);
+		} else {
+			nb_rx = pre_ld_ring_dq(rx_entry->dest.pre_ld_rx_ring,
+				(void **)pkts_burst, MAX_PKT_BURST);
 		}
 	} else {
 		hw_desc = &desc->dp_desc.hw_desc;
@@ -2306,11 +2409,14 @@ for_ever_loop:
 			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
 				sprintf(prefix, "EQ to rx ring(%s):",
 					entry->dest.rx_ring->name);
-				for (i = 0; i < nb_rx; i++)
-					pre_ld_l3_l4_traffic_dump(mbufs[i], prefix);
+				for (i = 0; i < nb_rx; i++) {
+					pre_ld_l3_l4_traffic_dump(mbufs[i],
+						prefix);
+				}
 			}
 			if (unlikely(s_dump_traffic_flow)) {
-				RTE_LOG(INFO, pre_ld, "EQ to rx ring(%s):\n",
+				RTE_LOG(INFO, pre_ld,
+					"EQ to rx ring(%s):\n",
 					entry->dest.rx_ring->name);
 				for (i = 0; i < nb_rx; i++)
 					rte_pktmbuf_dump(stdout, mbufs[i], 60);
@@ -2319,8 +2425,32 @@ for_ever_loop:
 					(void * const *)mbufs, nb_rx, NULL);
 			if (unlikely(s_dump_traffic_flow)) {
 				RTE_LOG(INFO, pre_ld,
-					"EQ %d frames to %s done\n",
+					"EQ %d frames to rx ring(%s) done\n",
 					nb_tx, entry->dest.rx_ring->name);
+			}
+		} else if (entry->dest_type == PRE_LD_RX_RING) {
+			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
+				sprintf(prefix, "EQ to preload rx ring(%s):",
+					entry->dest.pre_ld_rx_ring->name);
+				for (i = 0; i < nb_rx; i++) {
+					pre_ld_l3_l4_traffic_dump(mbufs[i],
+						prefix);
+				}
+			}
+			if (unlikely(s_dump_traffic_flow)) {
+				RTE_LOG(INFO, pre_ld,
+					"EQ to preload rx ring(%s):\n",
+					entry->dest.pre_ld_rx_ring->name);
+				for (i = 0; i < nb_rx; i++)
+					rte_pktmbuf_dump(stdout, mbufs[i], 60);
+			}
+			nb_tx = pre_ld_ring_eq(entry->dest.pre_ld_rx_ring,
+				(void **)mbufs, nb_rx);
+			if (unlikely(s_dump_traffic_flow)) {
+				RTE_LOG(INFO, pre_ld,
+					"EQ %d frames to preload rx ring(%s) done\n",
+					nb_tx,
+					entry->dest.pre_ld_rx_ring->name);
 			}
 		} else {
 			nb_tx = 0;
@@ -2585,6 +2715,10 @@ statistics_loop:
 		} else if (entry->dest_type == RX_RING) {
 			sprintf(entry_info, "then forward to rx ring(%s)",
 				entry->dest.rx_ring->name);
+		} else if (entry->dest_type == PRE_LD_RX_RING) {
+			sprintf(entry_info,
+				"then forward to preload rx ring(%s)",
+				entry->dest.pre_ld_rx_ring->name);
 		} else if (entry->dest_type == SEC_EGRESS) {
 			sprintf(entry_info, "then encap to SEC%d/queue%d",
 				entry->dest.dest_sec.sec_id,
@@ -3151,7 +3285,7 @@ usr_socket_fd_desc_init(int sockfd,
 	struct pre_ld_direct_entry *rx_entry = NULL;
 	struct pre_ld_direct_entry *tx_entry = NULL;
 	uint16_t mtu, *rxq_id = NULL;
-	char nm[64];
+	char nm[RTE_MEMZONE_NAMESIZE];
 
 	pthread_mutex_lock(&s_fd_mutex);
 	if (sockfd < 0) {
@@ -3246,13 +3380,25 @@ usr_socket_fd_desc_init(int sockfd,
 		rx_entry->poll_type = RX_QUEUE;
 		rx_entry->poll.poll_port.port_id = rx_port;
 		rx_entry->poll.poll_port.queue_id = rxq_id;
-		rx_entry->dest_type = RX_RING;
-		sprintf(nm, "rx_ring_fd%d", sockfd);
-		rx_entry->dest.rx_ring = rte_ring_create(nm, MEMPOOL_USR_SIZE,
-			0, RING_F_SP_ENQ | RING_F_SC_DEQ);
-		if (!rx_entry->dest.rx_ring) {
-			ret = -ENOMEM;
-			goto fd_init_quit;
+		if (s_fd_rte_ring) {
+			sprintf(nm, "rx_ring_fd%d", sockfd);
+			rx_entry->dest_type = RX_RING;
+			rx_entry->dest.rx_ring = rte_ring_create(nm,
+				MEMPOOL_USR_SIZE,
+				0, RING_F_SP_ENQ | RING_F_SC_DEQ);
+			if (!rx_entry->dest.rx_ring) {
+				ret = -ENOMEM;
+				goto fd_init_quit;
+			}
+		} else {
+			sprintf(nm, "pre_ld_rx_ring_fd%d", sockfd);
+			rx_entry->dest_type = PRE_LD_RX_RING;
+			rx_entry->dest.pre_ld_rx_ring = pre_ld_ring_create(nm,
+				MEMPOOL_USR_SIZE);
+			if (!rx_entry->dest.pre_ld_rx_ring) {
+				ret = -ENOMEM;
+				goto fd_init_quit;
+			}
 		}
 		pre_ld_insert_dir_list_safe(list, rx_entry);
 		desc->dp_desc.entry_desc.rx_entry = rx_entry;
@@ -3312,8 +3458,14 @@ fd_init_quit:
 				rte_ring_free(tx_entry->poll.tx_ring);
 			if (tx_entry)
 				rte_free(tx_entry);
-			if (rx_entry && rx_entry->dest.rx_ring)
+			if (rx_entry &&
+				rx_entry->dest_type == RX_RING &&
+				rx_entry->dest.rx_ring)
 				rte_ring_free(rx_entry->dest.rx_ring);
+			else if (rx_entry &&
+				rx_entry->dest_type == PRE_LD_RX_RING &&
+				rx_entry->dest.pre_ld_rx_ring)
+				pre_ld_ring_free(rx_entry->dest.pre_ld_rx_ring);
 			if (rx_entry)
 				rte_free(rx_entry);
 		}
@@ -4636,6 +4788,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_FORCE_EAL_THREAD");
 	if (env)
 		s_force_eal_thread = atoi(env);
+
+	env = getenv("PRE_LOAD_FD_RTE_RING");
+	if (env)
+		s_fd_rte_ring = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
