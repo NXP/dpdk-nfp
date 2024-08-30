@@ -447,7 +447,7 @@ xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 	struct rte_flow_error error;
 	struct pre_ld_xfm_flow *xfm_flow;
 	uint16_t port_id;
-	int ret;
+	int ret, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
 
 	if (sp->flow) {
 		RTE_LOG(WARNING, pre_ld,
@@ -465,11 +465,16 @@ xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 		xfm_flow = rte_zmalloc(NULL,
 			sizeof(struct pre_ld_xfm_flow), 0);
 		if (!xfm_flow) {
+again:
 			ret = rte_flow_destroy(port_id, sp->flow, &error);
 			if (ret) {
 				RTE_LOG(INFO, pre_ld,
-					"%s: destroy flow failed(%d)\n",
-					__func__, ret);
+					"%s: destroy flow failed(%d), times=%d\n",
+					__func__, ret, times);
+			}
+			if (ret == -EAGAIN && times > 0) {
+				times--;
+				goto again;
 			}
 			sp->flow = NULL;
 
@@ -505,7 +510,7 @@ xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 static int
 process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 {
-	int ret = 0;
+	int ret = 0, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
 	struct rte_flow_error error;
 	uint16_t port_id = sp->entry_to_sec->poll.poll_port.port_id;
 	struct pre_ld_xfm_flow *xfm_flow = NULL, *txfm_flow;
@@ -523,11 +528,16 @@ process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 		return -ENODATA;
 
 	if (!xfm_flow->flow_ref) {
+again:
 		ret = rte_flow_destroy(port_id, sp->flow, &error);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
-				"%s: Policy flow destroy failed(%s)\n",
-				__func__, error.message);
+				"%s: Policy flow destroy failed(%s)(%d), times=%d\n",
+				__func__, error.message, ret, times);
+		}
+		if (ret == -EAGAIN && times > 0) {
+			times--;
+			goto again;
 		}
 
 		pre_ld_deconfigure_sec_path(sp);

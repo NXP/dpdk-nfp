@@ -190,6 +190,8 @@ struct pre_ld_ipsec_cntx {
 	struct pre_ld_ipsec_sp_head sp_ipv6_out_list;
 };
 
+#define PRE_LD_FLOW_DESTROY_TRY_TIMES 10
+
 #define dcbf(p) { asm volatile("dc cvac, %0" : : "r"(p) : "memory"); }
 #define dccivac(p) { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
 

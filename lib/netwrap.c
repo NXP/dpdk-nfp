@@ -693,7 +693,7 @@ usr_socket_fd_remove(int sockfd)
 static int
 usr_socket_fd_release(int sockfd)
 {
-	int ret = 0, i;
+	int ret = 0, i, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
 	uint16_t rx_port, nb, *rxq_id;
 	struct pre_ld_rx_pool *rx_pool;
 	struct rte_mbuf *free_burst[MAX_PKT_BURST];
@@ -731,11 +731,16 @@ usr_socket_fd_release(int sockfd)
 	}
 
 	if (desc->flow) {
+again:
 		ret = rte_flow_destroy(rx_port, desc->flow, NULL);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
-				"%s: Destroy FD[%d].flow failed(%d)\n",
-				__func__, sockfd, ret);
+				"%s: Destroy FD[%d].flow failed(%d), times=%d\n",
+				__func__, sockfd, ret, times);
+		}
+		if (ret == -EAGAIN && times > 0) {
+			times--;
+			goto again;
 		}
 		desc->flow = NULL;
 	}
