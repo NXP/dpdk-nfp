@@ -123,11 +123,12 @@ static const struct xfm_auth_support s_auth_xfm[] = {
 	},
 };
 
+#define PRE_LD_SA_INVALID_DIR \
+	(RTE_SECURITY_IPSEC_SA_DIR_INGRESS + 1)
+
 static int s_ipsec_ib_flow_ip_addr_extract;
 
 static struct pre_ld_ipsec_cntx s_pre_ld_ipsec_cntx;
-
-static int s_kernel_sp_sa_clear;
 
 static double s_xfm_cycs_per_us;
 
@@ -686,6 +687,96 @@ xfm_find_sa_addrs_by_sp_addrs(const xfrm_address_t *src,
 	return -ENODATA;
 }
 
+static void
+xfm_dump_all_sa_sp(const char *prefix)
+{
+	const struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+	const struct pre_ld_ipsec_sa_entry *sa;
+	const struct pre_ld_ipsec_sp_entry *sp;
+	int num = 0, off = 0;
+	const uint8_t *addr;
+	char *info = rte_zmalloc(NULL, 4096, 0);
+
+	if (!info)
+		return;
+
+	/* IPv4 only.**/
+	sa = LIST_FIRST(&cntx->sa_list);
+	while (sa) {
+		off += sprintf(&info[off], "SA %s ",
+			sa->sess_conf.ipsec.direction ==
+			RTE_SECURITY_IPSEC_SA_DIR_EGRESS ?
+			"OUT" :
+			sa->sess_conf.ipsec.direction ==
+			RTE_SECURITY_IPSEC_SA_DIR_INGRESS ?
+			"IN" : "Not directed");
+		addr = (const void *)&sa->src;
+		off += sprintf(&info[off], "src:%d.%d.%d.%d/",
+			addr[0], addr[1], addr[2], addr[3]);
+		addr = (const void *)&sa->dst;
+		off += sprintf(&info[off], "dst:%d.%d.%d.%d ",
+			addr[0], addr[1], addr[2], addr[3]);
+		off += sprintf(&info[off], "spi(%08x) ",
+			sa->sess_conf.ipsec.spi);
+		off += sprintf(&info[off], "%s ",
+			sa->sp ? "Associated" : "None associated");
+		off += sprintf(&info[off], "lifetime(%.2f s)\n",
+			(rte_get_timer_cycles() - sa->created_cyc) /
+			(s_xfm_cycs_per_us * 1000 * 1000));
+		num++;
+		sa = LIST_NEXT(sa, next);
+	}
+	if (!num)
+		off += sprintf(&info[off], "SA list is empty\n");
+	else
+		off += sprintf(&info[off], "Total %d SA(s)\n", num);
+
+	num = 0;
+	sp = LIST_FIRST(&cntx->sp_ipv4_in_list);
+	while (sp) {
+		addr = (const void *)&sp->src;
+		off += sprintf(&info[off], "SP IN[%d] src:%d.%d.%d.%d/",
+			sp->index, addr[0], addr[1], addr[2], addr[3]);
+		addr = (const void *)&sp->dst;
+		off += sprintf(&info[off], "dst:%d.%d.%d.%d ",
+			addr[0], addr[1], addr[2], addr[3]);
+		off += sprintf(&info[off], "spi(%08x)\n",
+			rte_be_to_cpu_32(sp->esp_spec.hdr.spi));
+		num++;
+		sp = LIST_NEXT(sp, next);
+	}
+	if (!num)
+		off += sprintf(&info[off], "SP IN list is empty\n");
+	else
+		off += sprintf(&info[off], "Total %d SP IN(s)\n", num);
+
+	num = 0;
+	sp = LIST_FIRST(&cntx->sp_ipv4_out_list);
+	while (sp) {
+		addr = (const void *)&sp->src;
+		off += sprintf(&info[off], "SP OUT[%d] src:%d.%d.%d.%d/",
+			sp->index, addr[0], addr[1], addr[2], addr[3]);
+		addr = (const void *)&sp->dst;
+		off += sprintf(&info[off], "dst:%d.%d.%d.%d ",
+			addr[0], addr[1], addr[2], addr[3]);
+		if (sp->sa) {
+			off += sprintf(&info[off], "spi(%08x)\n",
+				sp->sa->sess_conf.ipsec.spi);
+		} else {
+			off += sprintf(&info[off], "spi(NULL)\n");
+		}
+		num++;
+		sp = LIST_NEXT(sp, next);
+	}
+	if (!num)
+		off += sprintf(&info[off], "SP OUT list is empty\n");
+	else
+		off += sprintf(&info[off], "Total %d SP OUT(s)\n", num);
+
+	RTE_LOG(INFO, pre_ld, "%s\n%s\n", prefix, info);
+	rte_free(info);
+}
+
 static int
 xfm_to_sa_entry(const struct xfm_ipsec_sa_params *sa_param,
 	const struct xfrm_usersa_info *sa_info, int update)
@@ -819,8 +910,7 @@ update_sa:
 	if (sa_info->mode == XFRM_MODE_TUNNEL)
 		sa_entry->sess_conf.ipsec.options.ecn = 1;
 
-	sa_entry->sess_conf.ipsec.direction =
-		RTE_SECURITY_IPSEC_SA_DIR_INGRESS;
+	sa_entry->sess_conf.ipsec.direction = PRE_LD_SA_INVALID_DIR;
 	sa_entry->sess_conf.ipsec.proto =
 		RTE_SECURITY_IPSEC_SA_PROTO_ESP;
 	if (sa_info->mode == XFRM_MODE_TUNNEL) {
@@ -950,6 +1040,8 @@ process_notif_sa(const struct nlmsghdr *nh, int len,
 	int msg_len = 0;
 	int ret = 0;
 
+	xfm_dump_all_sa_sp("Before new SA notification");
+
 	RTE_LOG(INFO, pre_ld, "XFRM notification type(%d)\n",
 		nh->nlmsg_type);
 
@@ -978,6 +1070,7 @@ process_notif_sa(const struct nlmsghdr *nh, int len,
 	/** We can't apply SA to HW now until SA is associated to SP
 	 * to get direction.
 	 */
+	xfm_dump_all_sa_sp("After new SA notification");
 
 	return ret;
 }
@@ -1003,7 +1096,10 @@ process_del_sa_entry(struct pre_ld_ipsec_sa_entry *sa)
 		"Delete SA %s spi(%08x), lifetime(%.2f s)\n",
 		sa->sess_conf.ipsec.direction ==
 		RTE_SECURITY_IPSEC_SA_DIR_INGRESS ?
-		"IN" : "OUT", sa->sess_conf.ipsec.spi,
+		"IN" : sa->sess_conf.ipsec.direction ==
+		RTE_SECURITY_IPSEC_SA_DIR_EGRESS ?
+		"OUT" : "Not directed",
+		sa->sess_conf.ipsec.spi,
 		(rte_get_timer_cycles() - sa->created_cyc) /
 		(s_xfm_cycs_per_us * 1000 * 1000));
 	rte_free(sa);
@@ -1021,6 +1117,8 @@ static int process_del_sa(const struct nlmsghdr *nh)
 	uint16_t info_offset = 0, size = 0;
 	uint32_t cpu_spi;
 	int ret;
+
+	xfm_dump_all_sa_sp("Before del SA notification");
 
 	usersa_id = NLMSG_DATA(nh);
 
@@ -1052,7 +1150,7 @@ static int process_del_sa(const struct nlmsghdr *nh)
 			}
 		}
 
-		return process_del_sa_entry(curr);
+		ret = process_del_sa_entry(curr);
 	}
 
 	rte_memcpy(addr, &usersa_id->daddr, size);
@@ -1072,8 +1170,14 @@ static int process_del_sa(const struct nlmsghdr *nh)
 	}
 
 	RTE_LOG(INFO, pre_ld,
-		"XFRM delete spi(0x%08x), %s failed\n",
-		rte_be_to_cpu_32(usersa_id->spi), addr_info);
+		"XFRM deleting SA spi(0x%08x), %s %s\n",
+		rte_be_to_cpu_32(usersa_id->spi), addr_info,
+		curr ? "deleted" : "not found");
+
+	xfm_dump_all_sa_sp("After del SA notification");
+
+	if (curr)
+		return ret;
 
 	return -ENODATA;
 }
@@ -1241,34 +1345,22 @@ xfm_sa_sp_associate(struct pre_ld_ipsec_sp_entry *sp,
 }
 
 static void
-xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
+xfm_init_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 	const struct xfrm_userpolicy_info *pol_info,
 	const xfrm_address_t *saddr, const xfrm_address_t *daddr,
 	int af)
 {
-	struct pre_ld_ipsec_sp_entry *curr;
-	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
-	struct pre_ld_ipsec_sp_head *head;
 	const uint8_t *src_ip4, *dst_ip4;
 	const rte_be16_t *src_ip6, *dst_ip6;
 	char add_str[1024];
 	int offset;
 
-	if (pol_info->dir == XFRM_POLICY_OUT) {
-		if (af == AF_INET)
-			head = &cntx->sp_ipv4_out_list;
-		else
-			head = &cntx->sp_ipv6_out_list;
-	} else {
-		if (af == AF_INET)
-			head = &cntx->sp_ipv4_in_list;
-		else
-			head = &cntx->sp_ipv6_in_list;
-	}
-	curr = LIST_FIRST(head);
-
 	rte_memcpy(&sp->src, saddr, sizeof(xfrm_address_t));
 	rte_memcpy(&sp->dst, daddr, sizeof(xfrm_address_t));
+	rte_memcpy(&sp->sel_src, &pol_info->sel.saddr,
+		sizeof(xfrm_address_t));
+	rte_memcpy(&sp->sel_dst, &pol_info->sel.daddr,
+		sizeof(xfrm_address_t));
 	src_ip4 = (const void *)saddr;
 	dst_ip4 = (const void *)daddr;
 	src_ip6 = (const void *)saddr;
@@ -1305,6 +1397,27 @@ xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 	sp->family = af;
 	sp->sa = NULL;
 	sp->dir = pol_info->dir;
+}
+
+static void
+xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp)
+{
+	struct pre_ld_ipsec_sp_entry *curr;
+	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+	struct pre_ld_ipsec_sp_head *head;
+
+	if (sp->dir == XFRM_POLICY_OUT) {
+		if (sp->family == AF_INET)
+			head = &cntx->sp_ipv4_out_list;
+		else
+			head = &cntx->sp_ipv6_out_list;
+	} else {
+		if (sp->family == AF_INET)
+			head = &cntx->sp_ipv4_in_list;
+		else
+			head = &cntx->sp_ipv6_in_list;
+	}
+	curr = LIST_FIRST(head);
 
 	if (!curr) {
 		LIST_INSERT_HEAD(head, sp, next);
@@ -1368,7 +1481,7 @@ process_new_policy(const struct nlmsghdr *nh,
 	xfrm_address_t saddr, daddr;
 	uint32_t spi;
 	struct pre_ld_ipsec_sa_entry *sas[MAX_SA_NUM], *sa = NULL;
-	struct pre_ld_ipsec_sp_entry *sp;
+	struct pre_ld_ipsec_sp_entry *sp = NULL;
 	char addr_info[1024];
 
 	pol_info = NLMSG_DATA(nh);
@@ -1378,8 +1491,10 @@ process_new_policy(const struct nlmsghdr *nh,
 		RTE_LOG(DEBUG, pre_ld,
 			"Don't configure policy (dir=%d)\n",
 			pol_info->dir);
-		return 0;
+		return -ENOTSUP;
 	}
+
+	xfm_dump_all_sa_sp("Before new SP notification");
 
 	dump_new_policy(pol_info);
 
@@ -1460,12 +1575,7 @@ process_new_policy(const struct nlmsghdr *nh,
 		return -ENOMEM;
 	}
 
-	xfm_insert_new_policy(sp, pol_info, &saddr, &daddr, af);
-
-	rte_memcpy(&sp->sel_src, &pol_info->sel.saddr,
-		sizeof(xfrm_address_t));
-	rte_memcpy(&sp->sel_dst, &pol_info->sel.daddr,
-		sizeof(xfrm_address_t));
+	xfm_init_new_policy(sp, pol_info, &saddr, &daddr, af);
 
 	sp->crypt_id = sec_id;
 
@@ -1475,47 +1585,27 @@ process_new_policy(const struct nlmsghdr *nh,
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
 				"Create session failed(%d)\n", ret);
+			goto quit;
 		} else if (!sa->session.security.ses) {
 			RTE_LOG(ERR, pre_ld,
 				"Security session not allocated\n");
 			ret = -ENOBUFS;
+			goto quit;
 		}
 	}
 
-	if (!ret) {
-		ret = xfm_sa_sp_associate(sp, sa, flow);
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"SA/SP associate failed!\n");
+	ret = xfm_sa_sp_associate(sp, sa, flow);
+	if (ret)
+		RTE_LOG(ERR, pre_ld, "SA/SP associate failed!\n");
 
-			return ret;
-		}
-		if (s_kernel_sp_sa_clear) {
-			ret = do_spddel(pol_info->index);
-			if (ret) {
-				RTE_LOG(ERR, pre_ld,
-					"Delete policy[%d] in kernel failed(%d)\n",
-					pol_info->index, ret);
-			} else {
-				RTE_LOG(INFO, pre_ld,
-					"Delete policy[%d] in kernel successfully\n",
-					pol_info->index);
-			}
-			if (sp->sa) {
-				spi = sp->sa->sess_conf.ipsec.spi;
-				ret = do_saddel(spi);
-				if (ret) {
-					RTE_LOG(ERR, pre_ld,
-						"Delete SA(spi=%08x) in kernel failed(%d)\n",
-						spi, ret);
-				} else {
-					RTE_LOG(INFO, pre_ld,
-						"Delete SA(spi=%08x) in kernel successfully\n",
-						spi);
-				}
-			}
-		}
+quit:
+	if (ret) {
+		if (sp)
+			rte_free(sp);
+	} else {
+		xfm_insert_new_policy(sp);
 	}
+	xfm_dump_all_sa_sp("After new SP notification");
 
 	return ret;
 }
@@ -1526,19 +1616,20 @@ static int process_del_policy(const struct nlmsghdr *nh)
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 	struct pre_ld_ipsec_sp_head *head;
 	struct pre_ld_ipsec_sp_entry *curr;
+	struct pre_ld_ipsec_sa_entry *sa = NULL;
 	void *src, *dst;
 	uint64_t size, offset = 0;
 	char addr_info[256], src_info[16], dst_info[16];
+	int ret;
 
 	pol_id = NLMSG_DATA(nh);
 
-	RTE_LOG(INFO, pre_ld, "XFRM del policy dir:%d\n",
-		pol_id->dir);
-
-	/* we handle only in/out policies */
+	/* we handle only in/out policy */
 	if (pol_id->dir != XFRM_POLICY_OUT &&
 		pol_id->dir != XFRM_POLICY_IN)
-		return -EBADMSG;
+		return -ENOTSUP;
+
+	xfm_dump_all_sa_sp("Before del SP notification");
 
 	if (pol_id->sel.family == AF_INET &&
 		pol_id->dir == XFRM_POLICY_IN) {
@@ -1557,7 +1648,7 @@ static int process_del_policy(const struct nlmsghdr *nh)
 		head = &cntx->sp_ipv6_out_list;
 		size = 16;
 	} else {
-		/* we handle only in/out policies */
+		/* we handle only in/out policy */
 		RTE_LOG(ERR, pre_ld,
 			"XFRM del policy dir(%d)/family(%d) unsupport\n",
 			pol_id->dir, pol_id->sel.family);
@@ -1570,14 +1661,31 @@ static int process_del_policy(const struct nlmsghdr *nh)
 		src = &curr->sel_src;
 		dst = &curr->sel_dst;
 		if (!memcmp(src, &pol_id->sel.saddr, size) &&
-			!memcmp(dst, &pol_id->sel.daddr, size) &&
-			curr->index == pol_id->index)
+			!memcmp(dst, &pol_id->sel.daddr, size))
 			break;
 		curr = LIST_NEXT(curr, next);
 	}
 
-	if (curr)
-		return process_del_policy_entry(curr);
+	if (curr) {
+		/** Remove SP first then remove associated SA.*/
+		sa = curr->sa;
+		ret = process_del_policy_entry(curr);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"XFRM del policy entry failed(%d)\n",
+				ret);
+		}
+		if (sa) {
+			ret = process_del_sa_entry(sa);
+			if (ret) {
+				RTE_LOG(ERR, pre_ld,
+					"%s: delete associated sa failed(%d)\n",
+					__func__, ret);
+			}
+		}
+	} else {
+		ret = -ENODATA;
+	}
 
 	rte_memcpy(src_info, &pol_id->sel.saddr, size);
 	rte_memcpy(dst_info, &pol_id->sel.daddr, size);
@@ -1606,12 +1714,16 @@ static int process_del_policy(const struct nlmsghdr *nh)
 			dst_info[12], dst_info[13], dst_info[14], dst_info[15]);
 	}
 
-	RTE_LOG(ERR, pre_ld,
-		"XFRM del policy not found dir(%d)/family(%d) %s\n",
-		pol_id->dir, pol_id->sel.family,
+	RTE_LOG(INFO, pre_ld,
+		"XFRM delete policy[%d] %s %s(%d) %s\n",
+		pol_id->index,
+		pol_id->dir == XFRM_POLICY_IN ? "IN" : "OUT",
+		curr ? "done" : "not found", ret,
 		addr_info);
 
-	return -ENODATA;
+	xfm_dump_all_sa_sp("After del SP notification");
+
+	return ret;
 }
 
 static int process_flush_policy(void)
@@ -1674,32 +1786,29 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		}
 		break;
 	case XFRM_MSG_UPDPOLICY:
-		RTE_LOG(INFO, pre_ld, "XFRM update policy start\n");
 		ret = process_new_policy(nh, sec_id, mp);
-		if (ret) {
+		if (ret && ret != -ENOTSUP) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM update policy failed(%d)\n\n", ret);
-		} else {
+		} else if (!ret) {
 			RTE_LOG(INFO, pre_ld, "XFRM update policy done\n\n");
 		}
 		break;
 	case XFRM_MSG_NEWPOLICY:
-		RTE_LOG(INFO, pre_ld, "XFRM new policy start\n");
 		ret = process_new_policy(nh, sec_id, mp);
-		if (ret) {
+		if (ret && ret != -ENOTSUP) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM new policy failed(%d)\n\n", ret);
-		} else {
+		} else if (!ret) {
 			RTE_LOG(INFO, pre_ld, "XFRM new policy done\n\n");
 		}
 		break;
 	case XFRM_MSG_DELPOLICY:
-		RTE_LOG(INFO, pre_ld, "XFRM delete policy start\n");
 		ret = process_del_policy(nh);
-		if (ret) {
+		if (ret && ret != -ENOTSUP) {
 			RTE_LOG(ERR, pre_ld,
 				"XFRM delete policy failed(%d)\n\n", ret);
-		} else {
+		} else if (!ret) {
 			RTE_LOG(INFO, pre_ld, "XFRM delete policy done\n\n");
 		}
 		break;
