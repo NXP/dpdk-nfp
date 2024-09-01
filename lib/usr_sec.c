@@ -1107,9 +1107,10 @@ process_del_sa_entry(struct pre_ld_ipsec_sa_entry *sa)
 	return ret;
 }
 
-static int process_del_sa(const struct nlmsghdr *nh)
+static int
+xfm_del_sa(uint16_t family, rte_be32_t spi,
+	const xfrm_address_t *daddr)
 {
-	struct xfrm_usersa_id *usersa_id;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 	struct pre_ld_ipsec_sa_entry *curr;
 	uint8_t addr[16];
@@ -1118,22 +1119,14 @@ static int process_del_sa(const struct nlmsghdr *nh)
 	uint32_t cpu_spi;
 	int ret;
 
-	xfm_dump_all_sa_sp("Before del SA notification");
-
-	usersa_id = NLMSG_DATA(nh);
-
-	if (usersa_id->family == AF_INET)
-		size = sizeof(rte_be32_t);
-	else if (usersa_id->family == AF_INET6)
-		size = 16;
-
-	cpu_spi = rte_be_to_cpu_32(usersa_id->spi);
+	size = family == AF_INET ? sizeof(rte_be32_t) : 16;
+	cpu_spi = rte_be_to_cpu_32(spi);
 
 	curr = LIST_FIRST(&cntx->sa_list);
 
 	while (curr) {
-		if (usersa_id->family == curr->family &&
-			!memcmp(&usersa_id->daddr, &curr->dst, size) &&
+		if (family == curr->family &&
+			!memcmp(daddr, &curr->dst, size) &&
 			cpu_spi == curr->sess_conf.ipsec.spi)
 			break;
 
@@ -1153,8 +1146,8 @@ static int process_del_sa(const struct nlmsghdr *nh)
 		ret = process_del_sa_entry(curr);
 	}
 
-	rte_memcpy(addr, &usersa_id->daddr, size);
-	if (usersa_id->family == AF_INET) {
+	rte_memcpy(addr, daddr, size);
+	if (family == AF_INET) {
 		sprintf(addr_info, "IPV4 dst: %d.%d.%d.%d",
 			addr[0], addr[1], addr[2], addr[3]);
 	} else {
@@ -1171,15 +1164,71 @@ static int process_del_sa(const struct nlmsghdr *nh)
 
 	RTE_LOG(INFO, pre_ld,
 		"XFRM deleting SA spi(0x%08x), %s %s\n",
-		rte_be_to_cpu_32(usersa_id->spi), addr_info,
-		curr ? "deleted" : "not found");
-
-	xfm_dump_all_sa_sp("After del SA notification");
+		cpu_spi, addr_info, curr ? "deleted" : "not found");
 
 	if (curr)
 		return ret;
 
 	return -ENODATA;
+}
+
+static void process_flush_sa(void)
+{
+	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
+	struct pre_ld_ipsec_sa_entry *curr;
+	int ret;
+
+	xfm_dump_all_sa_sp("Before flush SA notification");
+
+	curr = LIST_FIRST(&cntx->sa_list);
+	while (curr) {
+		ret = xfm_del_sa(curr->family,
+			rte_cpu_to_be_32(curr->sess_conf.ipsec.spi),
+			&curr->dst);
+		if (ret && curr == LIST_FIRST(&cntx->sa_list)) {
+			/** Force remove.*/
+			LIST_REMOVE(curr, next);
+		}
+		curr = LIST_FIRST(&cntx->sa_list);
+	}
+
+	xfm_dump_all_sa_sp("After flush SA notification");
+}
+
+static int process_del_sa(const struct nlmsghdr *nh)
+{
+	struct xfrm_usersa_id *usersa_id;
+	int ret;
+
+	xfm_dump_all_sa_sp("Before del SA notification");
+
+	usersa_id = NLMSG_DATA(nh);
+
+	ret = xfm_del_sa(usersa_id->family, usersa_id->spi,
+		&usersa_id->daddr);
+
+	xfm_dump_all_sa_sp("After del SA notification");
+
+	return ret;
+}
+
+static int process_exp_sa(const struct nlmsghdr *nh)
+{
+	struct xfrm_usersa_info *xsinfo = NULL;
+	struct xfrm_user_expire *xexp = NULL;
+	int ret;
+
+	xexp = NLMSG_DATA(nh);
+	xsinfo = &xexp->state;
+
+	xfm_dump_all_sa_sp("Before expire SA notification");
+
+	ret = xfm_del_sa(xsinfo->family, xsinfo->id.spi,
+		&xsinfo->id.daddr);
+
+	xfm_dump_all_sa_sp("After expire SA notification");
+
+	return ret;
 }
 
 static void
@@ -1610,9 +1659,10 @@ quit:
 	return ret;
 }
 
-static int process_del_policy(const struct nlmsghdr *nh)
+static int
+xfm_del_policy(const struct xfrm_selector *sel,
+	uint8_t dir)
 {
-	struct xfrm_userpolicy_id *pol_id;
 	struct pre_ld_ipsec_cntx *cntx = xfm_get_cntx();
 	struct pre_ld_ipsec_sp_head *head;
 	struct pre_ld_ipsec_sp_entry *curr;
@@ -1622,36 +1672,27 @@ static int process_del_policy(const struct nlmsghdr *nh)
 	char addr_info[256], src_info[16], dst_info[16];
 	int ret;
 
-	pol_id = NLMSG_DATA(nh);
-
-	/* we handle only in/out policy */
-	if (pol_id->dir != XFRM_POLICY_OUT &&
-		pol_id->dir != XFRM_POLICY_IN)
-		return -ENOTSUP;
-
-	xfm_dump_all_sa_sp("Before del SP notification");
-
-	if (pol_id->sel.family == AF_INET &&
-		pol_id->dir == XFRM_POLICY_IN) {
+	if (sel->family == AF_INET &&
+		dir == XFRM_POLICY_IN) {
 		head = &cntx->sp_ipv4_in_list;
 		size = sizeof(rte_be32_t);
-	} else if (pol_id->sel.family == AF_INET &&
-		pol_id->dir == XFRM_POLICY_OUT) {
+	} else if (sel->family == AF_INET &&
+		dir == XFRM_POLICY_OUT) {
 		head = &cntx->sp_ipv4_out_list;
 		size = sizeof(rte_be32_t);
-	} else if (pol_id->sel.family == AF_INET6 &&
-		pol_id->dir == XFRM_POLICY_IN) {
+	} else if (sel->family == AF_INET6 &&
+		dir == XFRM_POLICY_IN) {
 		head = &cntx->sp_ipv6_in_list;
 		size = 16;
-	} else if (pol_id->sel.family == AF_INET6 &&
-		pol_id->dir == XFRM_POLICY_OUT) {
+	} else if (sel->family == AF_INET6 &&
+		dir == XFRM_POLICY_OUT) {
 		head = &cntx->sp_ipv6_out_list;
 		size = 16;
 	} else {
 		/* we handle only in/out policy */
 		RTE_LOG(ERR, pre_ld,
 			"XFRM del policy dir(%d)/family(%d) unsupport\n",
-			pol_id->dir, pol_id->sel.family);
+			dir, sel->family);
 		return -EINVAL;
 	}
 
@@ -1660,8 +1701,8 @@ static int process_del_policy(const struct nlmsghdr *nh)
 	while (curr) {
 		src = &curr->sel_src;
 		dst = &curr->sel_dst;
-		if (!memcmp(src, &pol_id->sel.saddr, size) &&
-			!memcmp(dst, &pol_id->sel.daddr, size))
+		if (!memcmp(src, &sel->saddr, size) &&
+			!memcmp(dst, &sel->daddr, size))
 			break;
 		curr = LIST_NEXT(curr, next);
 	}
@@ -1672,25 +1713,24 @@ static int process_del_policy(const struct nlmsghdr *nh)
 		ret = process_del_policy_entry(curr);
 		if (ret) {
 			RTE_LOG(ERR, pre_ld,
-				"XFRM del policy entry failed(%d)\n",
-				ret);
+				"XFRM del policy entry failed(%d)\n", ret);
 		}
 		if (sa) {
 			ret = process_del_sa_entry(sa);
 			if (ret) {
 				RTE_LOG(ERR, pre_ld,
-					"%s: delete associated sa failed(%d)\n",
-					__func__, ret);
+					"XFRM delete associated sa failed(%d)\n",
+					ret);
 			}
 		}
 	} else {
 		ret = -ENODATA;
 	}
 
-	rte_memcpy(src_info, &pol_id->sel.saddr, size);
-	rte_memcpy(dst_info, &pol_id->sel.daddr, size);
+	rte_memcpy(src_info, &sel->saddr, size);
+	rte_memcpy(dst_info, &sel->daddr, size);
 
-	if (pol_id->sel.family == AF_INET) {
+	if (sel->family == AF_INET) {
 		sprintf(addr_info,
 			"src/dst:%d.%d.%d.%d/%d.%d.%d.%d",
 			src_info[0], src_info[1], src_info[2], src_info[3],
@@ -1715,13 +1755,53 @@ static int process_del_policy(const struct nlmsghdr *nh)
 	}
 
 	RTE_LOG(INFO, pre_ld,
-		"XFRM delete policy[%d] %s %s(%d) %s\n",
-		pol_id->index,
-		pol_id->dir == XFRM_POLICY_IN ? "IN" : "OUT",
-		curr ? "done" : "not found", ret,
-		addr_info);
+		"XFRM delete policy %s %s(%d) %s\n",
+		dir == XFRM_POLICY_IN ? "IN" : "OUT",
+		curr ? "done" : "not found", ret, addr_info);
+
+	return ret;
+}
+
+static int process_del_policy(const struct nlmsghdr *nh)
+{
+	struct xfrm_userpolicy_id *pol_id;
+	int ret;
+
+	pol_id = NLMSG_DATA(nh);
+
+	/* we handle only in/out policy */
+	if (pol_id->dir != XFRM_POLICY_OUT &&
+		pol_id->dir != XFRM_POLICY_IN)
+		return -ENOTSUP;
+
+	xfm_dump_all_sa_sp("Before del SP notification");
+
+	ret = xfm_del_policy(&pol_id->sel, pol_id->dir);
 
 	xfm_dump_all_sa_sp("After del SP notification");
+
+	return ret;
+}
+
+static int process_exp_policy(const struct nlmsghdr *nh)
+{
+	struct xfrm_userpolicy_info	*xpol = NULL;
+	struct xfrm_user_polexpire *xpexp = NULL;
+	int ret;
+
+	xpexp = NLMSG_DATA(nh);
+	xpol = &xpexp->pol;
+
+	/* we handle only in/out policy */
+	if (xpol->dir != XFRM_POLICY_OUT &&
+		xpol->dir != XFRM_POLICY_IN)
+		return -ENOTSUP;
+
+	xfm_dump_all_sa_sp("Before expire SP notification");
+
+	ret = xfm_del_policy(&xpol->sel, xpol->dir);
+
+	xfm_dump_all_sa_sp("After expire SP notification");
 
 	return ret;
 }
@@ -1736,13 +1816,6 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 	uint16_t sec_id, struct rte_mempool *mp)
 {
 	int ret = 0;
-	struct xfrm_usersa_info *xsinfo = NULL;
-	struct xfrm_user_expire *xexp = NULL;
-	struct xfrm_userpolicy_info	*xpol = NULL;
-	struct xfrm_user_polexpire *xpexp = NULL;
-	uint8_t *src, *dst;
-	uint16_t *src16, *dst16;
-	char src_addr[128], dst_addr[128];
 
 	switch (nh->nlmsg_type) {
 	case XFRM_MSG_UPDSA:
@@ -1777,13 +1850,7 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		break;
 	case XFRM_MSG_FLUSHSA:
 		RTE_LOG(INFO, pre_ld, "XFRM flush SA start\n");
-		ret = 0;
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM flush SA failed(%d)\n\n", ret);
-		} else {
-			RTE_LOG(INFO, pre_ld, "XFRM flush SA done\n\n");
-		}
+		process_flush_sa();
 		break;
 	case XFRM_MSG_UPDPOLICY:
 		ret = process_new_policy(nh, sec_id, mp);
@@ -1823,36 +1890,10 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		}
 		break;
 	case XFRM_MSG_POLEXPIRE:
-		xpexp = NLMSG_DATA(nh);
-		xpol = &xpexp->pol;
-		if (xpol->sel.family == AF_INET) {
-			src = (void *)&xpol->sel.saddr;
-			dst = (void *)&xpol->sel.daddr;
-			sprintf(src_addr, "%d.%d.%d.%d",
-				src[0], src[1], src[2], src[3]);
-			sprintf(dst_addr, "%d.%d.%d.%d",
-				dst[0], dst[1], dst[2], dst[3]);
-		} else if (xpol->sel.family == AF_INET6) {
-			src16 = (void *)&xpol->sel.saddr;
-			dst16 = (void *)&xpol->sel.daddr;
-			sprintf(src_addr,
-				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-				src16[0], src16[1], src16[2], src16[3],
-				src16[4], src16[5], src16[6], src16[7]);
-			sprintf(dst_addr,
-				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-				dst16[0], dst16[1], dst16[2], dst16[3],
-				dst16[4], dst16[5], dst16[6], dst16[7]);
-		} else {
-			sprintf(src_addr, "Invalid family(%d)",
-				xpol->sel.family);
-			sprintf(dst_addr, "Invalid family(%d)",
-				xpol->sel.family);
-		}
+		ret = process_exp_policy(nh);
 		RTE_LOG(INFO, pre_ld,
-			"XFRM %s SP(src=%s/dst=%s) expire\n",
-			xpol->dir == XFRM_POLICY_IN ? "in" : "out",
-			src_addr, dst_addr);
+			"XFRM process SP expire %s\n",
+			ret ? "failed" : "success");
 		break;
 	case XFRM_MSG_FLUSHPOLICY:
 		RTE_LOG(INFO, pre_ld, "XFRM flush policy start\n");
@@ -1865,33 +1906,10 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 		}
 		break;
 	case XFRM_MSG_EXPIRE:
-		xexp = NLMSG_DATA(nh);
-		xsinfo = &xexp->state;
-		if (xsinfo->family == AF_INET) {
-			src = (void *)&xsinfo->saddr;
-			dst = (void *)&xsinfo->id.daddr;
-			sprintf(src_addr, "%d.%d.%d.%d",
-				src[0], src[1], src[2], src[3]);
-			sprintf(dst_addr, "%d.%d.%d.%d",
-				dst[0], dst[1], dst[2], dst[3]);
-		} else if (xsinfo->family == AF_INET6) {
-			src16 = (void *)&xsinfo->saddr;
-			dst16 = (void *)&xsinfo->id.daddr;
-			sprintf(src_addr,
-				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-				src16[0], src16[1], src16[2], src16[3],
-				src16[4], src16[5], src16[6], src16[7]);
-			sprintf(dst_addr,
-				"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-				dst16[0], dst16[1], dst16[2], dst16[3],
-				dst16[4], dst16[5], dst16[6], dst16[7]);
-		} else {
-			sprintf(src_addr, "Invalid family(%d)", xsinfo->family);
-			sprintf(dst_addr, "Invalid family(%d)", xsinfo->family);
-		}
+		ret = process_exp_sa(nh);
 		RTE_LOG(INFO, pre_ld,
-			"XFRM SA(src=%s/dst=%s/spi=0x%08x) expire\n",
-			src_addr, dst_addr, rte_be_to_cpu_32(xsinfo->id.spi));
+			"XFRM process SA expire %s\n",
+			ret ? "failed" : "success");
 		break;
 	default:
 		RTE_LOG(INFO, pre_ld,
