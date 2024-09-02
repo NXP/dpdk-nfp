@@ -343,6 +343,7 @@ static int s_ipsec_buf_swap;
 #define MAX_HUGE_FRAME_SIZE 9600
 static uint16_t s_mtu_set;
 static int s_dump_traffic_flow;
+static int s_select_dbg;
 
 struct pre_ld_default_direction {
 	struct rte_remote_dir_req *def_dir;
@@ -1131,14 +1132,6 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 		(uint8_t *)mbuf->buf_addr);
 
 	return 0;
-}
-
-static int
-recv_frame_available(int sockfd)
-{
-	RTE_SET_USED(sockfd);
-
-	return true;
 }
 
 static void
@@ -4593,83 +4586,50 @@ send_to_kernel:
 	return send_value;
 }
 
-static int
-select_usr_sys(int nfds, int usr_fd_num,
-	int usr_fd[], int sys_fd_num, int sys_fd[],
-	fd_set *readfds, struct timeval *timeout,
-	fd_set *writefds, fd_set *exceptfds)
+static uint16_t
+netwrap_filter_fd_set(const fd_set *fds,
+	const fd_set *filterd_fds, fd_set *rest_fds, int fd[])
 {
-	struct timeval sys_timeout;
-	int64_t total_usec = 1;
-	fd_set sys_readfds;
-	int select_value, i;
+	uint16_t num = 0;
+	const uint8_t *_f, *_t;
+	uint8_t *_r;
+	uint64_t i, j;
 
-	sys_timeout.tv_sec = 0;
-	sys_timeout.tv_usec = 1000 * 1000;
-
-	if (timeout) {
-		total_usec = timeout->tv_sec * 1000 * 1000 +
-			sys_timeout.tv_usec;
-	}
-	select_value = 0;
-
-	if (!usr_fd_num) {
-		return (*libc_select)(nfds, readfds, writefds,
-				exceptfds, timeout);
-	}
-	if (!sys_fd_num) {
-		memset(readfds, 0, sizeof(fd_set));
-		while (total_usec >= 0) {
-			for (i = 0; i < usr_fd_num; i++) {
-				if (recv_frame_available(usr_fd[i])) {
-					select_value++;
-					FD_SET(usr_fd[i], readfds);
-				}
-			}
-			if (select_value > 0)
-				break;
-			if (timeout)
-				total_usec -= sys_timeout.tv_usec;
-		}
-		return select_value;
-	}
-
-	while (total_usec >= 0) {
-		memset(&sys_readfds, 0, sizeof(fd_set));
-		for (i = 0; i < sys_fd_num; i++)
-			FD_SET(sys_fd[i], &sys_readfds);
-		select_value = (*libc_select)(nfds, &sys_readfds, writefds,
-			exceptfds, &sys_timeout);
-		for (i = 0; i < usr_fd_num; i++) {
-			if (recv_frame_available(usr_fd[i])) {
-				select_value++;
-				FD_SET(usr_fd[i], &sys_readfds);
+	_f = (const void *)filterd_fds;
+	_t = (const void *)fds;
+	_r = (void *)rest_fds;
+	for (i = 0; i < sizeof(fd_set); i++) {
+		_r[i] = _t[i] & (~_f[i]);
+		if (!_r[i])
+			continue;
+		for (j = 0; j < 8; j++) {
+			if ((1 << j) & _r[i] &&
+				!is_usr_socket(j + 8 * i)) {
+				fd[num] = j + 8 * i;
+				num++;
 			}
 		}
-		if (select_value > 0) {
-			rte_memcpy(readfds, &sys_readfds, sizeof(fd_set));
-			break;
-		}
-		if (timeout)
-			total_usec -= sys_timeout.tv_usec;
 	}
-	return select_value;
+
+	return num;
 }
 
 int select(int nfds, fd_set *readfds, fd_set *writefds,
 	fd_set *exceptfds, struct timeval *timeout)
 {
-	int select_value = 0, usr_fd_num = 0, sys_fd_num = 0;
-	int ret, i, j, off;
-	fd_set usr_readfds;
-	fd_set sys_readfds;
-	uint8_t *_usr, *_sys;
-	const uint8_t *_fds;
-	char usr_fd_buf[128];
-	char sys_fd_buf[128];
-	char sel_fd_buf[128];
-	int usr_fd[MAX_USR_FD_NUM];
-	int sys_fd[sizeof(fd_set) * 8];
+	int ret = 0, i, off, hit;
+	fd_set usr_rfds;
+	fd_set usr_wfds;
+	int usr_r_fd_num = 0, usr_w_fd_num = 0, user_fd_num = 0;
+	fd_set sys_rfds;
+	fd_set sys_wfds;
+	fd_set *rfds = NULL, *wfds = NULL;
+	int sys_r_fd_num = 0, sys_w_fd_num = 0;
+	char log_buf[1024];
+	int usr_r_fd[sizeof(fd_set) * 8];
+	int usr_w_fd[sizeof(fd_set) * 8];
+	int sys_r_fd[sizeof(fd_set) * 8];
+	int sys_w_fd[sizeof(fd_set) * 8];
 	struct fd_desc *usr, *tusr;
 
 	if (s_socket_dbg) {
@@ -4679,101 +4639,110 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 		dump_usr_fd(__func__);
 	}
 
-	if (RTE_TAILQ_FIRST(&s_fd_desc_list) && readfds) {
-		if (unlikely(!libc_select)) {
-			LIBC_FUNCTION(select);
-			if (!libc_select) {
-				select_value = -1;
-				errno = EACCES;
-
-				return select_value;
-			}
-		}
-
-		RTE_TAILQ_FOREACH_SAFE(usr, &s_fd_desc_list, next, tusr) {
-			if (FD_ISSET(usr->fd, readfds) && usr->flow) {
-				usr_fd[usr_fd_num] = usr->fd;
-				usr_fd_num++;
-			}
-		}
-
-		if (!usr_fd_num) {
-			select_value = (*libc_select)(nfds, readfds, writefds,
-				exceptfds, timeout);
-			return select_value;
-		}
-		memset(&usr_readfds, 0, sizeof(fd_set));
-		for (i = 0; i < usr_fd_num; i++)
-			FD_SET(usr_fd[i], &usr_readfds);
-		ret = memcmp(&usr_readfds, readfds, sizeof(fd_set));
-		if (likely(!ret)) {
-			/**User FD select only.*/
-			return select_usr_sys(nfds, usr_fd_num, usr_fd,
-				0, NULL, readfds, timeout,
-				writefds, exceptfds);
-		}
-
-		off = 0;
-		memset(usr_fd_buf, 0, sizeof(usr_fd_buf));
-		memset(sys_fd_buf, 0, sizeof(sys_fd_buf));
-		memset(sel_fd_buf, 0, sizeof(sys_fd_buf));
-		for (i = 0; i < usr_fd_num; i++)
-			off += sprintf(&usr_fd_buf[off], "%d ", usr_fd[i]);
-
-		memset(&sys_readfds, 0, sizeof(fd_set));
-		_usr = (void *)&usr_readfds;
-		_sys = (void *)&sys_readfds;
-		_fds = (void *)readfds;
-		off = 0;
-		for (i = 0; i < (int)sizeof(fd_set); i++) {
-			_sys[i] = _fds[i] & (~_usr[i]);
-			if (_sys[i]) {
-				for (j = 0; j < 8; j++) {
-					if ((1 << j) & _sys[i]) {
-						sys_fd[sys_fd_num] = j + 8 * i;
-						off += sprintf(&sys_fd_buf[off],
-							"%d ",
-							sys_fd[sys_fd_num]);
-						sys_fd_num++;
-					}
-				}
-			}
-		}
-
-		RTE_LOG(DEBUG, pre_ld,
-			"Select user FDs(%d): %s and system FDs(%d): %s on core%d(%d)\n",
-			usr_fd_num, usr_fd_buf, sys_fd_num, sys_fd_buf,
-			sched_getcpu(), rte_lcore_id());
-
-		if (1) {
-			select_value = (*libc_select)(nfds, readfds, writefds,
-				exceptfds, timeout);
-		} else {
-			select_value = select_usr_sys(nfds, usr_fd_num, usr_fd,
-				sys_fd_num, sys_fd, readfds, timeout,
-				writefds, exceptfds);
-		}
-	} else if (libc_select) {
-		select_value = (*libc_select)(nfds, readfds, writefds,
-			exceptfds, timeout);
-	} else {
+	if (unlikely(!libc_select)) {
 		LIBC_FUNCTION(select);
-
-		if (libc_select) {
-			select_value = (*libc_select)(nfds, readfds, writefds,
-				exceptfds, timeout);
-		} else {
-			select_value = -1;
+		if (!libc_select) {
+			ret = -1;
 			errno = EACCES;
+
+			return ret;
 		}
 	}
 
-	if (select_value < 0) {
-		RTE_LOG(ERR, pre_ld,
-			"Select system FDs err(%d)\n", select_value);
+	RTE_TAILQ_FOREACH_SAFE(usr, &s_fd_desc_list, next, tusr) {
+		hit = 0;
+		if (readfds && FD_ISSET(usr->fd, readfds) && usr->flow) {
+			usr_r_fd[usr_r_fd_num] = usr->fd;
+			usr_r_fd_num++;
+			hit++;
+		}
+		if (writefds && FD_ISSET(usr->fd, writefds)) {
+			usr_w_fd[usr_w_fd_num] = usr->fd;
+			usr_w_fd_num++;
+			hit++;
+		}
+		if (hit)
+			user_fd_num++;
 	}
 
-	return select_value;
+	if (!user_fd_num) {
+		return (*libc_select)(nfds, readfds, writefds,
+				exceptfds, timeout);
+	}
+
+	memset(&usr_rfds, 0, sizeof(fd_set));
+	memset(&usr_wfds, 0, sizeof(fd_set));
+	for (i = 0; i < usr_r_fd_num; i++)
+		FD_SET(usr_r_fd[i], &usr_rfds);
+	for (i = 0; i < usr_w_fd_num; i++)
+		FD_SET(usr_w_fd[i], &usr_wfds);
+
+	memset(&sys_rfds, 0, sizeof(fd_set));
+	memset(&sys_wfds, 0, sizeof(fd_set));
+
+	if (readfds) {
+		sys_r_fd_num = netwrap_filter_fd_set(readfds,
+			&usr_rfds, &sys_rfds, sys_r_fd);
+	}
+	if (writefds) {
+		sys_w_fd_num = netwrap_filter_fd_set(writefds,
+			&usr_wfds, &sys_wfds, sys_w_fd);
+	}
+
+	if (!s_select_dbg)
+		goto select_fds;
+
+	off = 0;
+	if (sys_r_fd_num) {
+		off += sprintf(&log_buf[off],
+			"Sys read FD(s)(=%d): ", sys_r_fd_num);
+		for (i = 0; i < sys_r_fd_num; i++)
+			off += sprintf(&log_buf[off], "%d ", sys_r_fd[i]);
+	}
+	if (sys_w_fd_num) {
+		off += sprintf(&log_buf[off],
+			"/Sys write FD(s)(=%d): ", sys_w_fd_num);
+		for (i = 0; i < sys_w_fd_num; i++)
+			off += sprintf(&log_buf[off], "%d ", sys_w_fd[i]);
+	}
+	if (usr_r_fd_num) {
+		off += sprintf(&log_buf[off],
+			"/Usr read FD(s)(=%d): ", usr_r_fd_num);
+		for (i = 0; i < usr_r_fd_num; i++)
+			off += sprintf(&log_buf[off], "%d ", usr_r_fd[i]);
+	}
+	if (usr_w_fd_num) {
+		off += sprintf(&log_buf[off],
+			"/Usr write FD(s)(=%d): ", usr_w_fd_num);
+		for (i = 0; i < usr_w_fd_num; i++)
+			off += sprintf(&log_buf[off], "%d ", usr_w_fd[i]);
+	}
+
+	RTE_LOG(INFO, pre_ld, "%s: %s\n", __func__, log_buf);
+
+select_fds:
+	if ((readfds && !memcmp(&usr_rfds, readfds, sizeof(fd_set)) &&
+		writefds && !memcmp(&usr_wfds, writefds, sizeof(fd_set))) ||
+		(readfds && !writefds &&
+		!memcmp(&usr_rfds, readfds, sizeof(fd_set))) ||
+		(writefds && !readfds &&
+		!memcmp(&usr_wfds, writefds, sizeof(fd_set)))) {
+		/** TBD: User FD select only.*/
+		ret = user_fd_num;
+	} else {
+		if (sys_r_fd_num)
+			rfds = &sys_rfds;
+		if (sys_w_fd_num)
+			wfds = &sys_wfds;
+
+		ret = (*libc_select)(nfds, rfds, wfds, exceptfds, timeout);
+		if (readfds && rfds)
+			rte_memcpy(readfds, rfds, sizeof(fd_set));
+		if (writefds && wfds)
+			rte_memcpy(writefds, wfds, sizeof(fd_set));
+	}
+
+	return ret;
 }
 
 __attribute__((destructor)) static void netwrap_main_dtor(void)
@@ -4932,6 +4901,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_FD_RTE_RING");
 	if (env)
 		s_fd_rte_ring = atoi(env);
+
+	env = getenv("PRE_LOAD_SELECT_DEBUG");
+	if (env)
+		s_select_dbg = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
