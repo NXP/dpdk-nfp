@@ -182,6 +182,7 @@ struct fd_hw_desc {
 struct fd_entry_desc {
 	struct pre_ld_direct_entry *rx_entry;
 	struct pre_ld_direct_entry *tx_entry;
+	struct pre_ld_direct_entry *free_entry;
 };
 
 union fd_data_path_desc {
@@ -779,12 +780,14 @@ usr_socket_fd_release(int sockfd)
 	struct pre_ld_rx_pool *rx_pool;
 	struct rte_mbuf *free_burst[MAX_PKT_BURST];
 	struct pre_ld_lcore_direct_list *list = NULL;
-	struct rte_ring *tx_ring = NULL, *rx_ring = NULL;
+	struct rte_ring *tx_ring = NULL, *rx_ring = NULL, *free_ring = NULL;
 	struct pre_ld_ring *pre_ld_rx_ring = NULL;
+	struct pre_ld_ring *pre_ld_free_ring = NULL;
 	struct fd_thread_desc *th_desc;
 	struct fd_desc *desc = &s_fd_desc[sockfd];
 	struct pre_ld_direct_entry *rx_entry;
 	struct pre_ld_direct_entry *tx_entry;
+	struct pre_ld_direct_entry *free_entry;
 
 	pthread_mutex_lock(&s_fd_mutex);
 
@@ -794,6 +797,7 @@ usr_socket_fd_release(int sockfd)
 	} else {
 		rx_entry = desc->dp_desc.entry_desc.rx_entry;
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
+		free_entry = desc->dp_desc.entry_desc.free_entry;
 		rx_port = rx_entry->poll.poll_port.port_id;
 		rxq_id = rx_entry->poll.poll_port.queue_id;
 		if (rx_entry->dest_type == RX_RING)
@@ -801,11 +805,17 @@ usr_socket_fd_release(int sockfd)
 		else
 			pre_ld_rx_ring = rx_entry->dest.pre_ld_rx_ring;
 		tx_ring = tx_entry->poll.tx_ring;
+		if (free_entry->poll_type == MBUF_FREE_RING)
+			free_ring = free_entry->poll.free_ring;
+		else
+			pre_ld_free_ring = free_entry->poll.pre_ld_free_ring;
 		list = &s_pre_ld_lists[s_data_path_core];
 		pre_ld_remove_dir_list_safe(list, rx_entry);
 		desc->dp_desc.entry_desc.rx_entry = NULL;
 		pre_ld_remove_dir_list_safe(list, tx_entry);
 		desc->dp_desc.entry_desc.tx_entry = NULL;
+		pre_ld_remove_dir_list_safe(list, free_entry);
+		desc->dp_desc.entry_desc.free_entry = NULL;
 	}
 
 	ret = rte_ring_enqueue(s_port_rxq_rings[rx_port], rxq_id);
@@ -861,6 +871,28 @@ dq_txr_again:
 			goto dq_txr_again;
 		}
 		rte_ring_free(tx_ring);
+	}
+
+	if (free_ring) {
+dq_free_ring_again:
+		nb = rte_ring_dequeue_burst(free_ring,
+				(void **)free_burst, MAX_PKT_BURST, NULL);
+		if (nb > 0) {
+			rte_pktmbuf_free_bulk(free_burst, nb);
+			goto dq_free_ring_again;
+		}
+		rte_ring_free(free_ring);
+	}
+
+	if (pre_ld_free_ring) {
+dq_pre_ld_free_again:
+		nb = pre_ld_ring_dq(pre_ld_free_ring,
+				(void **)free_burst, MAX_PKT_BURST);
+		if (nb > 0) {
+			rte_pktmbuf_free_bulk(free_burst, nb);
+			goto dq_pre_ld_free_again;
+		}
+		pre_ld_ring_free(pre_ld_free_ring);
 	}
 
 	rx_pool = &desc->rx_buffer;
@@ -1109,6 +1141,52 @@ recv_frame_available(int sockfd)
 	return true;
 }
 
+static void
+usr_data_path_free_mbuf(struct fd_desc *desc,
+	struct rte_mbuf *mbufs[], uint32_t count)
+{
+	uint32_t freed = 0;
+	struct pre_ld_direct_entry *free_entry;
+	struct rte_ring *free_ring;
+	struct pre_ld_ring *pre_ld_free_ring;
+
+	if (desc->dp_type == FD_DP_IN_DIRECT_TYPE) {
+		free_entry = desc->dp_desc.entry_desc.free_entry;
+		if (unlikely(!free_entry)) {
+			/** FD close, have to leak memory*/
+			return;
+		}
+		if (free_entry->poll_type == MBUF_FREE_RING) {
+			free_ring = free_entry->poll.free_ring;
+			if (unlikely(!free_ring)) {
+				/** FD close, have to leak memory*/
+				return;
+			}
+			while (freed != count) {
+				freed += rte_ring_enqueue_burst(free_ring,
+					(void * const *)&mbufs[freed],
+					count - freed, NULL);
+			}
+		} else if (free_entry->poll_type == PRE_LD_MBUF_FREE_RING) {
+			pre_ld_free_ring = free_entry->poll.pre_ld_free_ring;
+			if (unlikely(!pre_ld_free_ring)) {
+				/** FD close, have to leak memory*/
+				return;
+			}
+			while (freed != count) {
+				freed += pre_ld_ring_eq(pre_ld_free_ring,
+					(void **)&mbufs[freed], count - freed);
+			}
+		} else {
+			RTE_LOG(ERR, pre_ld,
+				"%s: Invalid poll type(%d)\n",
+				__func__, free_entry->poll_type);
+		}
+	} else {
+		rte_pktmbuf_free_bulk(mbufs, count);
+	}
+}
+
 static int
 eal_recv(int sockfd, void *buf, size_t len, int flags)
 {
@@ -1157,13 +1235,13 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 			remain = 0;
 		}
 		if (i == MAX_PKT_BURST) {
-			rte_pktmbuf_free_bulk(free_burst, i);
+			usr_data_path_free_mbuf(desc, free_burst, i);
 			i = 0;
 		}
 	}
 
 	if (i > 0)
-		rte_pktmbuf_free_bulk(free_burst, i);
+		usr_data_path_free_mbuf(desc, free_burst, i);
 
 	if (!remain)
 		goto finsh_recv;
@@ -1225,13 +1303,15 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 			break;
 		}
 	}
-	rte_pktmbuf_free_bulk(free_burst, j);
+
+	usr_data_path_free_mbuf(desc, free_burst, j);
 	while (i != nb_rx) {
 		if (unlikely(((rx_pool->tail + 1) &
 			(rx_pool->max_num - 1)) == rx_pool->head)) {
 			RTE_LOG(ERR, pre_ld,
 				"RX pool is too small?\n");
-			rte_pktmbuf_free_bulk(&pkts_burst[i], nb_rx - i);
+			usr_data_path_free_mbuf(desc, &pkts_burst[i],
+				nb_rx - i);
 			break;
 		}
 		/** Remove Header.*/
@@ -2264,7 +2344,13 @@ for_ever_loop:
 			continue;
 		}
 
-		if (entry->poll_type == RX_QUEUE) {
+		if (entry->poll_type == MBUF_FREE_RING) {
+			nb_rx = rte_ring_dequeue_burst(entry->poll.free_ring,
+				(void **)mbufs, MAX_PKT_BURST, NULL);
+		} else if (entry->poll_type == PRE_LD_MBUF_FREE_RING) {
+			nb_rx = pre_ld_ring_dq(entry->poll.pre_ld_free_ring,
+				(void **)mbufs, MAX_PKT_BURST);
+		} else if (entry->poll_type == RX_QUEUE) {
 			portid = entry->poll.poll_port.port_id;
 			queueid = *entry->poll.poll_port.queue_id;
 			nb_rx = rte_eth_rx_burst(portid, queueid,
@@ -2364,7 +2450,10 @@ for_ever_loop:
 		entry->rx_stat.pkts += nb_rx;
 		entry->rx_stat.count++;
 
-		if (entry->dest_type == SEC_EGRESS ||
+		if (entry->dest_type == FREE_MBUF) {
+			rte_pktmbuf_free_bulk(mbufs, nb_rx);
+			nb_tx = nb_rx;
+		} else if (entry->dest_type == SEC_EGRESS ||
 			entry->dest_type == SEC_INGRESS) {
 			if (unlikely(s_l3_traffic_dump || s_l4_traffic_dump)) {
 				sprintf(prefix, "%s SEC EQ:",
@@ -3284,6 +3373,7 @@ usr_socket_fd_desc_init(int sockfd,
 	struct fd_desc *desc = NULL;
 	struct pre_ld_direct_entry *rx_entry = NULL;
 	struct pre_ld_direct_entry *tx_entry = NULL;
+	struct pre_ld_direct_entry *free_entry = NULL;
 	uint16_t mtu, *rxq_id = NULL;
 	char nm[RTE_MEMZONE_NAMESIZE];
 
@@ -3402,6 +3492,37 @@ usr_socket_fd_desc_init(int sockfd,
 		}
 		pre_ld_insert_dir_list_safe(list, rx_entry);
 		desc->dp_desc.entry_desc.rx_entry = rx_entry;
+
+		free_entry = rte_zmalloc(NULL,
+			sizeof(struct pre_ld_direct_entry), 0);
+		if (!free_entry) {
+			ret = -ENOMEM;
+			goto fd_init_quit;
+		}
+		if (s_fd_rte_ring) {
+			free_entry->poll_type = MBUF_FREE_RING;
+			sprintf(nm, "free_ring_fd%d", sockfd);
+			free_entry->poll.free_ring = rte_ring_create(nm,
+				MEMPOOL_USR_SIZE, 0,
+				RING_F_SP_ENQ | RING_F_SC_DEQ);
+			if (!free_entry->poll.free_ring) {
+				ret = -ENOMEM;
+				goto fd_init_quit;
+			}
+		} else {
+			free_entry->poll_type = PRE_LD_MBUF_FREE_RING;
+			sprintf(nm, "pre_ld_free_ring_fd%d", sockfd);
+			free_entry->poll.pre_ld_free_ring =
+				pre_ld_ring_create(nm, MEMPOOL_USR_SIZE);
+			if (!free_entry->poll.pre_ld_free_ring) {
+				ret = -ENOMEM;
+				goto fd_init_quit;
+			}
+		}
+		free_entry->dest_type = FREE_MBUF;
+		pre_ld_insert_dir_list_safe(list, free_entry);
+		desc->dp_desc.entry_desc.free_entry = free_entry;
+
 		if (s_force_eal_thread)
 			desc->eal_thread = 1;
 		else
@@ -3440,38 +3561,57 @@ usr_socket_fd_desc_init(int sockfd,
 		pre_ld_pktmbuf_init, NULL);
 
 fd_init_quit:
-	if (ret) {
-		if (rxq_id) {
-			rte_ring_enqueue(s_port_rxq_rings[rx_port],
-				rxq_id);
-		}
-		if (desc && desc->dp_type == FD_DP_IN_DIRECT_TYPE) {
-			if (desc->dp_desc.entry_desc.tx_entry && list) {
-				pre_ld_remove_dir_list_safe(list,
-					desc->dp_desc.entry_desc.tx_entry);
-			}
-			if (desc->dp_desc.entry_desc.rx_entry && list) {
-				pre_ld_remove_dir_list_safe(list,
-					desc->dp_desc.entry_desc.rx_entry);
-			}
-			if (tx_entry && tx_entry->poll.tx_ring)
-				rte_ring_free(tx_entry->poll.tx_ring);
-			if (tx_entry)
-				rte_free(tx_entry);
-			if (rx_entry &&
-				rx_entry->dest_type == RX_RING &&
-				rx_entry->dest.rx_ring)
-				rte_ring_free(rx_entry->dest.rx_ring);
-			else if (rx_entry &&
-				rx_entry->dest_type == PRE_LD_RX_RING &&
-				rx_entry->dest.pre_ld_rx_ring)
-				pre_ld_ring_free(rx_entry->dest.pre_ld_rx_ring);
-			if (rx_entry)
-				rte_free(rx_entry);
-		}
-		if (desc && desc->tx_pool)
-			rte_mempool_free(desc->tx_pool);
+	if (!ret) {
+		pthread_mutex_unlock(&s_fd_mutex);
+
+		return 0;
 	}
+
+	if (rxq_id) {
+		rte_ring_enqueue(s_port_rxq_rings[rx_port],
+			rxq_id);
+	}
+	if (desc && desc->dp_type == FD_DP_IN_DIRECT_TYPE) {
+		if (desc->dp_desc.entry_desc.tx_entry && list) {
+			pre_ld_remove_dir_list_safe(list,
+				desc->dp_desc.entry_desc.tx_entry);
+		}
+		if (desc->dp_desc.entry_desc.rx_entry && list) {
+			pre_ld_remove_dir_list_safe(list,
+				desc->dp_desc.entry_desc.rx_entry);
+		}
+		if (desc->dp_desc.entry_desc.free_entry && list) {
+			pre_ld_remove_dir_list_safe(list,
+				desc->dp_desc.entry_desc.free_entry);
+		}
+		if (tx_entry && tx_entry->poll.tx_ring)
+			rte_ring_free(tx_entry->poll.tx_ring);
+		if (tx_entry)
+			rte_free(tx_entry);
+		if (rx_entry &&
+			rx_entry->dest_type == RX_RING &&
+			rx_entry->dest.rx_ring)
+			rte_ring_free(rx_entry->dest.rx_ring);
+		else if (rx_entry &&
+			rx_entry->dest_type == PRE_LD_RX_RING &&
+			rx_entry->dest.pre_ld_rx_ring)
+			pre_ld_ring_free(rx_entry->dest.pre_ld_rx_ring);
+		if (rx_entry)
+			rte_free(rx_entry);
+		if (free_entry &&
+			free_entry->poll_type == MBUF_FREE_RING &&
+			free_entry->poll.free_ring)
+			rte_ring_free(free_entry->poll.free_ring);
+		else if (free_entry &&
+			free_entry->poll_type ==
+			PRE_LD_MBUF_FREE_RING &&
+			free_entry->poll.pre_ld_free_ring)
+			pre_ld_ring_free(free_entry->poll.pre_ld_free_ring);
+		if (free_entry)
+			rte_free(free_entry);
+	}
+	if (desc && desc->tx_pool)
+		rte_mempool_free(desc->tx_pool);
 	pthread_mutex_unlock(&s_fd_mutex);
 
 	return ret;

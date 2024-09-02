@@ -60,13 +60,17 @@ enum pre_ld_dir_poll_type {
 	RX_QUEUE,
 	TX_RING,
 	SEC_IN_COMPLETE,
-	SEC_EG_COMPLETE
+	SEC_EG_COMPLETE,
+	PRE_LD_MBUF_FREE_RING,
+	MBUF_FREE_RING
 };
 
 union pre_ld_dir_poll {
 	struct pre_ld_port_desc poll_port;
 	struct pre_ld_sec_desc poll_sec;
 	struct rte_ring *tx_ring;
+	struct rte_ring *free_ring;
+	struct pre_ld_ring *pre_ld_free_ring;
 };
 
 enum pre_ld_dir_dest_type {
@@ -75,6 +79,7 @@ enum pre_ld_dir_dest_type {
 	RX_RING,
 	SEC_INGRESS,
 	SEC_EGRESS,
+	FREE_MBUF,
 	DROP
 };
 
