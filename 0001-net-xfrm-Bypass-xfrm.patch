@@ -1,4 +1,4 @@
-From c3175bdcbfcb358294973ded222119a51207b3c1 Mon Sep 17 00:00:00 2001
+From d1781a37ca3546a3ae08e93cfc1dfd38b40436d2 Mon Sep 17 00:00:00 2001
 From: Jun Yang <jun.yang@nxp.com>
 Date: Tue, 21 May 2024 22:37:25 -0700
 Subject: [PATCH] net/xfrm: Bypass xfrm
@@ -18,9 +18,9 @@ Signed-off-by: Jun Yang <jun.yang@nxp.com>
  include/net/netns/xfrm.h |  1 +
  include/net/xfrm.h       | 32 ++++++++++++++++++++++++++++++--
  net/ipv4/tcp_output.c    | 16 +++++++++++++++-
- net/xfrm/xfrm_policy.c   |  3 +++
+ net/xfrm/xfrm_policy.c   |  7 +++++--
  net/xfrm/xfrm_sysctl.c   |  7 +++++++
- 5 files changed, 56 insertions(+), 3 deletions(-)
+ 5 files changed, 58 insertions(+), 5 deletions(-)
 
 diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
 index bd7c3be4af5d..cd2e49eef074 100644
@@ -116,19 +116,32 @@ index ed2e1836c0c0..d5b2a5386968 100644
  }
  
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index ba58b963f482..a58f53698c8b 100644
+index ba58b963f482..e7a288ea28bc 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
-@@ -3046,6 +3046,9 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
- 	xdst = NULL;
- 	route = NULL;
- 
+@@ -3148,7 +3148,8 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
+ 		goto error;
+ 	} else if (num_xfrms > 0) {
+ 		/* Flow transformed */
+-		dst_release(dst_orig);
++		if (!net->xfrm.sysctl_bypass)
++			dst_release(dst_orig);
+ 	} else {
+ 		/* Flow passes untransformed */
+ 		dst_release(dst);
+@@ -3156,9 +3157,11 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
+ 	}
+ ok:
+ 	xfrm_pols_put(pols, drop_pols);
+-	if (dst && dst->xfrm &&
++	if (!net->xfrm.sysctl_bypass && dst && dst->xfrm &&
+ 	    dst->xfrm->props.mode == XFRM_MODE_TUNNEL)
+ 		dst->flags |= DST_XFRM_TUNNEL;
 +	if (net->xfrm.sysctl_bypass)
 +		return dst_orig;
-+
- 	sk = sk_const_to_full_sk(sk);
- 	if (sk && sk->sk_policy[XFRM_POLICY_OUT]) {
- 		num_pols = 1;
+ 	return dst;
+ 
+ nopol:
 diff --git a/net/xfrm/xfrm_sysctl.c b/net/xfrm/xfrm_sysctl.c
 index 0c6c5ef65f9d..9388f44e6af5 100644
 --- a/net/xfrm/xfrm_sysctl.c
