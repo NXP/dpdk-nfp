@@ -4843,6 +4843,19 @@ static void setup_wrappers(void)
 	if (!getenv("DPAA2_RX_GET_PROTOCOL_OFFSET"))
 		setenv("DPAA2_RX_GET_PROTOCOL_OFFSET", "1", 1);
 
+	if (!getenv("DPAA2_TX_CONF_FD_OVERFLOW"))
+		setenv("DPAA2_TX_CONF_FD_OVERFLOW", "128", 1);
+
+	if (!getenv("PRE_LOAD_IPSEC_BUF_SWAP"))
+		setenv("PRE_LOAD_IPSEC_BUF_SWAP", "1", 1);
+
+	/* We have to set flow control, otherwise, traffic congests
+	 * at other end to discard IKE frames to get failure of
+	 * IPSec rekey.
+	 */
+	if (!getenv("PRE_LOAD_FLOW_CONTROL_ENABLE"))
+		setenv("PRE_LOAD_FLOW_CONTROL_ENABLE", "1", 1);
+
 	s_in_pre_loading = 1;
 	s_eal_file_prefix = getenv("file_prefix");
 
