@@ -58,19 +58,23 @@ struct pre_ld_ring {
 
 enum pre_ld_dir_poll_type {
 	RX_QUEUE,
+	PRE_LD_TX_RING,
 	TX_RING,
 	SEC_IN_COMPLETE,
 	SEC_EG_COMPLETE,
 	PRE_LD_MBUF_FREE_RING,
-	MBUF_FREE_RING
+	MBUF_FREE_RING,
+	MBUF_MALLOC_POOL
 };
 
 union pre_ld_dir_poll {
 	struct pre_ld_port_desc poll_port;
 	struct pre_ld_sec_desc poll_sec;
 	struct rte_ring *tx_ring;
+	struct pre_ld_ring *pre_ld_tx_ring;
 	struct rte_ring *free_ring;
 	struct pre_ld_ring *pre_ld_free_ring;
+	struct rte_mempool *malloc_pool;
 };
 
 enum pre_ld_dir_dest_type {
@@ -80,6 +84,8 @@ enum pre_ld_dir_dest_type {
 	SEC_INGRESS,
 	SEC_EGRESS,
 	FREE_MBUF,
+	PRE_LD_MALLOC_RING,
+	MALLOC_RING,
 	DROP
 };
 
@@ -90,6 +96,8 @@ union pre_ld_dir_dest {
 	struct pre_ld_ring *pre_ld_rx_ring;
 	struct rte_ring *rx_ring;
 	struct pre_ld_sec_desc dest_sec;
+	struct pre_ld_ring *pre_ld_malloc_ring;
+	struct rte_ring *malloc_ring;
 };
 
 struct pre_ld_dir_statistic {
@@ -116,6 +124,9 @@ struct pre_ld_direct_entry {
 	union pre_ld_dir_dest dest;
 	struct pre_ld_dir_statistic tx_stat;
 	struct pre_ld_dir_statistic rx_stat;
+	char *poll_prefix;
+	char *action_prefix;
+	void (*entry_cb)(struct pre_ld_direct_entry *entry);
 
 	/** Update by statistic function only.*/
 	struct pre_ld_dir_statistic tx_old_stat;
