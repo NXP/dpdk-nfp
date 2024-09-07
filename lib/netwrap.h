@@ -34,9 +34,16 @@
 		}					\
 	} while (0)
 
-struct pre_ld_port_desc {
+struct pre_ld_port_rx_flow {
+	int valid;
 	uint16_t port_id;
-	uint16_t *queue_id;
+	uint8_t tc_id;
+	uint16_t flow_id;
+	uint16_t queue_id;
+};
+
+struct pre_ld_port_desc {
+	struct pre_ld_port_rx_flow *rx_flow;
 	void *flow;
 };
 

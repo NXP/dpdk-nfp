@@ -447,8 +447,8 @@ xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 {
 	struct rte_flow_error error;
 	struct pre_ld_xfm_flow *xfm_flow;
-	uint16_t port_id;
 	int ret, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
+	struct pre_ld_port_rx_flow *rx_flow;
 
 	if (sp->flow) {
 		RTE_LOG(WARNING, pre_ld,
@@ -458,16 +458,16 @@ xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 		return -EEXIST;
 	}
 
-	port_id = sp->entry_to_sec->poll.poll_port.port_id;
-
-	sp->flow = rte_flow_create(port_id, &sp->attr,
+	rx_flow = sp->entry_to_sec->poll.poll_port.rx_flow;
+	sp->flow = rte_flow_create(rx_flow->port_id, &sp->attr,
 			sp->flow_item, sp->action, &error);
 	if (sp->flow) {
 		xfm_flow = rte_zmalloc(NULL,
 			sizeof(struct pre_ld_xfm_flow), 0);
 		if (!xfm_flow) {
 again:
-			ret = rte_flow_destroy(port_id, sp->flow, &error);
+			ret = rte_flow_destroy(rx_flow->port_id, sp->flow,
+				&error);
 			if (ret) {
 				RTE_LOG(INFO, pre_ld,
 					"%s: destroy flow failed(%d), times=%d\n",
@@ -489,11 +489,10 @@ again:
 			__func__, sp->ingress_queue.index);
 
 		RTE_LOG(INFO, pre_ld,
-			"%s: Steer %s flow from port%d flow%d to port%d\n",
+			"%s: Steer %s flow from port%d queue%d to port%d\n",
 			__func__, sp->dir == XFRM_POLICY_IN ?
 			"Ingress" : "Egress",
-			port_id,
-			*sp->entry_to_sec->poll.poll_port.queue_id,
+			rx_flow->port_id, rx_flow->queue_id,
 			sp->entry_from_sec->dest.dest_port);
 
 		TAILQ_INSERT_TAIL(&s_xfm_flow_list, xfm_flow, next);
@@ -513,7 +512,7 @@ process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 {
 	int ret = 0, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
 	struct rte_flow_error error;
-	uint16_t port_id = sp->entry_to_sec->poll.poll_port.port_id;
+	uint16_t port_id;
 	struct pre_ld_xfm_flow *xfm_flow = NULL, *txfm_flow;
 	struct pre_ld_xfm_flow_list *flow_list = &s_xfm_flow_list;
 
@@ -528,6 +527,7 @@ process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 	if (!xfm_flow)
 		return -ENODATA;
 
+	port_id = sp->entry_to_sec->poll.poll_port.rx_flow->port_id;
 	if (!xfm_flow->flow_ref) {
 again:
 		ret = rte_flow_destroy(port_id, sp->flow, &error);
