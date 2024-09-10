@@ -344,6 +344,9 @@ static uint16_t s_mtu_set;
 static int s_dump_traffic_flow;
 static int s_select_dbg;
 
+static int s_data_verify;
+static int s_data_verify_err_panic;
+
 struct pre_ld_default_direction {
 	struct rte_remote_dir_req *def_dir;
 	const struct pre_ld_port_rx_flow *rx_flows[MAX_DEF_DIR_NUM];
@@ -743,6 +746,39 @@ pre_ld_sp_out_ready(void)
 	return false;
 }
 
+void
+pre_ld_rx_flow_verify_set(struct pre_ld_port_rx_flow *rx_flow,
+	enum pre_ld_cmp_offset type, uint8_t offset, uint8_t size,
+	const uint8_t *cmp_data)
+{
+	if (!s_data_verify || !size) {
+		rx_flow->cmp_offset_type = PRE_LD_NO_CMP;
+		return;
+	}
+	rx_flow->cmp_offset_type = type;
+	rx_flow->cmp_offset = offset;
+	rx_flow->cmp_size = size;
+	rte_memcpy(rx_flow->cmp_data, cmp_data, size);
+}
+
+void
+pre_ld_flow_destroy(uint16_t port, struct rte_flow *flow)
+{
+	int ret, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
+
+again:
+	ret = rte_flow_destroy(port, flow, NULL);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"%s: Destroy flow failed(%d), times=%d\n",
+			__func__, ret, times);
+	}
+	if (ret == -EAGAIN && times > 0) {
+		times--;
+		goto again;
+	}
+}
+
 static int
 eal_destroy_dpaa2_mux_flow(void)
 {
@@ -785,7 +821,7 @@ usr_socket_fd_remove(int sockfd)
 static int
 usr_socket_fd_release(int sockfd)
 {
-	int ret = 0, i, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
+	int ret = 0, i;
 	uint16_t rx_port, nb;
 	struct pre_ld_rx_pool *rx_pool;
 	struct rte_mbuf *free_burst[MAX_PKT_BURST];
@@ -848,26 +884,16 @@ usr_socket_fd_release(int sockfd)
 		desc->dp_desc.entry_desc.free_entry = NULL;
 	}
 
+	if (desc->flow) {
+		pre_ld_flow_destroy(rx_port, desc->flow);
+		desc->flow = NULL;
+	}
+
 	ret = rte_ring_enqueue(s_port_flow_r[rx_port], rx_flow);
 	if (ret) {
 		RTE_LOG(ERR, pre_ld,
 			"%s release s_fd_desc[%d]'s RX flow failed(%d)\n",
 			__func__, sockfd, ret);
-	}
-
-	if (desc->flow) {
-again:
-		ret = rte_flow_destroy(rx_port, desc->flow, NULL);
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: Destroy FD[%d].flow failed(%d), times=%d\n",
-				__func__, sockfd, ret, times);
-		}
-		if (ret == -EAGAIN && times > 0) {
-			times--;
-			goto again;
-		}
-		desc->flow = NULL;
 	}
 
 	if (pre_ld_rx_ring) {
@@ -1150,6 +1176,10 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 			"FD(%d): UDP offset = %d, IPV6 or tunnel frame?\n",
 			sockfd, l4_offset);
 		rte_pktmbuf_dump(stdout, mbuf, 60);
+		if (s_data_verify_err_panic) {
+			rte_panic("%s line %d: verify failure!\r\n",
+				__func__, __LINE__);
+		}
 		return -EINVAL;
 	}
 
@@ -1161,6 +1191,10 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 			sockfd, udp_hdr->src_port, flow_hdr->dst_port,
 			udp_hdr->dst_port, flow_hdr->src_port);
 		rte_pktmbuf_dump(stdout, mbuf, 60);
+		if (s_data_verify_err_panic) {
+			rte_panic("%s line %d: verify failure!\r\n",
+				__func__, __LINE__);
+		}
 		return -EINVAL;
 	}
 	length = rte_be_to_cpu_16(udp_hdr->dgram_len) -
@@ -1645,17 +1679,106 @@ pre_ld_entry_traffic_dump(const char *prefix,
 	}
 }
 
-static uint16_t
-pre_ld_entry_port_recv(uint16_t portid,
-	uint16_t queueid, struct rte_mbuf *mbufs[], const char *prefix)
+static int
+pre_ld_entry_rx_flow_verify(struct rte_mbuf *mbuf,
+	struct pre_ld_direct_entry *entry)
 {
-	uint16_t nb_rx;
+	int ret = 0, i;
+	uint8_t offset = 0xff, *data, off = 0;
+	const struct pre_ld_port_rx_flow *rx_flow;
+	char cmp1[64], cmp2[64];
 
-	nb_rx = rte_eth_rx_burst(portid, queueid, mbufs, MAX_PKT_BURST);
+	rx_flow = entry->poll.poll_port.rx_flow;
+	if (rx_flow->cmp_offset_type == PRE_LD_CMP_L3_OFFSET)
+		ret = rte_pmd_dpaa2_rx_get_offset(mbuf, &offset, NULL, NULL);
+	else if (rx_flow->cmp_offset_type == PRE_LD_CMP_L4_OFFSET)
+		ret = rte_pmd_dpaa2_rx_get_offset(mbuf, NULL, &offset, NULL);
+	else if (rx_flow->cmp_offset_type == PRE_LD_CMP_L5_OFFSET)
+		ret = rte_pmd_dpaa2_rx_get_offset(mbuf, NULL, NULL, &offset);
+	else
+		return 0;
+
+	if (unlikely(ret) || offset == 0xff) {
+		RTE_LOG(WARNING, pre_ld,
+			"%s parse %s %s failed\n",
+			rx_flow->cmp_offset_type == PRE_LD_CMP_L3_OFFSET ?
+			"L3" :
+			rx_flow->cmp_offset_type == PRE_LD_CMP_L4_OFFSET ?
+			"L4" : "L5",
+			entry->poll_prefix, entry->action_prefix);
+		rte_pktmbuf_dump(stdout, mbuf, 60);
+		if (s_data_verify_err_panic) {
+			rte_panic("%s line %d: verify failure!\r\n",
+				__func__, __LINE__);
+		}
+		return -EINVAL;
+	}
+	offset += rx_flow->cmp_offset;
+	data = rte_pktmbuf_mtod_offset(mbuf, void *, offset);
+	if (!memcmp(data, rx_flow->cmp_data, rx_flow->cmp_size))
+		return 0;
+
+	for (i = 0; i < rx_flow->cmp_size; i++) {
+		sprintf(&cmp1[off], "%02x ", rx_flow->cmp_data[i]);
+		off += sprintf(&cmp2[off], "%02x ", data[i]);
+	}
+	RTE_LOG(ERR, pre_ld,
+		"%s %s: data received %s don't match: %s\n",
+		entry->poll_prefix, entry->action_prefix, cmp2, cmp1);
+	rte_pktmbuf_dump(stdout, mbuf, 60);
+	if (s_data_verify_err_panic) {
+		rte_panic("%s line %d: verify failure!\r\n",
+			__func__, __LINE__);
+	}
+
+	return -EACCES;
+}
+
+static uint16_t
+pre_ld_entry_port_recv(struct pre_ld_direct_entry *entry,
+	struct rte_mbuf *mbufs[], uint64_t lens[])
+{
+	uint16_t nb_rx, i, j = 0;
+	const struct pre_ld_port_rx_flow *rx_flow;
+	struct rte_mbuf *rx_mbufs[MAX_PKT_BURST];
+	struct rte_mbuf **pmbufs;
+	int ret;
+
+	rx_flow = entry->poll.poll_port.rx_flow;
+
+	if (rx_flow->cmp_offset_type == PRE_LD_NO_CMP)
+		pmbufs = mbufs;
+	else
+		pmbufs = rx_mbufs;
+
+	nb_rx = rte_eth_rx_burst(rx_flow->port_id, rx_flow->queue_id,
+		pmbufs, MAX_PKT_BURST);
 	if (unlikely(!nb_rx))
 		return 0;
 
-	pre_ld_entry_traffic_dump(prefix, nb_rx, mbufs);
+	if (rx_flow->cmp_offset_type != PRE_LD_NO_CMP)
+		goto cmp_rx_data;
+
+	for (i = 0; i < nb_rx; i++)
+		lens[i] = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+
+	goto recv_complete;
+
+cmp_rx_data:
+	for (i = 0; i < nb_rx; i++) {
+		ret = pre_ld_entry_rx_flow_verify(rx_mbufs[i], entry);
+		if (ret) {
+			rte_pktmbuf_free(rx_mbufs[i]);
+			continue;
+		}
+		mbufs[j] = rx_mbufs[i];
+		lens[j] = mbufs[j]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+		j++;
+	}
+	nb_rx = j;
+
+recv_complete:
+	pre_ld_entry_traffic_dump(entry->poll_prefix, nb_rx, mbufs);
 
 	return nb_rx;
 }
@@ -1868,18 +1991,12 @@ pre_ld_entry_sec_start(struct pre_ld_direct_entry *entry)
 	uint16_t nb_rx, nb_tx, i;
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint64_t lens[MAX_PKT_BURST];
-	const struct pre_ld_port_rx_flow *rx_flow;
 
 	RTE_ASSERT(entry->poll_type == RX_QUEUE &&
 		(entry->dest_type == SEC_EGRESS ||
 		entry->dest_type == SEC_INGRESS));
 
-	rx_flow = entry->poll.poll_port.rx_flow;
-	nb_rx = pre_ld_entry_port_recv(rx_flow->port_id,
-		rx_flow->queue_id, mbufs, entry->poll_prefix);
-
-	for (i = 0; i < nb_rx; i++)
-		lens[i] = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+	nb_rx = pre_ld_entry_port_recv(entry, mbufs, lens);
 
 	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
 
@@ -2001,6 +2118,9 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 
 		return ret;
 	}
+	memset(&rx_flow->cmp_offset_type, 0,
+		sizeof(struct pre_ld_port_rx_flow) -
+		offsetof(struct pre_ld_port_rx_flow, cmp_offset_type));
 
 	ret = rte_ring_dequeue(s_crypt_queue_ring[sp->crypt_id],
 		(void **)&crypt_qid);
@@ -2241,20 +2361,14 @@ pre_ld_configure_default_flow(const struct pre_ld_port_rx_flow *def_flow)
 static void
 pre_ld_entry_port_fwd(struct pre_ld_direct_entry *entry)
 {
-	uint16_t nb_rx, nb_tx, i;
+	uint16_t nb_rx, nb_tx;
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint64_t lens[MAX_PKT_BURST];
-	const struct pre_ld_port_rx_flow *rx_flow;
 
 	RTE_ASSERT(entry->poll_type == RX_QUEUE &&
 		entry->dest_type == HW_PORT);
 
-	rx_flow = entry->poll.poll_port.rx_flow;
-	nb_rx = pre_ld_entry_port_recv(rx_flow->port_id,
-		rx_flow->queue_id, mbufs, entry->poll_prefix);
-
-	for (i = 0; i < nb_rx; i++)
-		lens[i] = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+	nb_rx = pre_ld_entry_port_recv(entry, mbufs, lens);
 
 	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
 
@@ -2930,6 +3044,7 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 	}
 
 	s_def_flow[portid] = pre_ld_port_default_flow(portid, total_num);
+	s_def_flow[portid]->cmp_offset_type = PRE_LD_NO_CMP;
 	sprintf(ring_nm, "port%d_flow_r", portid);
 	s_port_flow_r[portid] = rte_ring_create(ring_nm, num * 2, 0,
 		RING_F_EXACT_SZ);
@@ -3310,26 +3425,14 @@ static int
 eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 {
 	char config_str[256];
-	int ret, udp_src = 0, udp_dst = 0;
+	int ret, udp_src = 0, udp_dst = 0, offset = 0;
 	struct pre_ld_direct_entry *rx_entry;
 	static int default_created;
 	const char *prot_name;
 	const struct rte_flow_item_udp *udp = NULL;
 	const struct rte_flow_item_udp *mask = NULL;
 	struct pre_ld_port_rx_flow *rx_flow;
-
-	if (s_dpdmux_ep_name) {
-		/**dpdmux flow : dpni flow = 1:1*/
-		ret = eal_create_dpaa2_mux_flow(s_dpdmux_id,
-				s_dpdmux_ep_id, pattern);
-		if (ret)
-			return ret;
-
-		goto create_local_flow;
-	}
-
-	if (!s_uplink || !s_downlink || default_created)
-		goto create_local_flow;
+	uint8_t rule[32], rule_size = 0, l3_offset = 0;
 
 	if (pattern[0].type == RTE_FLOW_ITEM_TYPE_UDP) {
 		prot_name = "udp";
@@ -3353,23 +3456,53 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 	}
 
 	if (udp_src && !udp_dst) {
+		rte_memcpy(rule, &udp->hdr.src_port, sizeof(rte_be16_t));
+		rule_size = sizeof(rte_be16_t);
+		l3_offset = 0;
+	} else if (!udp_src && udp_dst) {
+		rte_memcpy(rule, &udp->hdr.dst_port, sizeof(rte_be16_t));
+		rule_size = sizeof(rte_be16_t);
+		l3_offset = offsetof(struct rte_udp_hdr, dst_port);
+	} else if (udp_src && udp_dst) {
+		rte_memcpy(rule, &udp->hdr.src_port, sizeof(rte_be16_t) * 2);
+		rule_size = sizeof(rte_be16_t) * 2;
+		l3_offset = offsetof(struct rte_udp_hdr, src_port);
+	} else {
 		sprintf(config_str,
+			"(%s, %s, %s)",
+			s_uplink, s_downlink, prot_name);
+	}
+
+	if (s_dpdmux_ep_name) {
+		/**dpdmux flow : dpni flow = 1:1*/
+		ret = eal_create_dpaa2_mux_flow(s_dpdmux_id,
+				s_dpdmux_ep_id, pattern);
+		if (ret)
+			return ret;
+
+		goto create_local_flow;
+	}
+
+	if (!s_uplink || !s_downlink || default_created)
+		goto create_local_flow;
+
+	if (udp_src) {
+		offset += sprintf(&config_str[offset],
 			"(%s, %s, %s, src, 0x%04x)",
 			s_uplink, s_downlink, prot_name,
 			rte_bswap16(udp->hdr.src_port));
-	} else if (!udp_src && udp_dst) {
-		sprintf(config_str,
+	}
+
+	if (udp_dst) {
+		if (udp_src)
+			offset += sprintf(&config_str[offset], ", ");
+		offset += sprintf(&config_str[offset],
 			"(%s, %s, %s, dst, 0x%04x)",
 			s_uplink, s_downlink, prot_name,
 			rte_bswap16(udp->hdr.dst_port));
-	} else if (udp_src && udp_dst) {
-		sprintf(config_str,
-			"(%s, %s, %s, src, 0x%04x), (%s, %s, %s, dst, 0x%04x)",
-			s_uplink, s_downlink, prot_name,
-			rte_bswap16(udp->hdr.src_port),
-			s_uplink, s_downlink, prot_name,
-			rte_bswap16(udp->hdr.dst_port));
-	} else {
+	}
+
+	if (!udp_src && !udp_dst) {
 		sprintf(config_str,
 			"(%s, %s, %s)",
 			s_uplink, s_downlink, prot_name);
@@ -3391,6 +3524,8 @@ create_local_flow:
 		rx_entry = s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry;
 		rx_flow = rx_entry->poll.poll_port.rx_flow;
 	}
+	pre_ld_rx_flow_verify_set(rx_flow,
+		PRE_LD_CMP_L4_OFFSET, l3_offset, rule_size, rule);
 	ret = eal_create_local_flow(sockfd, rx_flow, pattern);
 	if (ret) {
 		RTE_LOG(ERR, pre_ld,
@@ -3460,21 +3595,17 @@ pre_ld_entry_usr_tx_process(struct pre_ld_direct_entry *entry)
 static void
 pre_ld_entry_usr_rx_process(struct pre_ld_direct_entry *entry)
 {
-	uint16_t nb_rx, nb_tx, i;
+	uint16_t nb_rx, nb_tx;
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint64_t lens[MAX_PKT_BURST];
-	const struct pre_ld_port_rx_flow *rx_flow;
 
 	RTE_ASSERT(entry->poll_type == RX_QUEUE &&
 		(entry->dest_type == RX_RING ||
 		entry->dest_type == PRE_LD_RX_RING));
 
-	rx_flow = entry->poll.poll_port.rx_flow;
-	nb_rx = pre_ld_entry_port_recv(rx_flow->port_id,
-		rx_flow->queue_id, mbufs, entry->poll_prefix);
-
-	for (i = 0; i < nb_rx; i++)
-		lens[i] = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+	nb_rx = pre_ld_entry_port_recv(entry, mbufs, lens);
+	if (!nb_rx)
+		return;
 
 	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
 
@@ -3625,6 +3756,9 @@ usr_socket_fd_desc_init(int sockfd,
 
 		goto fd_init_quit;
 	}
+	memset(&rx_flow->cmp_offset_type, 0,
+		sizeof(struct pre_ld_port_rx_flow) -
+		offsetof(struct pre_ld_port_rx_flow, cmp_offset_type));
 
 	if (!s_dir_ports.valid) {
 		desc->dp_type = FD_DP_DIRECT_TYPE;
@@ -5171,7 +5305,7 @@ static void setup_wrappers(void)
 		setenv("DPAA2_RX_GET_PROTOCOL_OFFSET", "1", 1);
 
 	if (!getenv("DPAA2_TX_CONF_FD_OVERFLOW"))
-		setenv("DPAA2_TX_CONF_FD_OVERFLOW", "128", 1);
+		setenv("DPAA2_TX_CONF_FD_OVERFLOW", "64", 1);
 
 	if (!getenv("PRE_LOAD_IPSEC_BUF_SWAP"))
 		setenv("PRE_LOAD_IPSEC_BUF_SWAP", "1", 1);
@@ -5253,6 +5387,14 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_USER_FD_MALLOC_HW_POOL");
 	if (env)
 		s_fd_mbuf_malloc_hw_pool = atoi(env);
+
+	env = getenv("PRE_LOAD_USER_FD_DATA_VERIFY");
+	if (env)
+		s_data_verify = atoi(env);
+
+	env = getenv("PRE_LOAD_USER_FD_DATA_VERIFY_ERR_PANIC");
+	if (env)
+		s_data_verify_err_panic = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {

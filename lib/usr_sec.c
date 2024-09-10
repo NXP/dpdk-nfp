@@ -445,54 +445,56 @@ static int nl_parse_attrs(struct nlattr *na, int len,
 static int
 xfm_sp_flow_hw_create(struct pre_ld_ipsec_sp_entry *sp)
 {
-	struct rte_flow_error error;
 	struct pre_ld_xfm_flow *xfm_flow;
-	int ret, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
 	struct pre_ld_port_rx_flow *rx_flow;
+	char flow_info[128];
+	uint8_t offset, size;
+	const uint8_t *cmp_data;
 
+	rx_flow = sp->entry_to_sec->poll.poll_port.rx_flow;
+	sprintf(flow_info, "port%d/tc%d/flow%d->rxq%d",
+		rx_flow->port_id, rx_flow->tc_id,
+		rx_flow->flow_id, rx_flow->queue_id);
 	if (sp->flow) {
 		RTE_LOG(WARNING, pre_ld,
-			"%s: Policy flow (index=%d) has been created!\n",
-			__func__, sp->ingress_queue.index);
+			"%s: Policy flow(%s) has been created!\n",
+			__func__, flow_info);
 
 		return -EEXIST;
 	}
 
+	xfm_flow = rte_zmalloc(NULL, sizeof(struct pre_ld_xfm_flow), 0);
+	if (!xfm_flow)
+		return -ENOMEM;
 	rx_flow = sp->entry_to_sec->poll.poll_port.rx_flow;
+	if (sp->dir == XFRM_POLICY_IN) {
+		offset = sp->family == AF_INET ?
+			sizeof(struct rte_ipv4_hdr) :
+			sizeof(struct rte_ipv6_hdr);
+		offset += offsetof(struct rte_esp_hdr, spi);
+		size = sizeof(rte_be32_t);
+		cmp_data = (void *)&sp->esp_spec.hdr.spi;
+	} else if (sp->family == AF_INET) {
+		offset = offsetof(struct rte_ipv4_hdr, src_addr);
+		size = sizeof(rte_be32_t) * 2;
+		cmp_data = (void *)&sp->ipv4_spec.hdr.src_addr;
+	} else {
+		offset = offsetof(struct rte_ipv6_hdr, src_addr[0]);
+		size = 32;
+		cmp_data = sp->ipv6_spec.hdr.src_addr;
+	}
+	pre_ld_rx_flow_verify_set(rx_flow,
+		PRE_LD_CMP_L3_OFFSET, offset, size, cmp_data);
 	sp->flow = rte_flow_create(rx_flow->port_id, &sp->attr,
-			sp->flow_item, sp->action, &error);
+			sp->flow_item, sp->action, NULL);
 	if (sp->flow) {
-		xfm_flow = rte_zmalloc(NULL,
-			sizeof(struct pre_ld_xfm_flow), 0);
-		if (!xfm_flow) {
-again:
-			ret = rte_flow_destroy(rx_flow->port_id, sp->flow,
-				&error);
-			if (ret) {
-				RTE_LOG(INFO, pre_ld,
-					"%s: destroy flow failed(%d), times=%d\n",
-					__func__, ret, times);
-			}
-			if (ret == -EAGAIN && times > 0) {
-				times--;
-				goto again;
-			}
-			sp->flow = NULL;
-
-			return -ENOMEM;
-		}
 		xfm_flow->flow = sp->flow;
 		xfm_flow->flow_ref = 1;
 		sp->entry_to_sec->poll.poll_port.flow = sp->flow;
 		RTE_LOG(INFO, pre_ld,
-			"%s: Policy flow (index=%d) create successfully\n",
-			__func__, sp->ingress_queue.index);
-
-		RTE_LOG(INFO, pre_ld,
-			"%s: Steer %s flow from port%d queue%d to port%d\n",
+			"%s: Policy %s flow(%s) created to port%d\n",
 			__func__, sp->dir == XFRM_POLICY_IN ?
-			"Ingress" : "Egress",
-			rx_flow->port_id, rx_flow->queue_id,
+			"Ingress" : "Egress", flow_info,
 			sp->entry_from_sec->dest.dest_port);
 
 		TAILQ_INSERT_TAIL(&s_xfm_flow_list, xfm_flow, next);
@@ -501,8 +503,9 @@ again:
 	}
 
 	RTE_LOG(ERR, pre_ld,
-		"%s: Policy flow (index=%d) create failed(%s)\n",
-		__func__, sp->ingress_queue.index, error.message);
+		"%s: Policy %s flow(%s) created failed\n",
+		__func__, sp->dir == XFRM_POLICY_IN ?
+		"Ingress" : "Egress", flow_info);
 
 	return -EIO;
 }
@@ -510,8 +513,7 @@ again:
 static int
 process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 {
-	int ret = 0, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
-	struct rte_flow_error error;
+	int ret = 0;
 	uint16_t port_id;
 	struct pre_ld_xfm_flow *xfm_flow = NULL, *txfm_flow;
 	struct pre_ld_xfm_flow_list *flow_list = &s_xfm_flow_list;
@@ -529,17 +531,7 @@ process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 
 	port_id = sp->entry_to_sec->poll.poll_port.rx_flow->port_id;
 	if (!xfm_flow->flow_ref) {
-again:
-		ret = rte_flow_destroy(port_id, sp->flow, &error);
-		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: Policy flow destroy failed(%s)(%d), times=%d\n",
-				__func__, error.message, ret, times);
-		}
-		if (ret == -EAGAIN && times > 0) {
-			times--;
-			goto again;
-		}
+		pre_ld_flow_destroy(port_id, sp->flow);
 
 		pre_ld_deconfigure_sec_path(sp);
 		TAILQ_REMOVE(flow_list, xfm_flow, next);

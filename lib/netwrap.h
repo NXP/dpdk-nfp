@@ -34,12 +34,24 @@
 		}					\
 	} while (0)
 
+enum pre_ld_cmp_offset {
+	PRE_LD_NO_CMP,
+	PRE_LD_CMP_L2_OFFSET,
+	PRE_LD_CMP_L3_OFFSET,
+	PRE_LD_CMP_L4_OFFSET,
+	PRE_LD_CMP_L5_OFFSET
+};
+
 struct pre_ld_port_rx_flow {
 	int valid;
 	uint16_t port_id;
 	uint8_t tc_id;
 	uint16_t flow_id;
 	uint16_t queue_id;
+	enum pre_ld_cmp_offset cmp_offset_type;
+	uint8_t cmp_offset;
+	uint8_t cmp_size;
+	uint8_t cmp_data[64];
 };
 
 struct pre_ld_port_desc {
@@ -227,6 +239,14 @@ struct pre_ld_ipsec_cntx {
 
 #define dcbf(p) { asm volatile("dc cvac, %0" : : "r"(p) : "memory"); }
 #define dccivac(p) { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
+
+void
+pre_ld_rx_flow_verify_set(struct pre_ld_port_rx_flow *rx_flow,
+	enum pre_ld_cmp_offset type, uint8_t offset, uint8_t size,
+	const uint8_t *cmp_data);
+
+void
+pre_ld_flow_destroy(uint16_t port, struct rte_flow *flow);
 
 int
 pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp);
