@@ -209,6 +209,11 @@ struct fd_desc {
 	struct rte_mempool *tx_pool;
 	struct pre_ld_rx_pool rx_buffer;
 
+	rte_spinlock_t rx_lock;
+	rte_spinlock_t tx_lock;
+	int rx_enable;
+	int tx_enable;
+
 	uint16_t rx_port_mtu;
 	uint16_t tx_port_mtu;
 
@@ -236,7 +241,7 @@ TAILQ_HEAD(fd_desc_list, fd_desc);
 static struct fd_desc_list s_fd_desc_list =
 	TAILQ_HEAD_INITIALIZER(s_fd_desc_list);
 
-pthread_mutex_t s_fd_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+static rte_spinlock_t s_fd_list_lock;
 
 #define UDP_HDR_LEN sizeof(struct rte_udp_hdr)
 
@@ -933,9 +938,9 @@ is_usr_socket_connected(int sockfd)
 static void
 usr_socket_fd_remove(int sockfd)
 {
-	pthread_mutex_lock(&s_fd_list_mutex);
+	rte_spinlock_lock(&s_fd_list_lock);
 	TAILQ_REMOVE(&s_fd_desc_list, &s_fd_desc[sockfd], next);
-	pthread_mutex_unlock(&s_fd_list_mutex);
+	rte_spinlock_unlock(&s_fd_list_lock);
 	RTE_LOG(INFO, pre_ld, "FD(%d) was removed from user sockets.\n",
 		sockfd);
 }
@@ -962,6 +967,13 @@ usr_socket_fd_release(int sockfd)
 	struct rte_mempool *malloc_pool = NULL;
 
 	pthread_mutex_lock(&s_fd_mutex);
+
+	rte_spinlock_lock(&desc->rx_lock);
+	desc->rx_enable = false;
+	rte_spinlock_unlock(&desc->rx_lock);
+	rte_spinlock_lock(&desc->tx_lock);
+	desc->tx_enable = false;
+	rte_spinlock_unlock(&desc->tx_lock);
 
 	if (desc->tx_pool) {
 		malloc_pool = desc->tx_pool;
@@ -1444,16 +1456,31 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 	struct pre_ld_udp_desc *udp_desc;
 	int ret;
 	uint8_t *buf_u8 = buf, *pkt;
-	struct fd_desc *desc = &s_fd_desc[sockfd];
-	struct pre_ld_rx_pool *rx_pool = &desc->rx_buffer;
+	struct fd_desc *desc;
+	struct pre_ld_rx_pool *rx_pool;
 	struct pre_ld_direct_entry *rx_entry;
 	struct fd_hw_desc *hw_desc;
 
 	RTE_SET_USED(flags);
 
+	rte_spinlock_lock(&s_fd_list_lock);
+	if (unlikely(!is_usr_socket(sockfd))) {
+		rte_spinlock_unlock(&s_fd_list_lock);
+		return 0;
+	}
+	rte_spinlock_unlock(&s_fd_list_lock);
+
+	desc = &s_fd_desc[sockfd];
+	rx_pool = &desc->rx_buffer;
+
 	ret = eal_data_path_thread_register(desc);
 	if (ret)
 		return ret;
+
+	rte_spinlock_lock(&desc->rx_lock);
+
+	if (unlikely(!desc->rx_enable))
+		goto finsh_recv;
 
 	i = 0;
 	while (rx_pool->head != rx_pool->tail &&
@@ -1571,6 +1598,7 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 	}
 
 finsh_recv:
+	rte_spinlock_unlock(&desc->rx_lock);
 
 	return total_bytes;
 }
@@ -1627,14 +1655,26 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 	uint16_t mtu, max_len, hdr_len, count = 0;
 	struct pre_ld_direct_entry *tx_entry;
 	struct fd_hw_desc *hw_desc;
-	struct fd_desc *desc = &s_fd_desc[sockfd];
+	struct fd_desc *desc;
 
-	RTE_SET_USED(sockfd);
 	RTE_SET_USED(flags);
+	rte_spinlock_lock(&s_fd_list_lock);
+	if (unlikely(!is_usr_socket(sockfd))) {
+		rte_spinlock_unlock(&s_fd_list_lock);
+		return 0;
+	}
+	rte_spinlock_unlock(&s_fd_list_lock);
+
+	desc = &s_fd_desc[sockfd];
 
 	ret = eal_data_path_thread_register(desc);
 	if (ret)
 		return 0;
+
+	rte_spinlock_lock(&desc->tx_lock);
+
+	if (unlikely(!desc->tx_enable))
+		goto quit_send;
 
 	ret = 0;
 	mtu = desc->tx_port_mtu;
@@ -1655,17 +1695,16 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 		count++;
 	}
 	ret = usr_data_path_malloc_mbuf(desc, mbufs, count);
-	if (ret)
-		return 0;
+	if (unlikely(ret)) {
+		ret = 0;
+		count = 0;
+		goto quit_send;
+	}
 
 	eal_send_fill_mbufs(sockfd, buf, lens, mbufs, count);
 
 	if (desc->access_type == FD_THREAD_ACCESS) {
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
-		if (unlikely(!tx_entry)) {
-			/** FD close*/
-			goto quit_send;
-		}
 		if (tx_entry->poll_type == TX_RING) {
 			sent = rte_ring_enqueue_bulk(tx_entry->poll.tx_ring,
 				(void * const *)mbufs, count, NULL);
@@ -1691,6 +1730,8 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 quit_send:
 	if (sent < count)
 		rte_pktmbuf_free_bulk(&mbufs[sent], count - sent);
+
+	rte_spinlock_unlock(&desc->tx_lock);
 
 	return ret;
 }
@@ -3914,6 +3955,8 @@ static int eal_main(void)
 
 	s_main_td = pthread_self();
 
+	rte_spinlock_init(&s_fd_list_lock);
+
 	RTE_LOG(INFO, pre_ld,
 		"Main core%d, current core%d, CPU mask is 0x%08x\n",
 		rte_get_main_lcore(), sched_getcpu(),
@@ -4444,9 +4487,9 @@ socket_hdr_init(struct eth_ipv4_udp_hdr *hdr)
 static void
 usr_socket_fd_add(int sockfd)
 {
-	pthread_mutex_lock(&s_fd_list_mutex);
+	rte_spinlock_lock(&s_fd_list_lock);
 	TAILQ_INSERT_TAIL(&s_fd_desc_list, &s_fd_desc[sockfd], next);
-	pthread_mutex_unlock(&s_fd_list_mutex);
+	rte_spinlock_unlock(&s_fd_list_lock);
 }
 
 static void
@@ -4656,6 +4699,8 @@ usr_socket_fd_desc_init(int sockfd,
 	}
 
 	socket_hdr_init(&desc->hdr);
+	rte_spinlock_init(&desc->rx_lock);
+	rte_spinlock_init(&desc->tx_lock);
 
 	desc->rx_buffer.head = 0;
 	desc->rx_buffer.tail = 0;
@@ -4941,6 +4986,8 @@ usr_socket_fd_desc_init(int sockfd,
 
 fd_init_quit:
 	if (!ret) {
+		desc->tx_enable = true;
+		desc->rx_enable = true;
 		pthread_mutex_unlock(&s_fd_mutex);
 
 		return 0;
