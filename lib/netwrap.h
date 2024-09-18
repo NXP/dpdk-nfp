@@ -42,21 +42,32 @@ enum pre_ld_cmp_offset {
 	PRE_LD_CMP_L5_OFFSET
 };
 
+#define PRE_LD_FLOW_MAX_ITEM 4
+
+union pre_ld_flow_item {
+	struct rte_flow_item_ipv4 ipv4_spec;
+	struct rte_flow_item_ipv6 ipv6_spec;
+	struct rte_flow_item_esp esp_spec;
+	struct rte_flow_item_udp udp_spec;
+	struct rte_flow_item_gtp gtp_spec;
+	struct rte_flow_item_eth eth_spec;
+	struct rte_flow_item_ecpri ecpri_spec;
+};
+
 struct pre_ld_port_rx_flow {
 	int valid;
 	uint16_t port_id;
 	uint8_t tc_id;
 	uint16_t flow_id;
 	uint16_t queue_id;
+	struct rte_flow *flow;
+	enum rte_flow_item_type type[PRE_LD_FLOW_MAX_ITEM];
+	union pre_ld_flow_item items[PRE_LD_FLOW_MAX_ITEM];
+	union pre_ld_flow_item masks[PRE_LD_FLOW_MAX_ITEM];
 	enum pre_ld_cmp_offset cmp_offset_type;
 	uint8_t cmp_offset;
 	uint8_t cmp_size;
 	uint8_t cmp_data[64];
-};
-
-struct pre_ld_port_desc {
-	struct pre_ld_port_rx_flow *rx_flow;
-	void *flow;
 };
 
 struct pre_ld_sp_node;
@@ -87,7 +98,7 @@ enum pre_ld_dir_poll_type {
 };
 
 union pre_ld_dir_poll {
-	struct pre_ld_port_desc poll_port;
+	struct pre_ld_port_rx_flow *rx_flow;
 	struct pre_ld_sec_desc poll_sec;
 	struct rte_ring *tx_ring;
 	struct pre_ld_ring *pre_ld_tx_ring;
@@ -128,15 +139,8 @@ struct pre_ld_dir_statistic {
 	};
 };
 
-enum pre_ld_dir_entry_state {
-	PRE_LD_DIR_ENTRY_RUNNING = 1,
-	PRE_LD_DIR_ENTRY_STOPPING = 2,
-	PRE_LD_DIR_ENTRY_STOPPED = 3
-};
-
 struct pre_ld_direct_entry {
 	TAILQ_ENTRY(pre_ld_direct_entry) next;
-	enum pre_ld_dir_entry_state state;
 	enum pre_ld_dir_poll_type poll_type;
 	union pre_ld_dir_poll poll;
 	enum pre_ld_dir_dest_type dest_type;
@@ -145,7 +149,7 @@ struct pre_ld_direct_entry {
 	struct pre_ld_dir_statistic rx_stat;
 	char *poll_prefix;
 	char *action_prefix;
-	void (*entry_cb)(struct pre_ld_direct_entry *entry);
+	void (*entry_cb)(struct pre_ld_direct_entry *entry, int drain);
 
 	/** Update by statistic function only.*/
 	struct pre_ld_dir_statistic tx_old_stat;
@@ -191,20 +195,6 @@ struct pre_ld_ipsec_sp_entry {
 	uint32_t index;
 	uint8_t dir;
 
-	struct rte_flow_action action[2];
-	struct rte_flow_attr attr;
-	struct rte_flow_action_queue ingress_queue;
-	struct rte_flow_item flow_item[3];
-	union {
-		struct rte_flow_item_ipv4 ipv4_spec;
-		struct rte_flow_item_ipv6 ipv6_spec;
-	};
-	union {
-		struct rte_flow_item_ipv4 ipv4_mask;
-		struct rte_flow_item_ipv6 ipv6_mask;
-	};
-	struct rte_flow_item_esp esp_spec;
-	struct rte_flow_item_esp esp_mask;
 	struct rte_flow *flow;
 	uint8_t crypt_id;
 	struct pre_ld_direct_entry *entry_to_sec;
@@ -240,16 +230,9 @@ struct pre_ld_ipsec_cntx {
 #define dcbf(p) { asm volatile("dc cvac, %0" : : "r"(p) : "memory"); }
 #define dccivac(p) { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
 
-void
-pre_ld_rx_flow_verify_set(struct pre_ld_port_rx_flow *rx_flow,
-	enum pre_ld_cmp_offset type, uint8_t offset, uint8_t size,
-	const uint8_t *cmp_data);
-
-void
-pre_ld_flow_destroy(uint16_t port, struct rte_flow *flow);
-
 int
-pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp);
+pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
+	rte_be32_t spi);
 void
 pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp);
 int
