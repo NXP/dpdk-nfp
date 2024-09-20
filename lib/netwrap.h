@@ -233,6 +233,25 @@ struct pre_ld_ipsec_cntx {
 #define dcbf(p) { asm volatile("dc cvac, %0" : : "r"(p) : "memory"); }
 #define dccivac(p) { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
 
+static inline int
+_pre_ld_log(char *buf, const char *format, ...)
+{
+	va_list ap;
+	int ret;
+
+	va_start(ap, format);
+	ret = vsprintf(buf, format, ap);
+	va_end(ap);
+
+	return ret;
+}
+
+void
+pre_ld_log(uint32_t level, uint32_t logtype, const char *format, ...);
+
+#define PRE_LD_LOG(l, ...) \
+	pre_ld_log(RTE_LOG_##l, RTE_LOGTYPE_pre_ld, __VA_ARGS__)
+
 int
 pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	rte_be32_t spi);

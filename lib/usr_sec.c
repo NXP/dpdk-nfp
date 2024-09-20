@@ -363,7 +363,7 @@ dump_sa_from_xfrm(const struct xfrm_usersa_info *sa_info)
 		DUMP_PREFIX);
 	RTE_VERIFY(offset < DUMP_BUF_SIZE);
 
-	RTE_LOG(INFO, pre_ld, "%s", pol_dump);
+	PRE_LD_LOG(INFO, "%s", pol_dump);
 }
 
 static int nl_parse_attrs(struct nlattr *na, int len,
@@ -388,7 +388,7 @@ static int nl_parse_attrs(struct nlattr *na, int len,
 			rte_memcpy(sa_params->auth_alg.alg.alg_key,
 				auth_alg->alg_key,
 				sa_params->auth_alg.alg.alg_key_len);
-			RTE_LOG(INFO, pre_ld, "%s: parse auth alog(%s)\n",
+			PRE_LD_LOG(INFO, "%s: parse auth alog(%s)\n",
 				__func__, auth_alg->alg_name);
 			break;
 		case XFRMA_ALG_CRYPT:
@@ -401,19 +401,18 @@ static int nl_parse_attrs(struct nlattr *na, int len,
 			rte_memcpy(sa_params->ciph_alg.alg_key,
 				cipher_alg->alg_key,
 				sa_params->ciph_alg.alg_key_len);
-			RTE_LOG(INFO, pre_ld, "%s: parse crypt alog(%s)\n",
+			PRE_LD_LOG(INFO, "%s: parse crypt alog(%s)\n",
 				__func__, cipher_alg->alg_name);
 			break;
 		case XFRMA_ENCAP:
-			RTE_LOG(INFO, pre_ld, "%s: parse encap\n",
-				__func__);
+			PRE_LD_LOG(INFO, "%s: parse encap\n", __func__);
 			encp = NLA_DATA(na);
 			sa_params->encp_present = 1;
 			rte_memcpy(&sa_params->encp, encp,
 				sizeof(struct xfrm_encap_tmpl));
 			break;
 		case XFRMA_ALG_AUTH_TRUNC:
-			RTE_LOG(INFO, pre_ld, "%s: parse auth trunc(%s)\n",
+			PRE_LD_LOG(INFO, "%s: parse auth trunc(%s)\n",
 				__func__, auth_alg->alg_name);
 			auth_trunc_alg = NLA_DATA(na);
 			sa_params->auth_present = XFRMA_AUTH_TRUNC_PRESENT;
@@ -428,7 +427,7 @@ static int nl_parse_attrs(struct nlattr *na, int len,
 				sa_params->auth_alg.alg_trunc.alg_key_len);
 			break;
 		default:
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: XFRM netlink type(%d) not support\n",
 				__func__, na->nla_type);
 			break;
@@ -465,9 +464,8 @@ process_del_policy_entry(struct pre_ld_ipsec_sp_entry *sp)
 	} else {
 		ret = pre_ld_detach_sec_path(sp);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: detach sp failed(%d)\n",
-				__func__, ret);
+			PRE_LD_LOG(ERR,
+				"%s: detach sp failed(%d)\n", __func__, ret);
 		}
 	}
 
@@ -566,8 +564,7 @@ xfm_find_sa_addrs_by_sp_addrs(const xfrm_address_t *src,
 		size = 16;
 	} else {
 		/* we handle only in/out policies */
-		RTE_LOG(ERR, pre_ld,
-			"Policy dir(%d)/family(%d) unsupport\n",
+		PRE_LD_LOG(ERR, "Policy dir(%d)/family(%d) unsupport\n",
 			dir, family);
 		return -EINVAL;
 	}
@@ -694,9 +691,10 @@ xfm_dump_all_sa_sp(const char *prefix, const char *tail)
 		off += sprintf(&info[off], "Total %d SP OUT(s)\n", num);
 
 	if (tail)
-		RTE_LOG(INFO, pre_ld, "%s\n%s%s", prefix, info, tail);
+		PRE_LD_LOG(INFO, "%s\n%s%s", prefix, info, tail);
 	else
-		RTE_LOG(INFO, pre_ld, "%s\n%s", prefix, info);
+		PRE_LD_LOG(INFO, "%s\n%s", prefix, info);
+
 	rte_free(info);
 }
 
@@ -729,8 +727,7 @@ xfm_to_sa_entry(const struct xfm_ipsec_sa_params *sa_param,
 	sa_entry = rte_zmalloc(NULL, sizeof(struct pre_ld_ipsec_sa_entry),
 		RTE_CACHE_LINE_SIZE);
 	if (!sa_entry) {
-		RTE_LOG(ERR, pre_ld,
-			"New SA entry malloc failed\n");
+		PRE_LD_LOG(ERR, "New SA entry malloc failed\n");
 		return -ENOMEM;
 	}
 	new_sa = 1;
@@ -794,9 +791,8 @@ update_sa:
 		} else if (sa_info->mode == XFRM_MODE_TUNNEL) {
 			sa_entry->sa_flags = IP4_TUNNEL;
 		} else {
-			RTE_LOG(ERR, pre_ld,
-				"unsupported xfrm mode(%d)\n",
-				sa_info->mode);
+			PRE_LD_LOG(ERR,
+				"unsupported xfrm mode(%d)\n", sa_info->mode);
 			ret = -ENOTSUP;
 			goto quit;
 		}
@@ -806,16 +802,14 @@ update_sa:
 		} else if (sa_info->mode == XFRM_MODE_TUNNEL) {
 			sa_entry->sa_flags = IP6_TUNNEL;
 		} else {
-			RTE_LOG(ERR, pre_ld,
-				"unsupported xfrm mode(%d)\n",
-				sa_info->mode);
+			PRE_LD_LOG(ERR,
+				"unsupported xfrm mode(%d)\n", sa_info->mode);
 			ret = -ENOTSUP;
 			goto quit;
 		}
 	} else {
-		RTE_LOG(ERR, pre_ld,
-			"unsupported xfrm family(%d)\n",
-			sa_info->family);
+		PRE_LD_LOG(ERR,
+			"unsupported xfrm family(%d)\n", sa_info->family);
 		ret = -ENOTSUP;
 		goto quit;
 	}
@@ -843,8 +837,7 @@ update_sa:
 		sa_entry->sess_conf.ipsec.mode =
 			RTE_SECURITY_IPSEC_SA_MODE_TRANSPORT;
 	} else {
-		RTE_LOG(ERR, pre_ld,
-			"unsupported xfrm mode(%d)\n",
+		PRE_LD_LOG(ERR, "unsupported xfrm mode(%d)\n",
 			sa_info->mode);
 		ret = -ENOTSUP;
 		goto quit;
@@ -871,8 +864,7 @@ update_sa:
 			tunnel_param->ipv6.flabel = 0;
 			tunnel_param->ipv6.hlimit = IPDEFTTL;
 		} else {
-			RTE_LOG(ERR, pre_ld,
-				"unsupported xfrm family(%d)\n",
+			PRE_LD_LOG(ERR, "unsupported xfrm family(%d)\n",
 				sa_info->family);
 			ret = -ENOTSUP;
 			goto quit;
@@ -965,8 +957,7 @@ process_notif_sa(const struct nlmsghdr *nh, int len,
 
 	xfm_dump_all_sa_sp("Before new SA notification", NULL);
 
-	RTE_LOG(INFO, pre_ld, "XFRM notification type(%d)\n",
-		nh->nlmsg_type);
+	PRE_LD_LOG(INFO, "XFRM notification type(%d)\n", nh->nlmsg_type);
 
 	memset(&sa_params, 0, sizeof(struct xfm_ipsec_sa_params));
 
@@ -983,9 +974,7 @@ process_notif_sa(const struct nlmsghdr *nh, int len,
 	msg_len = (uint64_t)nh - (uint64_t)na + len;
 	ret = nl_parse_attrs(na, msg_len, &sa_params);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"XFRM netlink parse attrs err(%d)\n",
-			ret);
+		PRE_LD_LOG(ERR, "XFRM netlink parse attrs err(%d)\n", ret);
 		return ret;
 	}
 
@@ -1010,13 +999,11 @@ process_del_sa_entry(struct pre_ld_ipsec_sa_entry *sa)
 		ret = rte_security_session_destroy(ctx,
 				sa->session.security.ses);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: destroy session failed(%d)\n",
+			PRE_LD_LOG(ERR, "%s: destroy session failed(%d)\n",
 				__func__, ret);
 		}
 	}
-	RTE_LOG(INFO, pre_ld,
-		"Delete SA %s spi(%08x), lifetime(%.2f s)\n",
+	PRE_LD_LOG(INFO, "Delete SA %s spi(%08x), lifetime(%.2f s)\n",
 		sa->sess_conf.ipsec.direction ==
 		RTE_SECURITY_IPSEC_SA_DIR_INGRESS ?
 		"IN" : sa->sess_conf.ipsec.direction ==
@@ -1060,7 +1047,7 @@ xfm_del_sa(uint16_t family, rte_be32_t spi,
 		if (curr->sp) {
 			ret = process_del_policy_entry(curr->sp);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"%s: Delete policy entry failed(%d)\n",
 					__func__, ret);
 			}
@@ -1085,8 +1072,7 @@ xfm_del_sa(uint16_t family, rte_be32_t spi,
 			addr[12], addr[13], addr[14], addr[15]);
 	}
 
-	RTE_LOG(INFO, pre_ld,
-		"XFRM deleting SA spi(0x%08x), %s %s\n",
+	PRE_LD_LOG(INFO, "XFRM deleting SA spi(0x%08x), %s %s\n",
 		cpu_spi, addr_info, curr ? "deleted" : "not found");
 
 	if (curr)
@@ -1167,7 +1153,7 @@ dump_new_policy(const struct xfrm_userpolicy_info *pol_info)
 	int offset = 0;
 
 	if (pol_info->dir > XFRM_POLICY_MAX) {
-		RTE_LOG(ERR, pre_ld, "Invalid policy direction(%d)\n",
+		PRE_LD_LOG(ERR, "Invalid policy direction(%d)\n",
 			pol_info->dir);
 		return;
 	}
@@ -1183,7 +1169,7 @@ dump_new_policy(const struct xfrm_userpolicy_info *pol_info)
 		DUMP_PREFIX);
 	RTE_VERIFY(offset < DUMP_BUF_SIZE);
 
-	RTE_LOG(INFO, pre_ld, "%s", pol_dump);
+	PRE_LD_LOG(INFO, "%s", pol_dump);
 }
 
 static int
@@ -1219,8 +1205,7 @@ xfm_steer_sp_flow(struct pre_ld_ipsec_sp_entry *sp, rte_be32_t spi)
 
 	xfm_flow->flow = sp->flow;
 	xfm_flow->flow_ref = 1;
-	RTE_LOG(INFO, pre_ld,
-		"%s: Policy %s flow created to port%d\n",
+	PRE_LD_LOG(INFO, "%s: Policy %s flow created to port%d\n",
 		__func__, sp->dir == XFRM_POLICY_IN ?
 		"Ingress" : "Egress",
 		sp->entry_from_sec->dest.dest_port);
@@ -1245,7 +1230,7 @@ xfm_create_session_by_sa(struct pre_ld_ipsec_sa_entry *sa,
 	ips->security.ses = rte_security_session_create(ctx,
 		&sa->sess_conf, mp);
 	if (!ips->security.ses) {
-		RTE_LOG(ERR, pre_ld, "Lookaside Session init failed\n");
+		PRE_LD_LOG(ERR, "Lookaside Session init failed\n");
 		return -EINVAL;
 	}
 	sa->sec_id = dev_id;
@@ -1272,8 +1257,7 @@ xfm_sa_sp_associate(struct pre_ld_ipsec_sp_entry *sp,
 	ret = xfm_steer_sp_flow(sp,
 		rte_cpu_to_be_32(sa->sess_conf.ipsec.spi));
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Steer policy by HW failed(%d)\n", ret);
+		PRE_LD_LOG(ERR, "Steer policy by HW failed(%d)\n", ret);
 		return ret;
 	}
 
@@ -1327,7 +1311,7 @@ xfm_init_new_policy(struct pre_ld_ipsec_sp_entry *sp,
 			dst_ip6[4], dst_ip6[5],
 			dst_ip6[6], dst_ip6[7]);
 	}
-	RTE_LOG(INFO, pre_ld, "New %s %s\n",
+	PRE_LD_LOG(INFO, "New %s %s\n",
 		pol_info->dir == XFRM_POLICY_OUT ?
 		"Outbound policy" : "Inbound policy",
 		add_str);
@@ -1427,8 +1411,7 @@ process_new_policy(const struct nlmsghdr *nh,
 
 	if (pol_info->dir != XFRM_POLICY_IN &&
 		pol_info->dir != XFRM_POLICY_OUT) {
-		RTE_LOG(DEBUG, pre_ld,
-			"Don't configure policy (dir=%d)\n",
+		PRE_LD_LOG(DEBUG, "Don't configure policy (dir=%d)\n",
 			pol_info->dir);
 		return -ENOTSUP;
 	}
@@ -1439,8 +1422,7 @@ process_new_policy(const struct nlmsghdr *nh,
 
 	ret = do_spdget(pol_info->index, &saddr, &daddr, &af);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Policy doesn't exist in kernel SPDB(%d)\n",
+		PRE_LD_LOG(ERR, "Policy doesn't exist in kernel SPDB(%d)\n",
 			ret);
 		return ret;
 	}
@@ -1469,14 +1451,14 @@ process_new_policy(const struct nlmsghdr *nh,
 			dst6[0], dst6[1], dst6[2], dst6[3],
 			dst6[4], dst6[5], dst6[6], dst6[7]);
 	} else {
-		RTE_LOG(ERR, pre_ld, "Invalid AF(%d) got by SPD\n", af);
+		PRE_LD_LOG(ERR, "Invalid AF(%d) got by SPD\n", af);
 		return -EINVAL;
 	}
 
 	num = xfm_find_sa_by_addrs(&saddr, &daddr, af, sas, MAX_SA_NUM);
 	if (num <= 0) {
 		/** TO DO: Add SP to pending list.*/
-		RTE_LOG(ERR, pre_ld, "No SA found by %s\n", addr_info);
+		PRE_LD_LOG(ERR, "No SA found by %s\n", addr_info);
 		return -ENOTSUP;
 	}
 	for (i = 0; i < num; i++) {
@@ -1486,14 +1468,13 @@ process_new_policy(const struct nlmsghdr *nh,
 		}
 	}
 	if (!sa) {
-		RTE_LOG(ERR, pre_ld,
-			"%d SA(s) have been associated to SP\n", num);
+		PRE_LD_LOG(ERR, "%d SA(s) have been associated to SP\n", num);
 		return -EINVAL;
 	}
 
 	sprintf(&addr_info[offset], "/spi(%08x)",
 		sa->sess_conf.ipsec.spi);
-	RTE_LOG(INFO, pre_ld, "Found SA: %s\n", addr_info);
+	PRE_LD_LOG(INFO, "Found SA: %s\n", addr_info);
 
 	if (pol_info->dir == XFRM_POLICY_IN) {
 		spi = sa->sess_conf.ipsec.spi;
@@ -1510,7 +1491,7 @@ process_new_policy(const struct nlmsghdr *nh,
 	sp = rte_zmalloc(NULL, sizeof(struct pre_ld_ipsec_sp_entry),
 		RTE_CACHE_LINE_SIZE);
 	if (!sp) {
-		RTE_LOG(ERR, pre_ld, "Malloc sp failed.\n");
+		PRE_LD_LOG(ERR, "Malloc sp failed.\n");
 		return -ENOMEM;
 	}
 
@@ -1522,12 +1503,10 @@ process_new_policy(const struct nlmsghdr *nh,
 	if (!sa->session.security.ses) {
 		ret = xfm_apply_sa(sa, pol_info, sec_id, mp);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"Create session failed(%d)\n", ret);
+			PRE_LD_LOG(ERR, "Create session failed(%d)\n", ret);
 			goto quit;
 		} else if (!sa->session.security.ses) {
-			RTE_LOG(ERR, pre_ld,
-				"Security session not allocated\n");
+			PRE_LD_LOG(ERR, "Security session not allocated\n");
 			ret = -ENOBUFS;
 			goto quit;
 		}
@@ -1536,7 +1515,7 @@ process_new_policy(const struct nlmsghdr *nh,
 	sp->flow = flow;
 	ret = xfm_sa_sp_associate(sp, sa);
 	if (ret)
-		RTE_LOG(ERR, pre_ld, "SA/SP associate failed!\n");
+		PRE_LD_LOG(ERR, "SA/SP associate failed!\n");
 
 quit:
 	if (ret) {
@@ -1581,7 +1560,7 @@ xfm_del_policy(const struct xfrm_selector *sel,
 		size = 16;
 	} else {
 		/* we handle only in/out policy */
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"XFRM del policy dir(%d)/family(%d) unsupport\n",
 			dir, sel->family);
 		return -EINVAL;
@@ -1603,13 +1582,13 @@ xfm_del_policy(const struct xfrm_selector *sel,
 		sa = curr->sa;
 		ret = process_del_policy_entry(curr);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"XFRM del policy entry failed(%d)\n", ret);
 		}
 		if (sa) {
 			ret = process_del_sa_entry(sa);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"XFRM delete associated sa failed(%d)\n",
 					ret);
 			}
@@ -1645,8 +1624,7 @@ xfm_del_policy(const struct xfrm_selector *sel,
 			dst_info[12], dst_info[13], dst_info[14], dst_info[15]);
 	}
 
-	RTE_LOG(INFO, pre_ld,
-		"XFRM delete policy %s %s(%d) %s\n",
+	PRE_LD_LOG(INFO, "XFRM delete policy %s %s(%d) %s\n",
 		dir == XFRM_POLICY_IN ? "IN" : "OUT",
 		curr ? "done" : "not found", ret, addr_info);
 
@@ -1710,101 +1688,94 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 
 	switch (nh->nlmsg_type) {
 	case XFRM_MSG_UPDSA:
-		RTE_LOG(INFO, pre_ld, "XFRM update SA start\n");
+		PRE_LD_LOG(INFO, "XFRM update SA start\n");
 		ret = process_notif_sa(nh, len, 1);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM update SA failed(%d)\n\n", ret);
+			PRE_LD_LOG(ERR, "XFRM update SA failed(%d)\n\n", ret);
 		} else {
-			RTE_LOG(INFO, pre_ld, "XFRM update SA done\n\n");
+			PRE_LD_LOG(INFO, "XFRM update SA done\n\n");
 		}
 		break;
 	case XFRM_MSG_NEWSA:
-		RTE_LOG(INFO, pre_ld, "XFRM new SA start\n");
+		PRE_LD_LOG(INFO, "XFRM new SA start\n");
 		ret = process_notif_sa(nh, len, 0);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM new SA failed(%d)\n\n", ret);
+			PRE_LD_LOG(ERR, "XFRM new SA failed(%d)\n\n", ret);
 		} else {
-			RTE_LOG(INFO, pre_ld, "XFRM new SA done\n\n");
+			PRE_LD_LOG(INFO, "XFRM new SA done\n\n");
 		}
 		break;
 	case XFRM_MSG_DELSA:
-		RTE_LOG(INFO, pre_ld, "XFRM delete SA start\n");
+		PRE_LD_LOG(INFO, "XFRM delete SA start\n");
 		ret = process_del_sa(nh);
 		if (ret && ret != (-ENODATA)) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM delete SA failed(%d)\n\n", ret);
+			PRE_LD_LOG(ERR, "XFRM delete SA failed(%d)\n\n", ret);
 		} else if (!ret) {
-			RTE_LOG(INFO, pre_ld, "XFRM delete SA done\n\n");
+			PRE_LD_LOG(INFO, "XFRM delete SA done\n\n");
 		}
 		break;
 	case XFRM_MSG_FLUSHSA:
-		RTE_LOG(INFO, pre_ld, "XFRM flush SA start\n");
+		PRE_LD_LOG(INFO, "XFRM flush SA start\n");
 		process_flush_sa();
 		break;
 	case XFRM_MSG_UPDPOLICY:
 		ret = process_new_policy(nh, sec_id, mp);
 		if (ret && ret != -ENOTSUP) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"XFRM update policy failed(%d)\n\n", ret);
 		} else if (!ret) {
-			RTE_LOG(INFO, pre_ld, "XFRM update policy done\n\n");
+			PRE_LD_LOG(INFO, "XFRM update policy done\n\n");
 		}
 		break;
 	case XFRM_MSG_NEWPOLICY:
 		ret = process_new_policy(nh, sec_id, mp);
 		if (ret && ret != -ENOTSUP) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM new policy failed(%d)\n\n", ret);
+			PRE_LD_LOG(ERR, "XFRM new policy failed(%d)\n\n", ret);
 		} else if (!ret) {
-			RTE_LOG(INFO, pre_ld, "XFRM new policy done\n\n");
+			PRE_LD_LOG(INFO, "XFRM new policy done\n\n");
 		}
 		break;
 	case XFRM_MSG_DELPOLICY:
 		ret = process_del_policy(nh);
 		if (ret && ret != -ENOTSUP) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"XFRM delete policy failed(%d)\n\n", ret);
 		} else if (!ret) {
-			RTE_LOG(INFO, pre_ld, "XFRM delete policy done\n\n");
+			PRE_LD_LOG(INFO, "XFRM delete policy done\n\n");
 		}
 		break;
 	case XFRM_MSG_GETPOLICY:
-		RTE_LOG(INFO, pre_ld, "XFRM get policy start\n");
+		PRE_LD_LOG(INFO, "XFRM get policy start\n");
 		ret = 0;
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"XFRM get policy failed(%d)\n\n", ret);
 		} else {
-			RTE_LOG(INFO, pre_ld, "XFRM get policy done\n\n");
+			PRE_LD_LOG(INFO, "XFRM get policy done\n\n");
 		}
 		break;
 	case XFRM_MSG_POLEXPIRE:
 		ret = process_exp_policy(nh);
-		RTE_LOG(INFO, pre_ld,
-			"XFRM process SP expire %s\n",
+		PRE_LD_LOG(INFO, "XFRM process SP expire %s\n",
 			ret ? "failed" : "success");
 		break;
 	case XFRM_MSG_FLUSHPOLICY:
-		RTE_LOG(INFO, pre_ld, "XFRM flush policy start\n");
+		PRE_LD_LOG(INFO, "XFRM flush policy start\n");
 		ret = process_flush_policy();
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"XFRM flush policy failed(%d)\n\n", ret);
 		} else {
-			RTE_LOG(INFO, pre_ld, "XFRM flush policy done\n\n");
+			PRE_LD_LOG(INFO, "XFRM flush policy done\n\n");
 		}
 		break;
 	case XFRM_MSG_EXPIRE:
 		ret = process_exp_sa(nh);
-		RTE_LOG(INFO, pre_ld,
-			"XFRM process SA expire %s\n",
+		PRE_LD_LOG(INFO, "XFRM process SA expire %s\n",
 			ret ? "failed" : "success");
 		break;
 	default:
-		RTE_LOG(INFO, pre_ld,
-			"\nXFRM msg type(%d) not support\n\n",
+		PRE_LD_LOG(INFO, "\nXFRM msg type(%d) not support\n\n",
 			nh->nlmsg_type);
 		ret = 0;
 	}
@@ -1821,8 +1792,7 @@ xfm_calculate_cycles_per_us(void)
 	rte_delay_ms(100);
 	end_cycles = rte_get_timer_cycles();
 	s_xfm_cycs_per_us = (end_cycles - start_cycles) / (100 * 1000);
-	RTE_LOG(INFO, pre_ld,
-		"Cycles per us is: %ld\n",
+	PRE_LD_LOG(INFO, "Cycles per us is: %ld\n",
 		(unsigned long)s_xfm_cycs_per_us);
 }
 
@@ -1847,9 +1817,7 @@ static void *xfrm_msg_loop(void *data)
 	ret = pthread_setaffinity_np(pthread_self(),
 		sizeof(cpuset), &cpuset);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"XFRM thread set affinity failed(%d)\n",
-			ret);
+		PRE_LD_LOG(ERR, "XFRM thread set affinity failed(%d)\n", ret);
 		pthread_exit(NULL);
 	}
 
@@ -1861,8 +1829,7 @@ static void *xfrm_msg_loop(void *data)
 				XFRMGRP_POLICY |
 				XFRMGRP_REPORT);
 	if (xfrm_sd < 0) {
-		RTE_LOG(ERR, pre_ld, "XFRM open netlink failed(%d)\n",
-			errno);
+		PRE_LD_LOG(ERR, "XFRM open netlink failed(%d)\n", errno);
 		pthread_exit(NULL);
 	}
 
@@ -1878,9 +1845,7 @@ static void *xfrm_msg_loop(void *data)
 	while (1) {
 		len = recvmsg(xfrm_sd, &msg, 0);
 		if (len < 0 && errno != EINTR) {
-			RTE_LOG(ERR, pre_ld,
-				"XFRM receive socket(%d)\n",
-				errno);
+			PRE_LD_LOG(ERR, "XFRM receive socket(%d)\n", errno);
 			break;
 		} else if (errno == EINTR) {
 			break;
@@ -1889,14 +1854,14 @@ static void *xfrm_msg_loop(void *data)
 		for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, len);
 		     nh = NLMSG_NEXT(nh, len)) {
 			if (nh->nlmsg_type == NLMSG_ERROR) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"XFRM netlink message err(%d)\n",
 					errno);
 				break;
 			}
 			if (nh->nlmsg_flags & NLM_F_MULTI ||
 				nh->nlmsg_type == NLMSG_DONE) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"XFRM multi-part messages not supported\n");
 				break;
 			}
@@ -1921,9 +1886,7 @@ xfrm_setup_msgloop(void *param)
 
 	ret = pthread_create(&tid, NULL, xfrm_msg_loop, param);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"XFRM message thread create failed(%d)\n",
-			ret);
+		PRE_LD_LOG(ERR, "XFRM message thread create failed(%d)\n", ret);
 	}
 	return ret;
 }

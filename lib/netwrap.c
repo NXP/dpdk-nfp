@@ -234,7 +234,7 @@ enum pre_ld_crypto_dir {
 
 static int s_ipsec_ib_flow_ip_addr_extract;
 
-pthread_mutex_t s_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct fd_desc *s_fd_desc;
 
 TAILQ_HEAD(fd_desc_list, fd_desc);
@@ -242,6 +242,7 @@ static struct fd_desc_list s_fd_desc_list =
 	TAILQ_HEAD_INITIALIZER(s_fd_desc_list);
 
 static rte_spinlock_t s_fd_list_lock;
+static int s_rte_eal_init_complete;
 
 #define UDP_HDR_LEN sizeof(struct rte_udp_hdr)
 
@@ -446,6 +447,52 @@ struct pre_ld_udp_desc {
 	(PRE_LD_MP_PRIV_SIZE + PRE_LD_MBUF_OFFSET + \
 	RTE_MBUF_DEFAULT_DATAROOM)
 
+#define NS_PER_US 1000
+#define NS_PER_MS (NS_PER_US * 1000)
+#ifndef NS_PER_S
+#define NS_PER_S (NS_PER_MS * 1000)
+#endif
+
+static struct timespec s_ts;
+static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+_pre_ld_time_log(uint32_t level, uint32_t logtype)
+{
+	char time[128];
+	struct timespec ts;
+	uint64_t diff;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	diff = ts.tv_sec * NS_PER_S + ts.tv_nsec -
+		(s_ts.tv_sec * NS_PER_S + s_ts.tv_nsec);
+
+	sprintf(time, "[pre_ld: %ld.%06d s] ", diff / NS_PER_S,
+		(int)(diff - (diff / NS_PER_S) * NS_PER_S) / NS_PER_US);
+	rte_log(level, logtype, "%s", time);
+}
+
+void
+pre_ld_log(uint32_t level, uint32_t logtype, const char *format, ...)
+{
+	va_list ap;
+
+	if (!s_rte_eal_init_complete)
+		return;
+
+	if (!rte_log_can_log(logtype, level))
+		return;
+
+	pthread_mutex_lock(&s_log_mutex);
+
+	_pre_ld_time_log(level, logtype);
+	va_start(ap, format);
+	rte_vlog(level, logtype, format, ap);
+	va_end(ap);
+
+	pthread_mutex_unlock(&s_log_mutex);
+}
+
 static struct pre_ld_ring *
 pre_ld_ring_create(const char *name, uint16_t size)
 {
@@ -572,14 +619,12 @@ rsp_again:
 		goto rsp_again;
 	}
 	if (rsp != &req) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: response(%p) != request(%p)\n",
+		PRE_LD_LOG(ERR, "%s: response(%p) != request(%p)\n",
 			__func__, rsp, &req);
 		return -EIO;
 	}
 	if (rsp->msg_type != UPDATE_ENTRY_SUCCESS_RSP) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Get failed or un-expected response(%d)\n",
+		PRE_LD_LOG(ERR, "%s: Get failed or un-expected response(%d)\n",
 			__func__, rsp->msg_type);
 		return -EINVAL;
 	}
@@ -620,7 +665,7 @@ pre_ld_cryptodev_init(void)
 
 	rte_cryptodev_info_get(crypt_dev, &cdev_info);
 	if (cdev_info.max_nb_queue_pairs < 2) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"Crypto(%d) can't support encap/decap with %d queue(s)\n",
 			crypt_dev, cdev_info.max_nb_queue_pairs);
 		return -ENOTSUP;
@@ -632,8 +677,8 @@ pre_ld_cryptodev_init(void)
 
 	ret = rte_cryptodev_configure(crypt_dev, &dev_conf);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Crypto(%d) configure failed(%d)\n", crypt_dev, ret);
+		PRE_LD_LOG(ERR, "Crypto(%d) configure failed(%d)\n",
+			crypt_dev, ret);
 
 		return ret;
 	}
@@ -644,8 +689,7 @@ pre_ld_cryptodev_init(void)
 		ret = rte_cryptodev_queue_pair_setup(crypt_dev, qp,
 				&qp_conf, dev_conf.socket_id);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"Crypto(%d) setup qp%d failed(%d)\n",
+			PRE_LD_LOG(ERR, "Crypto(%d) setup qp%d failed(%d)\n",
 				crypt_dev, qp, ret);
 
 			return ret;
@@ -654,8 +698,8 @@ pre_ld_cryptodev_init(void)
 
 	ret = rte_cryptodev_start(crypt_dev);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Crypto(%d) start failed(%d)\n", crypt_dev, ret);
+		PRE_LD_LOG(ERR, "Crypto(%d) start failed(%d)\n",
+			crypt_dev, ret);
 
 		return ret;
 	}
@@ -727,26 +771,24 @@ pre_ld_crypto_init(struct rte_mempool *mbuf_pool)
 	s_crypt_param.sess_pool = mbuf_pool;
 	ret = pre_ld_crypt_sess_priv_pool_create();
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Crypto session pool create failed(%d)\n",
-			ret);
+		PRE_LD_LOG(ERR, "Crypto session pool create failed(%d)\n", ret);
 
 		return ret;
 	}
 	ret = pre_ld_cryptodev_init();
 	if (ret) {
-		RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
+		PRE_LD_LOG(ERR, "Crypto init failed(%d)\n", ret);
 
 		return ret;
 	}
 	ret = xfrm_setup_msgloop(&s_crypt_param);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld, "IPSec msg setup failed(%d)\n", ret);
+		PRE_LD_LOG(ERR, "IPSec msg setup failed(%d)\n", ret);
 
 		return ret;
 	}
 
-	RTE_LOG(INFO, pre_ld, "Crypto init successfully\n");
+	PRE_LD_LOG(INFO, "Crypto init successfully\n");
 
 	return 0;
 }
@@ -774,8 +816,7 @@ convert_ip_addr_to_str(char *str,
 		}
 		str[idx] = 0;
 	} else {
-		RTE_LOG(ERR, pre_ld,
-			"Invalid IP address length(%d)", len);
+		PRE_LD_LOG(ERR, "Invalid IP address length(%d)", len);
 		return -EINVAL;
 	}
 
@@ -798,7 +839,7 @@ netwrap_get_current_process_name(char *nm)
 	if (f) {
 		size = fread(ps_nm, sizeof(char), 1024, f);
 		if (size > 0) {
-			RTE_LOG(DEBUG, pre_ld,
+			PRE_LD_LOG(DEBUG,
 				"This process: PID = %d, name: %s\n",
 				pid, ps_nm);
 			strcpy(nm, ps_nm);
@@ -826,7 +867,7 @@ netwrap_is_usr_process(void)
 		if (!strcmp(s_usr_app_nm, current_nm))
 			return true;
 
-		RTE_LOG(DEBUG, pre_ld,
+		PRE_LD_LOG(DEBUG,
 			"This process(%s) is not user app(%s)\n",
 			current_nm, s_usr_app_nm);
 	}
@@ -869,8 +910,7 @@ pre_ld_flow_destroy(uint16_t port, struct rte_flow *flow)
 again:
 	ret = rte_flow_destroy(port, flow, NULL);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Destroy flow failed(%d), times=%d\n",
+		PRE_LD_LOG(ERR, "%s: Destroy flow failed(%d), times=%d\n",
 			__func__, ret, times);
 	}
 	if (ret == -EAGAIN && times > 0) {
@@ -895,7 +935,7 @@ eal_destroy_dpaa2_mux_flow(void)
 				continue;
 			ret = rte_pmd_dpaa2_mux_flow_destroy(id, entry);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"Destroy MUX%d's flow entry%d failed(%d)\n",
 					id, entry, ret);
 			}
@@ -942,8 +982,7 @@ usr_socket_fd_remove(int sockfd)
 	rte_spinlock_lock(&s_fd_list_lock);
 	TAILQ_REMOVE(&s_fd_desc_list, &s_fd_desc[sockfd], next);
 	rte_spinlock_unlock(&s_fd_list_lock);
-	RTE_LOG(INFO, pre_ld, "FD(%d) was removed from user sockets.\n",
-		sockfd);
+	PRE_LD_LOG(INFO, "FD(%d) was removed from user sockets.\n", sockfd);
 }
 
 static int
@@ -1016,14 +1055,14 @@ usr_socket_fd_release(int sockfd)
 	if (rx_entry && is_usr_socket_connected(sockfd)) {
 		ret = pre_ld_update_dir_list_safe(rx_entry, REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s remove FD[%d]'s RX entry failed(%d)\n",
 				__func__, sockfd, ret);
 		}
 		if (ret == (-EBUSY) && rx_flow && rx_flow->flow) {
 			ret = pre_ld_flow_destroy(rx_port, rx_flow->flow);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"%s line %d: destroy FD[%d]'s flow failed(%d)\n",
 					__func__, __LINE__, sockfd, ret);
 			}
@@ -1041,7 +1080,7 @@ usr_socket_fd_release(int sockfd)
 	if (tx_entry) {
 		ret = pre_ld_update_dir_list_safe(tx_entry, REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s remove FD[%d]'s TX entry failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -1056,7 +1095,7 @@ usr_socket_fd_release(int sockfd)
 	if (free_entry) {
 		ret = pre_ld_update_dir_list_safe(free_entry, REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s remove FD[%d]'s free entry failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -1072,7 +1111,7 @@ usr_socket_fd_release(int sockfd)
 		ret = pre_ld_update_dir_list_safe(malloc_entry,
 			REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s remove FD[%d]'s malloc entry failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -1087,7 +1126,7 @@ usr_socket_fd_release(int sockfd)
 	if (desc->access_type == FD_HARDWARE_ACCESS) {
 		ret = pre_ld_flow_destroy(rx_port, rx_flow->flow);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s destroy FD[%d]'s rte flow failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -1096,8 +1135,7 @@ usr_socket_fd_release(int sockfd)
 
 	ret = rte_ring_enqueue(s_port_flow_r[rx_port], rx_flow);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s release FD[%d]'s RX flow failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s release FD[%d]'s RX flow failed(%d)\n",
 			__func__, sockfd, ret);
 	}
 
@@ -1168,14 +1206,13 @@ usr_socket_force_release(void)
 		if (libc_close) {
 			ret = (*libc_close)(fd);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"%s Close sockfd(%d) failed(%d)\n",
 					__func__, fd, ret);
 			}
 		}
 		ret = usr_socket_fd_release(fd);
-		RTE_LOG(INFO, pre_ld, "Release all: FD(%d), ret=%d\n",
-			fd, ret);
+		PRE_LD_LOG(INFO, "Release all: FD(%d), ret=%d\n", fd, ret);
 	}
 }
 
@@ -1210,8 +1247,7 @@ static void eal_quit(void)
 			ret = pre_ld_update_dir_list_safe(entry,
 				REMOVE_ENTRY_REQ);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
-					"%s: Remove entry failed(%d)",
+				PRE_LD_LOG(ERR, "%s: Remove entry failed(%d)",
 					__func__, ret);
 				if (ret == (-EBUSY) &&
 					entry->poll_type == RX_QUEUE &&
@@ -1221,7 +1257,7 @@ static void eal_quit(void)
 					ret = pre_ld_flow_destroy(src->port_id,
 						entry->poll.rx_flow->flow);
 					if (ret) {
-						RTE_LOG(ERR, pre_ld,
+						PRE_LD_LOG(ERR,
 							"%s: remove flow failed(%d)\n",
 							__func__, ret);
 					}
@@ -1235,12 +1271,11 @@ static void eal_quit(void)
 
 	eal_destroy_dpaa2_mux_flow();
 	RTE_ETH_FOREACH_DEV(portid) {
-		RTE_LOG(INFO, pre_ld, "Closing port %d...", portid);
+		PRE_LD_LOG(INFO, "Closing port %d...", portid);
 		ret = rte_eth_dev_stop(portid);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"rte_eth_dev_stop: err=%d, port=%d\n",
-				ret, portid);
+			PRE_LD_LOG(ERR, "Stop port%d failed(%d)\n",
+				portid, ret);
 		}
 		rte_eth_dev_close(portid);
 		rte_ring_free(s_port_flow_r[portid]);
@@ -1257,7 +1292,7 @@ static void eal_quit(void)
 
 	/* clean up the EAL */
 	rte_eal_cleanup();
-	RTE_LOG(INFO, pre_ld, "Bye...\n");
+	PRE_LD_LOG(INFO, "Bye...\n");
 }
 
 static int
@@ -1285,8 +1320,7 @@ eal_data_path_thread_register(struct fd_desc *desc)
 register_again:
 	ret = rte_thread_register();
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Register thread(%ld) of FD(%d) Failed(%d)\n",
+		PRE_LD_LOG(ERR, "Register thread(%ld) of FD(%d) Failed(%d)\n",
 			pthread_self(), desc->fd, ret);
 		return ret;
 	}
@@ -1294,7 +1328,7 @@ register_again:
 	lcore = rte_lcore_id();
 	if (lcore == SYS_CORE_ID ||
 		lcore == s_data_path_core) {
-		RTE_LOG(WARNING, pre_ld,
+		PRE_LD_LOG(WARNING,
 			"Skip core%d = sys core(%d) or data core(%d)\n",
 			lcore, SYS_CORE_ID, s_data_path_core);
 		goto register_again;
@@ -1304,14 +1338,13 @@ register_again:
 	ret = pthread_setaffinity_np(pthread_self(),
 		sizeof(cpu_set_t), &cpuset);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Set affinity(TD(%ld) FD(%d)) Failed(%d)\n",
+		PRE_LD_LOG(ERR, "Set affinity(TD(%ld) FD(%d)) Failed(%d)\n",
 			pthread_self(), desc->fd, ret);
 		return ret;
 	}
 	new_cpu = sched_getcpu();
 	if (new_cpu != (int)rte_lcore_id()) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"Register thread(%ld) of FD(%d) cpu(%d) != RTE cpu(%d)\n",
 			pthread_self(), desc->fd, new_cpu, rte_lcore_id());
 
@@ -1320,8 +1353,7 @@ register_again:
 
 	pthread_mutex_lock(&s_fd_mutex);
 	if (desc->eal_thread_nb >= RTE_MAX_LCORE) {
-		RTE_LOG(ERR, pre_ld,
-			"Too many threads allocated for FD(%d)\n",
+		PRE_LD_LOG(ERR, "Too many threads allocated for FD(%d)\n",
 			desc->fd);
 		pthread_mutex_unlock(&s_fd_mutex);
 
@@ -1332,7 +1364,7 @@ register_again:
 	th_desc->thread = pthread_self();
 	th_desc->lcore = &RTE_PER_LCORE(_lcore_id);
 	desc->eal_thread_nb++;
-	RTE_LOG(INFO, pre_ld,
+	PRE_LD_LOG(INFO,
 		"Register %d thread(s)(%ld) of FD(%d) from cpu(%d) to cpu(%d)\n",
 		desc->eal_thread_nb, pthread_self(),
 		desc->fd, cpu, new_cpu);
@@ -1358,7 +1390,7 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 
 	if (unlikely(l4_offset != offsetof(struct eth_ipv4_udp_hdr,
 		udp_hdr))) {
-		RTE_LOG(WARNING, pre_ld,
+		PRE_LD_LOG(WARNING,
 			"FD(%d): UDP offset = %d, IPV6 or tunnel frame?\n",
 			sockfd, l4_offset);
 		rte_pktmbuf_dump(stdout, mbuf, 60);
@@ -1372,7 +1404,7 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 	udp_hdr = rte_pktmbuf_mtod_offset(mbuf, void *, l4_offset);
 	if (unlikely(udp_hdr->src_port != flow_hdr->dst_port ||
 		udp_hdr->dst_port != flow_hdr->src_port)) {
-		RTE_LOG(WARNING, pre_ld,
+		PRE_LD_LOG(WARNING,
 			"FD(%d): UDP(%p) RX ERR(src %04x!=%04x, dst %04x!=%04x)\n",
 			sockfd, udp_hdr, udp_hdr->src_port, flow_hdr->dst_port,
 			udp_hdr->dst_port, flow_hdr->src_port);
@@ -1432,8 +1464,7 @@ usr_data_path_free_mbuf(struct fd_desc *desc,
 					(void **)&mbufs[freed], count - freed);
 			}
 		} else {
-			RTE_LOG(ERR, pre_ld,
-				"%s: Invalid poll type(%d)\n",
+			PRE_LD_LOG(ERR, "%s: Invalid poll type(%d)\n",
 				__func__, free_entry->poll_type);
 		}
 	} else {
@@ -1607,8 +1638,7 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 	while (i != nb_rx) {
 		if (unlikely(((rx_pool->tail + 1) &
 			(rx_pool->max_num - 1)) == rx_pool->head)) {
-			RTE_LOG(ERR, pre_ld,
-				"RX pool is too small?\n");
+			PRE_LD_LOG(ERR, "RX pool is too small?\n");
 			usr_data_path_free_mbuf(desc, &pkts_burst[i],
 				nb_rx - i);
 			break;
@@ -1784,13 +1814,13 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	sprintf(sec_info, "Sec%d/queue%d", sec_id, *sec_qid);
 	ret = pre_ld_update_dir_list_safe(entry_to_sec, REMOVE_ENTRY_REQ);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld, "%s: remove SEC eq entry failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s: remove SEC eq entry failed(%d)\n",
 			__func__, ret);
 		if (ret == (-EBUSY) && entry_to_sec->poll.rx_flow->flow) {
 			ret = pre_ld_flow_destroy(rx_port,
 				entry_to_sec->poll.rx_flow->flow);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"%s line %d: remove flow -> SEC failed(%d)\n",
 					__func__, __LINE__, ret);
 			}
@@ -1799,14 +1829,13 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	ret = rte_ring_enqueue(s_port_flow_r[rx_port],
 		entry_to_sec->poll.rx_flow);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Free RX flow to %s failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s: Free RX flow to %s failed(%d)\n",
 			__func__, s_port_flow_r[rx_port]->name, ret);
 	}
 	sprintf(dst_info, "Port%d", entry_from_sec->dest.dest_port);
 	ret = pre_ld_update_dir_list_safe(entry_from_sec, REMOVE_ENTRY_REQ);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld, "%s: remove SEC dq entry failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s: remove SEC dq entry failed(%d)\n",
 			__func__, ret);
 	}
 
@@ -1816,8 +1845,7 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 		entry_from_sec->poll.poll_sec.queue_id);
 	ret = rte_ring_enqueue(s_crypt_queue_ring[sec_id], sec_qid);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Free queue(%d) to %s failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s: Free queue(%d) to %s failed(%d)\n",
 			__func__, *sec_qid,
 			s_crypt_queue_ring[sec_id]->name, ret);
 	}
@@ -1825,7 +1853,7 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	rte_free(entry_to_sec);
 	rte_free(entry_from_sec);
 
-	RTE_LOG(INFO, pre_ld, "Remove %s -> %s -> %s\n",
+	PRE_LD_LOG(INFO, "Remove %s -> %s -> %s\n",
 		src_info, sec_info, dst_info);
 }
 
@@ -1874,16 +1902,13 @@ pre_ld_l3_l4_traffic_dump(struct rte_mbuf *mbuf,
 
 print_mbuf:
 	if (s_l3_traffic_dump && !s_l4_traffic_dump) {
-		RTE_LOG(INFO, pre_ld,
-			"%s with l3 is 0x%04x\n",
+		PRE_LD_LOG(INFO, "%s with l3 is 0x%04x\n",
 			prefix, s_l3_traffic_dump);
 	} else if (!s_l3_traffic_dump && s_l4_traffic_dump) {
-		RTE_LOG(INFO, pre_ld,
-			"%s with l4 is 0x%02x\n",
+		PRE_LD_LOG(INFO, "%s with l4 is 0x%02x\n",
 			prefix, s_l4_traffic_dump);
 	} else if (s_l3_traffic_dump && s_l4_traffic_dump) {
-		RTE_LOG(INFO, pre_ld,
-			"%s with l3 is 0x%04x and l4 is 0x%02x\n",
+		PRE_LD_LOG(INFO, "%s with l3 is 0x%04x and l4 is 0x%02x\n",
 			prefix, s_l3_traffic_dump, s_l4_traffic_dump);
 	}
 	rte_pktmbuf_dump(stdout, mbuf, 60);
@@ -1900,10 +1925,10 @@ pre_ld_entry_traffic_dump(const char *prefix,
 			pre_ld_l3_l4_traffic_dump(mbufs[i], prefix);
 	}
 	if (unlikely(s_dump_traffic_flow && nb_rx > 0)) {
-		RTE_LOG(INFO, pre_ld, "%s\n", prefix);
+		PRE_LD_LOG(INFO, "%s\n", prefix);
 		for (i = 0; i < nb_rx; i++)
 			rte_pktmbuf_dump(stdout, mbufs[i], 60);
-		RTE_LOG(INFO, pre_ld, "%s done(%d mbuf(s))\n",
+		PRE_LD_LOG(INFO, "%s done(%d mbuf(s))\n",
 			prefix, nb_rx);
 	}
 }
@@ -1928,8 +1953,7 @@ pre_ld_entry_rx_flow_verify(struct rte_mbuf *mbuf,
 		return 0;
 
 	if (unlikely(ret) || offset == 0xff) {
-		RTE_LOG(WARNING, pre_ld,
-			"%s parse %s %s failed\n",
+		PRE_LD_LOG(WARNING, "%s parse %s %s failed\n",
 			rx_flow->cmp_offset_type == PRE_LD_CMP_L3_OFFSET ?
 			"L3" :
 			rx_flow->cmp_offset_type == PRE_LD_CMP_L4_OFFSET ?
@@ -1951,8 +1975,7 @@ pre_ld_entry_rx_flow_verify(struct rte_mbuf *mbuf,
 		sprintf(&cmp1[off], "%02x ", rx_flow->cmp_data[i]);
 		off += sprintf(&cmp2[off], "%02x ", data[i]);
 	}
-	RTE_LOG(ERR, pre_ld,
-		"%s %s: data received %s don't match: %s\n",
+	PRE_LD_LOG(ERR, "%s %s: data received %s don't match: %s\n",
 		entry->poll_prefix, entry->action_prefix, cmp2, cmp1);
 	rte_pktmbuf_dump(stdout, mbuf, 60);
 	if (s_data_verify_err_panic) {
@@ -2069,7 +2092,7 @@ pre_ld_adjust_ipv4(struct rte_mbuf *pkt,
 		pkt->pkt_len += sizeof(struct rte_ether_hdr);
 		pkt->data_len += sizeof(struct rte_ether_hdr);
 	} else {
-		RTE_LOG(ERR, pre_ld, "Invalid IPSec dir(%d)\n", dir);
+		PRE_LD_LOG(ERR, "Invalid IPSec dir(%d)\n", dir);
 	}
 }
 
@@ -2101,13 +2124,12 @@ pre_ld_ipsec_sa_enqueue(struct rte_mbuf *pkts[],
 	struct rte_mbuf *mbufs[nb_pkts];
 
 	if (ips->type != RTE_SECURITY_ACTION_TYPE_LOOKASIDE_PROTOCOL) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"Type(%d) not support, Lookaside support only!\n",
 			ips->type);
 		return 0;
 	} else if (!ips->security.ses) {
-		RTE_LOG(ERR, pre_ld,
-			"Session has not been created!\n");
+		PRE_LD_LOG(ERR, "Session has not been created!\n");
 		return 0;
 	}
 
@@ -2341,8 +2363,7 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	ret = rte_ring_dequeue(s_port_flow_r[rx_port],
 		(void **)&rx_flow);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"No RX flow available from ring(%s)\n",
+		PRE_LD_LOG(ERR, "No RX flow available from ring(%s)\n",
 			s_port_flow_r[rx_port]->name);
 		goto failure_return;
 	}
@@ -2398,8 +2419,7 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 		idx++;
 	}
 	if (!idx) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Invalid IP family(%d) or direction(%d)\n",
+		PRE_LD_LOG(ERR, "%s: Invalid IP family(%d) or direction(%d)\n",
 			__func__, sp->family, sp->dir);
 		ret = -EINVAL;
 		goto failure_return;
@@ -2427,8 +2447,7 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	ret = rte_ring_dequeue(s_crypt_queue_ring[sp->crypt_id],
 		(void **)&crypt_qid);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"No crypt queue available from ring(%s)\n",
+		PRE_LD_LOG(ERR, "No crypt queue available from ring(%s)\n",
 			s_crypt_queue_ring[sp->crypt_id]->name);
 
 		goto failure_return;
@@ -2489,8 +2508,8 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 
 	ret = pre_ld_update_dir_list_safe(dir_from_sec, INSERT_ENTRY_REQ);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Insert SEC dq entry failed(%d)\n", __func__, ret);
+		PRE_LD_LOG(ERR, "%s: Insert SEC dq entry failed(%d)\n",
+			__func__, ret);
 
 		goto failure_return;
 	}
@@ -2498,8 +2517,8 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 
 	ret = pre_ld_update_dir_list_safe(dir_to_sec, INSERT_ENTRY_REQ);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: Insert SEC eq entry failed(%d)\n", __func__, ret);
+		PRE_LD_LOG(ERR, "%s: Insert SEC eq entry failed(%d)\n",
+			__func__, ret);
 
 		goto failure_return;
 	}
@@ -2514,7 +2533,7 @@ failure_return:
 		ret = pre_ld_update_dir_list_safe(dir_to_sec,
 			REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s line %d: Recover SEC eq entry failed(%d)",
 				__func__, __LINE__, ret);
 		}
@@ -2523,7 +2542,7 @@ failure_return:
 		ret = pre_ld_update_dir_list_safe(dir_from_sec,
 			REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s line %d: Recover SEC dq entry failed(%d)",
 				__func__, __LINE__, ret);
 		}
@@ -2539,7 +2558,7 @@ failure_return:
 		ret = rte_ring_enqueue(s_crypt_queue_ring[sp->crypt_id],
 			crypt_qid);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: Recover Crypto%d's queue%d failed(%d)",
 				__func__, sp->crypt_id, *crypt_qid, ret);
 		}
@@ -2548,7 +2567,7 @@ failure_return:
 		ret = rte_ring_enqueue(s_port_flow_r[rx_port],
 			rx_flow);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: Recover port%d's rx flow failed(%d)",
 				__func__, rx_port, ret);
 		}
@@ -2593,8 +2612,7 @@ pre_ld_attach_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 		curr = curr->next;
 	}
 	if (!prev) {
-		RTE_LOG(ERR, pre_ld, "%s: No SP on SEC path\n",
-			__func__);
+		PRE_LD_LOG(ERR, "%s: No SP on SEC path\n", __func__);
 		return -EINVAL;
 	}
 	sp_node = rte_malloc(NULL, sizeof(struct pre_ld_sp_node), 0);
@@ -2641,8 +2659,7 @@ pre_ld_detach_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 		curr = curr->next;
 	}
 	if (!curr) {
-		RTE_LOG(ERR, pre_ld, "%s: No SP found on SEC path\n",
-			__func__);
+		PRE_LD_LOG(ERR, "%s: No SP found on SEC path\n", __func__);
 		return -EINVAL;
 	}
 	if (prev)
@@ -2654,8 +2671,7 @@ pre_ld_detach_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	usleep(100000);
 
 	if (!sp->entry_to_sec->dest.dest_sec.sp_list) {
-		RTE_LOG(WARNING, pre_ld,
-			"%s: SEC path should be deconfigured\n",
+		PRE_LD_LOG(WARNING, "%s: SEC path should be deconfigured\n",
 			__func__);
 	}
 	rte_free(curr);
@@ -2823,8 +2839,7 @@ pre_ld_get_tap_kernel_if_nm(const char *peer_name)
 		peer_name);
 	dir = opendir(dir_nm);
 	if (!dir) {
-		RTE_LOG(ERR, pre_ld, "Unable open directory(%s)\n",
-			dir_nm);
+		PRE_LD_LOG(ERR, "Unable open directory(%s)\n", dir_nm);
 
 		return NULL;
 	}
@@ -2925,8 +2940,7 @@ pre_ld_loop_drain_ports(struct pre_ld_lcore_direct_list *list)
 		continue;
 		ret = rte_eth_dev_set_link_down(s_dir_ports.ext_id[i]);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"DOWN ext port%d failed(%d)\n",
+			PRE_LD_LOG(ERR, "DOWN ext port%d failed(%d)\n",
 				s_dir_ports.ext_id[i], ret);
 		}
 	}
@@ -2945,7 +2959,7 @@ clean_tx_again:
 			}
 			drain_times++;
 			if (drain_times > retry) {
-				RTE_LOG(INFO, pre_ld,
+				PRE_LD_LOG(INFO,
 					"Clean %d buffer(s) from port%d's TX conf\n",
 					total, id);
 				continue;
@@ -2960,8 +2974,8 @@ clean_tx_again:
 			id = entry->poll.rx_flow->src->port_id;
 			ret = rte_eth_dev_set_link_down(id);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
-					"DOWN port%d failed(%d)\n", id, ret);
+				PRE_LD_LOG(ERR, "DOWN port%d failed(%d)\n",
+					id, ret);
 			}
 		}
 	}
@@ -2983,7 +2997,7 @@ port_rx_again:
 			drain_times++;
 			if (drain_times < retry)
 				goto port_rx_again;
-			RTE_LOG(INFO, pre_ld,
+			PRE_LD_LOG(INFO,
 				"Clean %d frame(s) from port%d's RXQ%d\n",
 				total, id, qid);
 		} else if (entry->poll_type == SEC_IN_COMPLETE ||
@@ -3003,7 +3017,7 @@ sec_dq_again:
 			drain_times++;
 			if (drain_times < retry)
 				goto sec_dq_again;
-			RTE_LOG(INFO, pre_ld,
+			PRE_LD_LOG(INFO,
 				"Clean %d frame(s) from SEC%d's %s queue%d\n",
 				total, id, entry->poll_type == SEC_IN_COMPLETE ?
 				"Ingress" : "Egress", qid);
@@ -3026,8 +3040,8 @@ pre_ld_loop_up_ports(struct pre_ld_lcore_direct_list *list)
 			id = entry->poll.rx_flow->src->port_id;
 			ret = rte_eth_dev_set_link_up(id);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
-					"UP port%d failed(%d)\n", id, ret);
+				PRE_LD_LOG(ERR, "UP port%d failed(%d)\n",
+					id, ret);
 			}
 		}
 	}
@@ -3037,8 +3051,7 @@ pre_ld_loop_up_ports(struct pre_ld_lcore_direct_list *list)
 		continue;
 		ret = rte_eth_dev_set_link_up(s_dir_ports.ext_id[i]);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"UP ext port%d failed(%d)\n",
+			PRE_LD_LOG(ERR, "UP ext port%d failed(%d)\n",
 				s_dir_ports.ext_id[i], ret);
 		}
 	}
@@ -3090,14 +3103,13 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	ret = rte_flow_validate(rx_flow->src->port_id, &flow_attr,
 		flow_item, flow_action, NULL);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld, "%s: flow validate failed(%d)",
-			__func__, ret);
+		PRE_LD_LOG(ERR, "%s: flow validate failed(%d)", __func__, ret);
 		return ret;
 	}
 	rx_flow->flow = rte_flow_create(rx_flow->src->port_id, &flow_attr,
 		flow_item, flow_action, NULL);
 	if (!rx_flow->flow) {
-		RTE_LOG(ERR, pre_ld, "%s: flow create failed", __func__);
+		PRE_LD_LOG(ERR, "%s: flow create failed", __func__);
 
 		return -EIO;
 	}
@@ -3121,11 +3133,9 @@ pre_ld_main_loop(void *dummy)
 
 	pthread_mutex_lock(&s_dp_init_mutex);
 	if (s_data_path_core >= 0) {
-		RTE_LOG(ERR, pre_ld,
-			"Single data path core(%d) support only\n",
+		PRE_LD_LOG(ERR, "Single data path core(%d) support only\n",
 			s_data_path_core);
-		RTE_LOG(ERR, pre_ld,
-			"Quit from core(%d)\n", rte_lcore_id());
+		PRE_LD_LOG(ERR, "Quit from core(%d)\n", rte_lcore_id());
 		pthread_mutex_unlock(&s_dp_init_mutex);
 		return -EINVAL;
 	}
@@ -3146,12 +3156,12 @@ pre_ld_main_loop(void *dummy)
 
 	pthread_mutex_unlock(&s_dp_init_mutex);
 
-	RTE_LOG(INFO, pre_ld,
+	PRE_LD_LOG(INFO,
 		"entering main loop on lcore %u\n", lcore_id);
 
 	ret = pre_ld_crypto_init(s_pre_ld_rx_pool);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld, "Crypto init failed(%d)\n", ret);
+		PRE_LD_LOG(ERR, "Crypto init failed(%d)\n", ret);
 		return ret;
 	}
 
@@ -3184,26 +3194,26 @@ for_ever_loop:
 	msg_req = msg->msg_type;
 	if (!found && msg->msg_type == REMOVE_ENTRY_REQ) {
 		msg->msg_type = UPDATE_ENTRY_FAILED_RSP;
-		RTE_LOG(INFO, pre_ld,
+		PRE_LD_LOG(INFO,
 			"Entry(%p) to be removed was NOT in list!\n",
 			msg->dir);
 		goto rsp_again;
 	} else if (found && msg->msg_type == INSERT_ENTRY_REQ) {
 		msg->msg_type = UPDATE_ENTRY_FAILED_RSP;
-		RTE_LOG(INFO, pre_ld,
+		PRE_LD_LOG(INFO,
 			"Entry(%p) to be inserted has been in list!\n",
 			msg->dir);
 		goto rsp_again;
 	} else if (msg->msg_type != INSERT_ENTRY_REQ &&
 		msg->msg_type != REMOVE_ENTRY_REQ) {
-		RTE_LOG(INFO, pre_ld,
+		PRE_LD_LOG(INFO,
 			"Invalid entry message type(%d)\n",
 			msg->msg_type);
 		msg->msg_type = UPDATE_ENTRY_FAILED_RSP;
 		goto rsp_again;
 	}
 
-	RTE_LOG(INFO, pre_ld, "%s entry(%p) %s %s\n",
+	PRE_LD_LOG(INFO, "%s entry(%p) %s %s\n",
 		msg->msg_type == INSERT_ENTRY_REQ ?
 		"Insert" : "Remove", msg->dir, msg->dir->poll_prefix,
 		msg->dir->action_prefix);
@@ -3235,13 +3245,12 @@ rsp_again:
 	if (ret)
 		goto rsp_again;
 	if (msg_req == INSERT_ENTRY_REQ || msg_req == REMOVE_ENTRY_REQ) {
-		RTE_LOG(INFO, pre_ld, "%s entry(%p) %s.\n",
+		PRE_LD_LOG(INFO, "%s entry(%p) %s.\n",
 			msg_req == INSERT_ENTRY_REQ ? "Insert" : "Remove",
 			dir, msg_rsp == UPDATE_ENTRY_SUCCESS_RSP ?
 			"successfully" : "Failed");
 	} else {
-		RTE_LOG(ERR, pre_ld, "Invalid msg(%d) of entry(%p)\n",
-			msg_req, dir);
+		PRE_LD_LOG(ERR, "Invalid msg(%d) of entry(%p)\n", msg_req, dir);
 	}
 
 	goto for_ever_loop;
@@ -3292,7 +3301,7 @@ pre_ld_ls_listni_dump(void)
 	if (f) {
 		size = fread(info, sizeof(char), st.st_size, f);
 		if (size != (size_t)st.st_size) {
-			RTE_LOG(WARNING, pre_ld,
+			PRE_LD_LOG(WARNING,
 				"Read %s length(%ld) != length(%ld) of state\n",
 				rst, size, (size_t)st.st_size);
 		}
@@ -3536,7 +3545,7 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 		ret = rte_pmd_dpaa2_mux_default_id(mux_id,
 				&mux_cfg->def_id);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"Get default ID of dpdmux%d failed(%d)\n",
 				mux_id, ret);
 			continue;
@@ -3544,7 +3553,7 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 		ret = rte_pmd_dpaa2_mux_ep_name(mux_id,
 				mux_cfg->def_id, &mux_cfg->def_nm);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"Get default name of dpdmux%d failed(%d)\n",
 				mux_id, ret);
 			continue;
@@ -3664,7 +3673,7 @@ pre_ld_st_fd_info_and_update(int fd,
 			"usr: %.2fMbps,  %.2fMPPS\n",
 			usr_gbps * 1000, pre_ld_st_mpps(pkt_diff));
 	}
-	RTE_LOG(INFO, pre_ld, "%s", info);
+	PRE_LD_LOG(INFO, "%s", info);
 	rte_memcpy(fd_old_stat, fd_stat, sizeof(struct fd_statistic));
 }
 
@@ -3691,7 +3700,7 @@ statistics_loop:
 		pre_ld_st_entry_info_and_update(rx_stat_info,
 			PRE_LD_STAT_RX, &entry->rx_stat, &entry->rx_old_stat);
 
-		RTE_LOG(INFO, pre_ld,
+		PRE_LD_LOG(INFO,
 			"DIRECT ENTRY[%d] on core%d:\n%s%s %s\n%s%s\n%s%s\n\n",
 			i, s_data_path_core,
 			space, entry->poll_prefix, entry->action_prefix,
@@ -3750,8 +3759,7 @@ pre_ld_port_default_flow(uint16_t portid, uint16_t num)
 		}
 	}
 	src = s_pre_ld_rx_flows[portid][idx].src;
-	RTE_LOG(INFO, pre_ld,
-		"Port%d's default flow: TC%d.flow%d: rxq%d\n",
+	PRE_LD_LOG(INFO, "Port%d's default flow: TC%d.flow%d: rxq%d\n",
 		portid, src->tc_id, src->flow_id, src->queue_id);
 
 	return &s_pre_ld_rx_flows[portid][idx];
@@ -3793,7 +3801,7 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 		&fs_entries, &dist_size);
 	dist_size = RTE_MIN(fs_entries, dist_size);
 	if (!dist_size) {
-		RTE_LOG(ERR, pre_ld, "No distribution size of port%d\n",
+		PRE_LD_LOG(ERR, "No distribution size of port%d\n",
 			portid);
 		return -EINVAL;
 	}
@@ -3801,7 +3809,7 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 	for (i = 0; i < num; i++) {
 		ret = rte_eth_rx_queue_info_get(portid, i, &qinfo);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"Get info of port%d-rxq%d failed(%d)\n",
 				portid, i, ret);
 			return ret;
@@ -3920,7 +3928,7 @@ skip_print_kif:
 		if ((i + 1) == s_dir_ports.kif_num)
 			off += sprintf(&info[off], "\r\n");
 	}
-	RTE_LOG(INFO, pre_ld, "%s\n", info);
+	PRE_LD_LOG(INFO, "%s\n", info);
 
 skip_dir_dump:
 	if (!s_mux_num)
@@ -3943,7 +3951,7 @@ skip_dir_dump:
 		if ((i + 1) == s_mux_num)
 			off += sprintf(&info[off], "\r\n");
 	}
-	RTE_LOG(INFO, pre_ld, "%s\n", info);
+	PRE_LD_LOG(INFO, "%s\n", info);
 
 skip_mux_dump:
 	if (!s_proc_num) {
@@ -3968,7 +3976,7 @@ skip_mux_dump:
 		if ((i + 1) == s_proc_num)
 			off += sprintf(&info[off], "\r\n");
 	}
-	RTE_LOG(INFO, pre_ld, "%s\n", info);
+	PRE_LD_LOG(INFO, "%s\n", info);
 	rte_free(info);
 }
 
@@ -4019,12 +4027,13 @@ static int eal_main(void)
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
 
+	s_rte_eal_init_complete = true;
+
 	s_main_td = pthread_self();
 
 	rte_spinlock_init(&s_fd_list_lock);
 
-	RTE_LOG(INFO, pre_ld,
-		"Main core%d, current core%d, CPU mask is 0x%08x\n",
+	PRE_LD_LOG(INFO, "Main core%d, current core%d, CPU mask is 0x%08x\n",
 		rte_get_main_lcore(), sched_getcpu(),
 		cpu_mask);
 
@@ -4032,7 +4041,7 @@ static int eal_main(void)
 	if (!nb_ports)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
 
-	RTE_LOG(INFO, pre_ld, "%d Ethernet ports found.\n", nb_ports);
+	PRE_LD_LOG(INFO, "%d Ethernet ports found.\n", nb_ports);
 
 	/* create the mbuf pool */
 	s_pre_ld_rx_pool = rte_pktmbuf_pool_create("rx_pool",
@@ -4062,20 +4071,22 @@ static int eal_main(void)
 
 	ret = pre_ld_ls_listni_dump();
 	if (ret) {
-		RTE_LOG(ERR, pre_ld, "ls-listni dump failed(%d)\n", ret);
+		PRE_LD_LOG(ERR, "ls-listni dump failed(%d)\n", ret);
 	} else {
-		RTE_LOG(INFO, pre_ld, "ls-listni dump created:\n%s\n",
+		PRE_LD_LOG(INFO, "ls-listni dump created:\n%s\n",
 			s_safe_ls_listni_info);
 	}
 	pre_ld_set_port_type(port_type, RTE_MAX_ETHPORTS);
 
 	pre_ld_ls_listni_clean();
+	PRE_LD_LOG(INFO, "ls-listni dump clean\n");
+
 	RTE_ETH_FOREACH_DEV(portid) {
 		nb_ports_available++;
 		rxq_num[portid] = 0;
 
 		/* init port */
-		RTE_LOG(INFO, pre_ld, "Configuring port%u, type:%d(%s)... ",
+		PRE_LD_LOG(INFO, "Configuring port%u, type:%d(%s)... ",
 			portid, port_type[portid],
 			port_type[portid] == EXTERNAL_TYPE ?
 			"external" :
@@ -4156,8 +4167,7 @@ static int eal_main(void)
 		uint16_t rxd;
 
 		/* init port */
-		RTE_LOG(INFO, pre_ld,
-			"Initializing port %u... ", portid);
+		PRE_LD_LOG(INFO, "Initializing port %u... ", portid);
 		if (rte_pmd_dpaa2_dev_is_dpaa2(portid))
 			rxd = s_dpaa2_nb_rxd;
 		else
@@ -4206,7 +4216,7 @@ static int eal_main(void)
 			fc_conf.mode = RTE_ETH_FC_NONE;
 		ret = rte_eth_dev_flow_ctrl_set(portid, &fc_conf);
 		if (ret) {
-			RTE_LOG(WARNING, pre_ld,
+			PRE_LD_LOG(WARNING,
 				"Flow control set not support on port%d\n",
 				portid);
 		}
@@ -4214,7 +4224,7 @@ static int eal_main(void)
 		if (s_mtu_set) {
 			ret = rte_eth_dev_set_mtu(portid, s_mtu_set);
 			if (ret) {
-				RTE_LOG(WARNING, pre_ld,
+				PRE_LD_LOG(WARNING,
 					"Set MTU(%d) on port%d failed(%d)\n",
 					s_mtu_set, portid, ret);
 			}
@@ -4337,8 +4347,7 @@ eal_create_dpaa2_mux_flow(int dpdmux_id,
 	ret = rte_pmd_dpaa2_mux_flow_create(dpdmux_id,
 			pattern, actions);
 	if (ret < 0) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: MUX flow create failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s: MUX flow create failed(%d)\n",
 			__func__, ret);
 	}
 
@@ -4391,8 +4400,7 @@ eal_create_local_flow(int sockfd)
 	rx_flow->flow = rte_flow_create(rx_flow->src->port_id, &attr,
 		pattern, flow_action, NULL);
 	if (!rx_flow->flow) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: flow create failed\n", __func__);
+		PRE_LD_LOG(ERR, "%s: flow create failed\n", __func__);
 		return -EIO;
 	}
 
@@ -4437,8 +4445,7 @@ eal_create_flow(int sockfd)
 		prot_name = "ecpri";
 	} else {
 		prot_name = "unsupported protocol";
-		RTE_LOG(ERR, pre_ld,
-			"Unsupported protocol type(%d)\n",
+		PRE_LD_LOG(ERR, "Unsupported protocol type(%d)\n",
 			rx_flow->type[0]);
 	}
 
@@ -4469,8 +4476,7 @@ eal_create_flow(int sockfd)
 	ret = eal_create_dpaa2_mux_flow(mux_cfg->mux_id,
 			mux_cfg->ep_id[0], pattern);
 	if (ret < 0) {
-		RTE_LOG(ERR, pre_ld,
-			"MUX%d(id=%d).EP%d's flow create failed(%d)\n",
+		PRE_LD_LOG(ERR, "MUX%d(id=%d).EP%d's flow create failed(%d)\n",
 			s_mux_index, mux_cfg->mux_id, 0, ret);
 	}
 	mux_cfg->entry_id[0] = ret;
@@ -4511,15 +4517,13 @@ skip_mux_flow:
 	proc_cfg->dir_configured[0] = true;
 	ret = rte_remote_direct_parse_config(config_str, 1);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Remote direct parse: %s failed(%d)\n",
+		PRE_LD_LOG(ERR, "Remote direct parse: %s failed(%d)\n",
 			config_str, ret);
 		goto skip_proc_flow;
 	}
 	ret = rte_remote_direct_traffic(RTE_REMOTE_DIR_REQ, NULL);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
-			"Remote direct request failed(%d)\n", ret);
+		PRE_LD_LOG(ERR, "Remote direct request failed(%d)\n", ret);
 	}
 
 skip_proc_flow:
@@ -4528,7 +4532,7 @@ skip_proc_flow:
 		PRE_LD_CMP_L4_OFFSET, l3_offset, rule_size, rule);
 	ret = eal_create_local_flow(sockfd);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"Port%d/tc%d/flow%d->rxq%d flow create failed(%d)\n",
 			rx_flow->src->port_id, rx_flow->src->tc_id,
 			rx_flow->src->flow_id, rx_flow->src->queue_id, ret);
@@ -4740,15 +4744,13 @@ usr_socket_fd_desc_init(int sockfd,
 
 	pthread_mutex_lock(&s_fd_mutex);
 	if (sockfd < 0) {
-		RTE_LOG(ERR, pre_ld,
-			"create socket failed(%d)\n", sockfd);
+		PRE_LD_LOG(ERR, "create socket failed(%d)\n", sockfd);
 
 		ret = -EINVAL;
 		goto fd_init_quit;
 	}
 	if (sockfd >= MAX_USR_FD_NUM) {
-		RTE_LOG(ERR, pre_ld,
-			"Too many FDs(%d) >= %d\n",
+		PRE_LD_LOG(ERR, "Too many FDs(%d) >= %d\n",
 			sockfd, MAX_USR_FD_NUM);
 
 		ret = -EBADF;
@@ -4756,8 +4758,7 @@ usr_socket_fd_desc_init(int sockfd,
 	}
 	desc = &s_fd_desc[sockfd];
 	if (desc->fd >= 0) {
-		RTE_LOG(ERR, pre_ld,
-			"Duplicated FD[%d](%d)?\n",
+		PRE_LD_LOG(ERR, "Duplicated FD[%d](%d)?\n",
 			sockfd, desc->fd);
 
 		ret = -EEXIST;
@@ -4773,8 +4774,7 @@ usr_socket_fd_desc_init(int sockfd,
 	desc->rx_buffer.rx_bufs = rte_malloc(NULL,
 		sizeof(void *) * MAX_PKT_BURST * 2, RTE_CACHE_LINE_SIZE);
 	if (!desc->rx_buffer.rx_bufs) {
-		RTE_LOG(ERR, pre_ld,
-			"port%d: RX pool init failed for socket(%d)\n",
+		PRE_LD_LOG(ERR, "port%d: RX pool init failed for socket(%d)\n",
 			rx_port, sockfd);
 
 		goto fd_init_quit;
@@ -4784,7 +4784,7 @@ usr_socket_fd_desc_init(int sockfd,
 	ret = rte_ring_dequeue(s_port_flow_r[rx_port],
 			(void **)&rx_flow);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"port%d: RX flow allocated for socket(%d) failed(%d)\n",
 			tx_port, sockfd, ret);
 
@@ -4843,7 +4843,7 @@ usr_socket_fd_desc_init(int sockfd,
 		ret = pre_ld_update_dir_list_safe(tx_entry,
 			INSERT_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(INFO, pre_ld,
+			PRE_LD_LOG(INFO,
 				"Insert FD[%d]'s tx entry failed(%d)\n",
 				sockfd, ret);
 			goto fd_init_quit;
@@ -4935,7 +4935,7 @@ usr_socket_fd_desc_init(int sockfd,
 		ret = pre_ld_update_dir_list_safe(free_entry,
 			INSERT_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(INFO, pre_ld,
+			PRE_LD_LOG(INFO,
 				"Insert FD[%d]'s free buffer entry failed(%d)\n",
 				sockfd, ret);
 			goto fd_init_quit;
@@ -4976,7 +4976,7 @@ usr_socket_fd_desc_init(int sockfd,
 				rte_socket_id(), RTE_MBUF_DEFAULT_MEMPOOL_OPS);
 		if (!tx_pool) {
 			ret = -ENOMEM;
-			RTE_LOG(ERR, pre_ld, "Create %s failed\n", nm);
+			PRE_LD_LOG(ERR, "Create %s failed\n", nm);
 			goto fd_init_quit;
 		}
 		rte_mempool_obj_iter(tx_pool, pre_ld_pktmbuf_init, NULL);
@@ -4988,7 +4988,7 @@ usr_socket_fd_desc_init(int sockfd,
 		desc->tx_pool = NULL;
 		if (desc->access_type != FD_THREAD_ACCESS) {
 			ret = -EINVAL;
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"FD[%d] needs data path thread to malloc TX buffer\n",
 				sockfd);
 			goto fd_init_quit;
@@ -5040,7 +5040,7 @@ usr_socket_fd_desc_init(int sockfd,
 		ret = pre_ld_update_dir_list_safe(malloc_entry,
 			INSERT_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(INFO, pre_ld,
+			PRE_LD_LOG(INFO,
 				"Insert FD[%d]'s malloc buffer entry failed(%d)\n",
 				sockfd, ret);
 			goto fd_init_quit;
@@ -5076,7 +5076,7 @@ fd_init_quit:
 		rm = desc->dp_desc.entry_desc.tx_entry;
 		ret = pre_ld_update_dir_list_safe(rm, REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: remove FD[%d]'s tx entry failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -5085,7 +5085,7 @@ fd_init_quit:
 		rm = desc->dp_desc.entry_desc.free_entry;
 		ret = pre_ld_update_dir_list_safe(rm, REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: remove FD[%d]'s free entry failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -5094,7 +5094,7 @@ fd_init_quit:
 		rm = desc->dp_desc.entry_desc.malloc_entry;
 		ret = pre_ld_update_dir_list_safe(rm, REMOVE_ENTRY_REQ);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: remove FD[%d]'s malloc entry failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -5167,7 +5167,7 @@ dump_usr_fd(const char *s)
 	if (!count)
 		return;
 
-	RTE_LOG(INFO, pre_ld, "%s: total %d usr FD(s)(MAX=%d): %s\n",
+	PRE_LD_LOG(INFO, "%s: total %d usr FD(s)(MAX=%d): %s\n",
 		s, count, max_fd, dump_str);
 }
 
@@ -5176,8 +5176,7 @@ static int eal_init(int domain, int type)
 	uint8_t socket_type = type & SOCK_TYPE_MASK;
 	int ret = 0;
 
-	RTE_LOG(INFO, pre_ld,
-		"%s: domain = %d, type = %d, inited(%d)\n",
+	PRE_LD_LOG(INFO, "%s: domain = %d, type = %d, inited(%d)\n",
 		__func__, domain, socket_type, s_eal_inited);
 
 	if (domain != AF_INET &&
@@ -5203,8 +5202,7 @@ static int eal_init(int domain, int type)
 		if (!ret) {
 			s_eal_inited = 1;
 		} else {
-			RTE_LOG(ERR, pre_ld,
-				"eal init failed(%d)\n", ret);
+			PRE_LD_LOG(ERR, "eal init failed(%d)\n", ret);
 			pthread_mutex_unlock(&s_eal_init_mutex);
 			exit(EXIT_FAILURE);
 		}
@@ -5220,10 +5218,10 @@ socket(int domain, int type, int protocol)
 	int sockfd = INVALID_SOCKFD, ret;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
+		PRE_LD_LOG(INFO,
 			"%s starts: domain:0x%x, type:0x%x, proto:0x%04x\n",
 			__func__, domain, type, ntohs(protocol));
-		RTE_LOG(INFO, pre_ld,
+		PRE_LD_LOG(INFO,
 			"%s starts: wrappers:%d, libc_socket:%p\n",
 			__func__, s_socket_pre_set,
 			libc_socket);
@@ -5237,7 +5235,7 @@ socket(int domain, int type, int protocol)
 		}
 		sockfd = (*libc_socket)(domain, type, protocol);
 		if (sockfd < 0) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"Socket FD created failed(%d)\n", sockfd);
 
 			return sockfd;
@@ -5252,12 +5250,12 @@ socket(int domain, int type, int protocol)
 			ret = usr_socket_fd_desc_init(sockfd,
 					s_rx_port, s_tx_port);
 			if (ret < 0) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"Init FD desc failed(%d)\n", ret);
 				exit(EXIT_FAILURE);
 			}
 			usr_socket_fd_add(sockfd);
-			RTE_LOG(INFO, pre_ld,
+			PRE_LD_LOG(INFO,
 				"pre set user Socket FD(%d) created.\n",
 				sockfd);
 		}
@@ -5265,8 +5263,7 @@ socket(int domain, int type, int protocol)
 		LIBC_FUNCTION(socket);
 
 		if (!libc_socket) {
-			RTE_LOG(ERR, pre_ld,
-				"%s: not exist in libc.\n", __func__);
+			PRE_LD_LOG(ERR, "%s: not exist in libc.\n", __func__);
 			errno = EACCES;
 
 			return INVALID_SOCKFD;
@@ -5274,7 +5271,7 @@ socket(int domain, int type, int protocol)
 
 		sockfd = (*libc_socket)(domain, type, protocol);
 		if (sockfd < 0) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"Socket FD created failed(%d)\n", sockfd);
 
 			return sockfd;
@@ -5289,17 +5286,17 @@ socket(int domain, int type, int protocol)
 			ret = usr_socket_fd_desc_init(sockfd,
 					s_rx_port, s_tx_port);
 			if (ret < 0) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"Init FD desc failed(%d)\n", ret);
 				exit(EXIT_FAILURE);
 			}
 			usr_socket_fd_add(sockfd);
-			RTE_LOG(INFO, pre_ld,
+			PRE_LD_LOG(INFO,
 				"user Socket FD(%d) created.\n", sockfd);
 		}
 	}
 
-	RTE_LOG(INFO, pre_ld,
+	PRE_LD_LOG(INFO,
 		"Socket FD(%d) created, domain=%d, type=%d, protocol=%d\n",
 		sockfd, domain, type, protocol);
 
@@ -5312,11 +5309,9 @@ shutdown(int sockfd, int how)
 	int shutdown_value = 0, ret;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_shutdown:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_shutdown:%p\n",
 			__func__, sockfd, libc_shutdown);
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: wrappers:%d, libc_socket:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: wrappers:%d, libc_socket:%p\n",
 			__func__, s_socket_pre_set,
 			libc_socket);
 		dump_usr_fd(__func__);
@@ -5328,8 +5323,7 @@ shutdown(int sockfd, int how)
 			shutdown_value = (*libc_shutdown)(sockfd, how);
 		ret = usr_socket_fd_release(sockfd);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s Failed(%d) release fd:%d\n",
+			PRE_LD_LOG(ERR, "%s Failed(%d) release fd:%d\n",
 				__func__, ret, sockfd);
 		}
 	} else if (libc_shutdown) {
@@ -5354,8 +5348,7 @@ close(int sockfd)
 	int close_value = 0, ret;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_close:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_close:%p\n",
 			__func__, sockfd, libc_close);
 		dump_usr_fd(__func__);
 	}
@@ -5366,8 +5359,7 @@ close(int sockfd)
 			close_value = (*libc_close)(sockfd);
 		ret = usr_socket_fd_release(sockfd);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s release sockfd(%d) failed\n",
+			PRE_LD_LOG(ERR, "%s release sockfd(%d) failed\n",
 				__func__, sockfd);
 		}
 	} else if (libc_close) {
@@ -5422,7 +5414,7 @@ netwrap_get_local_ip(int sockfd)
 
 	ret = getsockname(sockfd, (struct sockaddr *)&ia, &addrlen);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: Get socket(%d) local name failed(%d)(AF_INET)\n",
 			__func__, sockfd, ret);
 	}
@@ -5433,10 +5425,8 @@ netwrap_get_local_ip(int sockfd)
 		if (ret)
 			return ret;
 
-		RTE_LOG(INFO, pre_ld,
-			"%s fd:%d, AF_INET: port=%x, IP addr=%s\n",
-			__func__, sockfd,
-			ntohs(ia.sin_port), ipl);
+		PRE_LD_LOG(INFO, "FD[%d] local AF_INET: port=%x, IP addr=%s\n",
+			sockfd, ntohs(ia.sin_port), ipl);
 		hdr->ip_hdr.src_addr = ia.sin_addr.s_addr;
 		hdr->udp_hdr.src_port = ia.sin_port;
 	} else if (ia.sin_family == AF_INET6) {
@@ -5448,7 +5438,7 @@ netwrap_get_local_ip(int sockfd)
 		ret = getsockname(sockfd, (struct sockaddr *)&local_addr,
 			&addrlen);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: Get socket(%d) local name failed(%d)(AF_INET6)\n",
 				__func__, sockfd, ret);
 
@@ -5460,11 +5450,10 @@ netwrap_get_local_ip(int sockfd)
 
 		hdr->ip_hdr.src_addr = ia6->sin6_addr.__in6_u.__u6_addr32[3];
 		hdr->udp_hdr.src_port = ia6->sin6_port;
-		RTE_LOG(INFO, pre_ld,
-			"%s fd:%d, AF_INET6: port=%x, IP addr=%s\n",
-			__func__, sockfd, ntohs(ia6->sin6_port), ipl);
+		PRE_LD_LOG(INFO, "FD[%d] local AF_INET6: port=%x, IP addr=%s\n",
+			sockfd, ntohs(ia6->sin6_port), ipl);
 	} else {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: Get socket(%d) local name: unsuppored family(%d)\n",
 			__func__, sockfd, ia.sin_family);
 
@@ -5488,16 +5477,14 @@ netwrap_get_remote_hw(int sockfd)
 	struct eth_ipv4_udp_hdr *hdr = &s_fd_desc[sockfd].hdr;
 
 	if (!s_slow_if) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: No tap port specified!\n", __func__);
+		PRE_LD_LOG(ERR, "%s: No tap port specified!\n", __func__);
 		return -EINVAL;
 	}
 
 	if ((s_fd_desc[sockfd].hdr_init &
 		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) !=
 		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: fd:%d, remote IP/UDP not initialized.\n",
+		PRE_LD_LOG(ERR, "%s: fd:%d, remote IP/UDP not initialized.\n",
 			__func__, sockfd);
 		return -EINVAL;
 	}
@@ -5520,8 +5507,7 @@ netwrap_get_remote_hw(int sockfd)
 
 	arp_s = libc_socket(AF_INET, SOCK_STREAM, 0);
 	if (arp_s < 0) {
-		RTE_LOG(INFO, pre_ld,
-			"%s: Create arp socket failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s: Create arp socket failed(%d)\n",
 			__func__, arp_s);
 
 		return arp_s;
@@ -5529,7 +5515,7 @@ netwrap_get_remote_hw(int sockfd)
 	ip4_addr = (void *)&ia.sin_addr.s_addr;
 	ret = ioctl(arp_s, SIOCGARP, &arpreq);
 	if (ret) {
-		RTE_LOG(WARNING, pre_ld,
+		PRE_LD_LOG(WARNING,
 			"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
 			__func__, ip4_addr[0], ip4_addr[1],
 			ip4_addr[2], ip4_addr[3], ret);
@@ -5543,7 +5529,7 @@ netwrap_get_remote_hw(int sockfd)
 		rte_memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
 		ret = ioctl(arp_s, SIOCGARP, &arpreq);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
 				__func__, ip4_addr[0], ip4_addr[1],
 				ip4_addr[2], ip4_addr[3], ret);
@@ -5565,9 +5551,8 @@ netwrap_get_remote_hw(int sockfd)
 				"%02x", addr_bytes[i]);
 		}
 	}
-	RTE_LOG(INFO, pre_ld,
-		"%s: socket fd:%d, Get Remote Mac: %s by %d.%d.%d.%d\n",
-		__func__, sockfd, mac_addr,
+	PRE_LD_LOG(INFO, "FD[%d], Get Remote Mac: %s by %d.%d.%d.%d\n",
+		sockfd, mac_addr,
 		ip4_addr[0], ip4_addr[1], ip4_addr[2], ip4_addr[3]);
 
 	s_fd_desc[sockfd].hdr_init |= REMOTE_ETH_INIT;
@@ -5575,8 +5560,7 @@ netwrap_get_remote_hw(int sockfd)
 close_arp_socket:
 	close_ret = (*libc_close)(arp_s);
 	if (close_ret) {
-		RTE_LOG(INFO, pre_ld,
-			"%s: close arp socket(%d) failed(%d)\n",
+		PRE_LD_LOG(ERR, "%s: close arp socket(%d) failed(%d)\n",
 			__func__, arp_s, close_ret);
 	}
 
@@ -5599,7 +5583,7 @@ netwrap_get_remote_ip(int sockfd)
 
 	ret = getpeername(sockfd, (struct sockaddr *)&ia, &addrlen);
 	if (ret < 0) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: Get socket(%d) peer name failed(%d)(AF_INET)\n",
 			__func__, sockfd, ret);
 
@@ -5613,10 +5597,9 @@ netwrap_get_remote_ip(int sockfd)
 		if (ret)
 			return ret;
 
-		RTE_LOG(INFO, pre_ld,
-			"%s fd:%d, remote AF_INET, port=%x, IP addr=%s\n",
-			__func__, sockfd,
-			ntohs(ia.sin_port), ipl);
+		PRE_LD_LOG(INFO,
+			"FD[%d] remote: AF_INET, port=%x, IP addr=%s\n",
+			sockfd, ntohs(ia.sin_port), ipl);
 
 		hdr->ip_hdr.dst_addr = ia.sin_addr.s_addr;
 		hdr->udp_hdr.dst_port = ia.sin_port;
@@ -5629,7 +5612,7 @@ netwrap_get_remote_ip(int sockfd)
 		ret = getpeername(sockfd, (struct sockaddr *)&local_addr,
 				&addrlen);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s: Get socket(%d) peer name failed(%d)(AF_INET6)\n",
 				__func__, sockfd, ret);
 
@@ -5641,11 +5624,11 @@ netwrap_get_remote_ip(int sockfd)
 
 		hdr->ip_hdr.dst_addr = ia6->sin6_addr.__in6_u.__u6_addr32[3];
 		hdr->udp_hdr.dst_port = ia6->sin6_port;
-		RTE_LOG(INFO, pre_ld,
-			"%s fd:%d, AF_INET6: port=%x, IP addr=%s\n",
-			__func__, sockfd, ntohs(ia6->sin6_port), ipl);
+		PRE_LD_LOG(INFO,
+			"FD[%d] remote: AF_INET6: port=%x, IP addr=%s\n",
+			sockfd, ntohs(ia6->sin6_port), ipl);
 	} else {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: Get socket(%d) peer name: unsuppored family(%d)\n",
 			__func__, sockfd, ia.sin_family);
 
@@ -5670,8 +5653,7 @@ netwrap_get_local_hw(int sockfd)
 		return 0;
 
 	if (!s_slow_if) {
-		RTE_LOG(ERR, pre_ld,
-			"%s: No tap port specified!\n", __func__);
+		PRE_LD_LOG(ERR, "%s: No tap port specified!\n", __func__);
 		return -EINVAL;
 	}
 
@@ -5680,8 +5662,7 @@ netwrap_get_local_hw(int sockfd)
 
 	ret = ioctl(sockfd, SIOCGIFHWADDR, &ifr);
 	if (ret < 0) {
-		RTE_LOG(ERR, pre_ld,
-			"ioctl SIOCGIFHWADDR error:%d\n", ret);
+		PRE_LD_LOG(ERR, "ioctl SIOCGIFHWADDR error:%d\n", ret);
 		return ret;
 	}
 
@@ -5699,9 +5680,7 @@ netwrap_get_local_hw(int sockfd)
 				"%02x",	addr_bytes[i]);
 		}
 	}
-	RTE_LOG(INFO, pre_ld,
-		"%s: socket fd:%d, Local Mac: %s\n",
-		__func__, sockfd, mac_addr);
+	PRE_LD_LOG(INFO, "FD[%d], Local Mac: %s\n", sockfd, mac_addr);
 
 	s_fd_desc[sockfd].hdr_init |= LOCAL_ETH_INIT;
 
@@ -5715,35 +5694,34 @@ netwrap_collect_info(int sockfd)
 
 	ret = netwrap_get_local_ip(sockfd);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: User socket(%d) Get local IP failed(%d)\n",
 			__func__, sockfd, ret);
 		return ret;
 	}
 	ret = netwrap_get_local_hw(sockfd);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: User socket(%d) Get local HW failed(%d)\n",
 			__func__, sockfd, ret);
 		return ret;
 	}
 	ret = netwrap_get_remote_ip(sockfd);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: User socket(%d) Get remote info failed(%d)\n",
 			__func__, sockfd, ret);
 		return ret;
 	}
 	ret = netwrap_get_remote_hw(sockfd);
 	if (ret) {
-		RTE_LOG(ERR, pre_ld,
+		PRE_LD_LOG(ERR,
 			"%s: User socket(%d) Get remote HW failed(%d)\n",
 			__func__, sockfd, ret);
 		return ret;
 	}
 
-	RTE_LOG(ERR, pre_ld,
-		"User socket(%d) collect info successfully.\n",
+	PRE_LD_LOG(ERR, "User socket(%d) collect info successfully.\n",
 		sockfd);
 
 	return 0;
@@ -5764,8 +5742,7 @@ socket_create_ingress_flow(int sockfd)
 	if ((s_fd_desc[sockfd].hdr_init &
 		(LOCAL_UDP_INIT | REMOTE_UDP_INIT)) !=
 		(LOCAL_UDP_INIT | REMOTE_UDP_INIT)) {
-		RTE_LOG(INFO, pre_ld,
-			"%s: Socket(%d) UDP header not initialized.\n",
+		PRE_LD_LOG(INFO, "%s: Socket(%d) UDP header not initialized.\n",
 			__func__, sockfd);
 		pthread_mutex_unlock(&s_fd_mutex);
 		return -EINVAL;
@@ -5801,8 +5778,7 @@ bind(int sockfd, const struct sockaddr *addr,
 	const struct sockaddr_in *sa = (const void *)addr;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_bind:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_bind:%p\n",
 			__func__, sockfd, libc_bind);
 		dump_usr_fd(__func__);
 	}
@@ -5820,8 +5796,7 @@ bind(int sockfd, const struct sockaddr *addr,
 		}
 	}
 
-	RTE_LOG(INFO, pre_ld,
-		"%s sockfd:%d, family(%d), port(%04x) %s.\n",
+	PRE_LD_LOG(INFO, "%s sockfd:%d, family(%d), port(%04x) %s.\n",
 		__func__, sockfd, sa->sin_family,
 		rte_be_to_cpu_16(sa->sin_port),
 		bind_value ? "failed" : "successfully");
@@ -5836,8 +5811,7 @@ accept(int sockfd, struct sockaddr *addr,
 	int accept_value = 0;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_bind:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_bind:%p\n",
 			__func__, sockfd, libc_accept);
 		dump_usr_fd(__func__);
 	}
@@ -5876,8 +5850,7 @@ connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	}
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_connect:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_connect:%p\n",
 			__func__, sockfd, libc_connect);
 		dump_usr_fd(__func__);
 	}
@@ -5888,7 +5861,7 @@ connect_usr:
 		connect_times++;
 		if (connect_times < CONNECT_MAX_TIMES && connect_value) {
 			sleep(1);
-			RTE_LOG(WARNING, pre_ld,
+			PRE_LD_LOG(WARNING,
 				"Connect user fd:%d failed, try again\n",
 				sockfd);
 			goto connect_usr;
@@ -5898,8 +5871,7 @@ connect_usr:
 
 		ret = netwrap_collect_info(sockfd);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
-				"%s fd:%d, collect info failed(%d)\n",
+			PRE_LD_LOG(ERR, "%s fd:%d, collect info failed(%d)\n",
 				__func__, sockfd, ret);
 			connect_value = ret;
 			goto connect_quit;
@@ -5912,7 +5884,7 @@ connect_sys:
 		connect_times++;
 		if (connect_times < CONNECT_MAX_TIMES && connect_value) {
 			sleep(1);
-			RTE_LOG(WARNING, pre_ld,
+			PRE_LD_LOG(WARNING,
 				"Connect sys fd:%d failed, try again\n",
 				sockfd);
 			goto connect_sys;
@@ -5939,7 +5911,7 @@ connect_quit:
 			sa->sin_family, rte_be_to_cpu_16(sa->sin_port),
 			ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
 	}
-	RTE_LOG(INFO, pre_ld, "Connect fd:%d, addrlen(%d) %s\n",
+	PRE_LD_LOG(INFO, "Connect fd:%d, addrlen(%d) %s\n",
 		sockfd, addrlen, connect_info);
 
 	return connect_value;
@@ -5952,8 +5924,7 @@ read(int sockfd, void *buf, size_t len)
 	int ret;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_read:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_read:%p\n",
 			__func__, sockfd, libc_read);
 		dump_usr_fd(__func__);
 	}
@@ -5977,14 +5948,14 @@ read(int sockfd, void *buf, size_t len)
 	if (is_usr_socket(sockfd)) {
 		ret = netwrap_collect_info(sockfd);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s Socket(%d) collect info failed(%d)\n",
 				__func__, sockfd, ret);
 		}
 
 		ret = socket_create_ingress_flow(sockfd);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s Socket(%d) create ingress flow failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -6000,8 +5971,7 @@ write(int sockfd, const void *buf, size_t len)
 	int ret;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_write:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_write:%p\n",
 			__func__, sockfd, libc_write);
 		dump_usr_fd(__func__);
 	}
@@ -6011,7 +5981,7 @@ write(int sockfd, const void *buf, size_t len)
 			HDR_INIT_ALL) != HDR_INIT_ALL)) {
 			ret = netwrap_collect_info(sockfd);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"%s sockfd(%d) collect info failed(%d)\n",
 					__func__, sockfd, ret);
 				goto send_to_kernel;
@@ -6046,8 +6016,7 @@ recv(int sockfd, void *buf, size_t len, int flags)
 	int ret;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_recv:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_recv:%p\n",
 			__func__, sockfd, libc_recv);
 		dump_usr_fd(__func__);
 	}
@@ -6071,14 +6040,14 @@ recv(int sockfd, void *buf, size_t len, int flags)
 	if (is_usr_socket(sockfd)) {
 		ret = netwrap_collect_info(sockfd);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s Socket(%d) collect info failed(%d)\n",
 				__func__, sockfd, ret);
 		}
 
 		ret = socket_create_ingress_flow(sockfd);
 		if (ret) {
-			RTE_LOG(ERR, pre_ld,
+			PRE_LD_LOG(ERR,
 				"%s Socket(%d) create ingress flow failed(%d)\n",
 				__func__, sockfd, ret);
 		}
@@ -6094,8 +6063,7 @@ send(int sockfd, const void *buf, size_t len, int flags)
 	int ret;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: sockfd:%d, libc_send:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_send:%p\n",
 			__func__, sockfd, libc_send);
 		dump_usr_fd(__func__);
 	}
@@ -6105,7 +6073,7 @@ send(int sockfd, const void *buf, size_t len, int flags)
 			HDR_INIT_ALL) != HDR_INIT_ALL)) {
 			ret = netwrap_collect_info(sockfd);
 			if (ret) {
-				RTE_LOG(ERR, pre_ld,
+				PRE_LD_LOG(ERR,
 					"%s sockfd(%d) collect info failed(%d)\n",
 					__func__, sockfd, ret);
 				goto send_to_kernel;
@@ -6182,8 +6150,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 	struct fd_desc *usr, *tusr;
 
 	if (s_socket_dbg) {
-		RTE_LOG(INFO, pre_ld,
-			"%s starts: nfds:%d, libc_select:%p\n",
+		PRE_LD_LOG(INFO, "%s starts: nfds:%d, libc_select:%p\n",
 			__func__, nfds, libc_select);
 		dump_usr_fd(__func__);
 	}
@@ -6268,7 +6235,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 			off += sprintf(&log_buf[off], "%d ", usr_w_fd[i]);
 	}
 
-	RTE_LOG(INFO, pre_ld, "%s: %s\n", __func__, log_buf);
+	PRE_LD_LOG(INFO, "%s: %s\n", __func__, log_buf);
 
 select_fds:
 	if ((readfds && !memcmp(&usr_rfds, readfds, sizeof(fd_set)) &&
@@ -6339,15 +6306,13 @@ pre_ld_ipsec_restart(void *arg)
 	sprintf(cmd, "%s down %s", IPSEC_STROKE_PROCESS_NAME,
 		desc ? desc : SWANCTL_CONF_DEFAULT_NAME);
 	ret = system(cmd);
-	RTE_LOG(INFO, pre_ld, "%s down %s\n",
-		IPSEC_STROKE_PROCESS_NAME,
+	PRE_LD_LOG(INFO, "%s down %s\n", IPSEC_STROKE_PROCESS_NAME,
 		ret ? "failed" : "success");
 	sleep(1);
 	sprintf(cmd, "%s up %s", IPSEC_STROKE_PROCESS_NAME,
 		desc ? desc : SWANCTL_CONF_DEFAULT_NAME);
 	ret = system(cmd);
-	RTE_LOG(INFO, pre_ld, "%s up %s\n",
-		IPSEC_STROKE_PROCESS_NAME,
+	PRE_LD_LOG(INFO, "%s up %s\n", IPSEC_STROKE_PROCESS_NAME,
 		ret ? "failed" : "success");
 
 	return arg;
@@ -6356,8 +6321,7 @@ pre_ld_ipsec_restart(void *arg)
 static void
 pre_ld_signal_handler(int signum)
 {
-	RTE_LOG(INFO, pre_ld,
-		"Receive signum(%d)\n", signum);
+	PRE_LD_LOG(INFO, "Receive signum(%d)\n", signum);
 	s_pre_ld_quit = 1;
 }
 
@@ -6367,6 +6331,8 @@ static void setup_wrappers(void)
 	char *env;
 	int i, j, ret;
 	pthread_t pid;
+
+	clock_gettime(CLOCK_REALTIME, &s_ts);
 
 	if (!netwrap_is_usr_process())
 		return;
@@ -6429,7 +6395,7 @@ static void setup_wrappers(void)
 		s_mtu_set = atoi(env);
 		if (s_mtu_set < RTE_ETHER_MTU ||
 			s_mtu_set > MAX_HUGE_FRAME_SIZE) {
-			RTE_LOG(WARNING, pre_ld,
+			PRE_LD_LOG(WARNING,
 				"Invalid MTU size(%d) to set\n",
 				s_mtu_set);
 			s_mtu_set = 0;
@@ -6489,7 +6455,7 @@ static void setup_wrappers(void)
 		s_mempool_cache_size = atoi(env);
 		if (!RTE_IS_POWER_OF_2(s_mempool_cache_size) ||
 			s_mempool_cache_size > MEMPOOL_CACHE_SIZE) {
-			RTE_LOG(WARNING, pre_ld,
+			PRE_LD_LOG(WARNING,
 				"Invalid mempool cache size(%d), reset it as zero\n",
 				s_mempool_cache_size);
 			s_mempool_cache_size = 0;
@@ -6516,8 +6482,7 @@ static void setup_wrappers(void)
 
 	s_fd_desc = malloc(sizeof(struct fd_desc) * MAX_USR_FD_NUM);
 	if (!s_fd_desc) {
-		RTE_LOG(ERR, pre_ld,
-			"Malloc %d FD descriptors failed\n",
+		PRE_LD_LOG(ERR, "Malloc %d FD descriptors failed\n",
 			MAX_USR_FD_NUM);
 
 		exit(EXIT_FAILURE);
@@ -6563,8 +6528,7 @@ static void setup_wrappers(void)
 	if (!ret) {
 		s_eal_inited = 1;
 	} else {
-		RTE_LOG(ERR, pre_ld,
-			"eal init failed(%d)\n", ret);
+		PRE_LD_LOG(ERR, "eal init failed(%d)\n", ret);
 		exit(EXIT_FAILURE);
 	}
 
@@ -6587,7 +6551,7 @@ static void setup_wrappers(void)
 
 	if (s_pre_ld_quit) {
 		netwrap_main_dtor();
-		RTE_LOG(INFO, pre_ld, "Exit from preload!\n");
+		PRE_LD_LOG(INFO, "Exit from preload!\n");
 		exit(0);
 	}
 
