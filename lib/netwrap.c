@@ -85,10 +85,6 @@ static pthread_mutex_t s_dp_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint16_t s_cpu_start = 1;
 #define SYS_CORE_ID 0
 
-static const char *s_dpdmux_ep_name;
-static int s_dpdmux_id = -1;
-static int s_dpdmux_ep_id;
-
 enum {
 	CRYPTO_DEV_INGRESS_QP,
 	CRYPTO_DEV_EGRESS_QP,
@@ -105,9 +101,7 @@ enum {
 static struct pre_ld_crypt_param s_crypt_param;
 
 static const char *s_eal_file_prefix;
-static char *s_uplink;
 static const char *s_slow_if;
-static char *s_downlink;
 
 static int s_manual_restart_ipsec;
 static int s_flow_control;
@@ -121,6 +115,9 @@ static uint16_t s_fd_mbuf_avail_threshold = 128;
 
 static uint16_t s_l3_traffic_dump;
 static uint8_t s_l4_traffic_dump;
+
+static char *s_ls_listni_info;
+static const char *s_safe_ls_listni_info;
 
 static pthread_t s_main_td;
 
@@ -172,9 +169,9 @@ struct fd_thread_desc {
 	pthread_t thread;
 };
 
-enum fd_data_path_type {
-	FD_DP_DIRECT_TYPE,
-	FD_DP_IN_DIRECT_TYPE
+enum fd_access_type {
+	FD_HARDWARE_ACCESS,
+	FD_THREAD_ACCESS
 };
 
 struct fd_hw_desc {
@@ -202,7 +199,7 @@ struct fd_desc {
 	struct fd_thread_desc th_desc[RTE_MAX_LCORE];
 	struct eth_ipv4_udp_hdr hdr;
 	enum hdr_init_enum hdr_init;
-	enum fd_data_path_type dp_type;
+	enum fd_access_type access_type;
 	union fd_data_path_desc dp_desc;
 	void *flow;
 	struct rte_mempool *tx_pool;
@@ -296,24 +293,75 @@ static struct rte_eth_conf s_port_conf = {
 
 static struct rte_mempool *s_pre_ld_rx_pool;
 
-struct pre_ld_dir_port_cfg {
-	int valid;
-	uint16_t ext_id;
-	uint16_t ul_id;
-	uint16_t dl_id;
-	uint16_t tap_id;
+struct pre_ld_dir_ul_dl_pair {
+	int ul_id;
+	int dl_id;
 };
 
-static struct pre_ld_dir_port_cfg s_dir_ports;
+struct pre_ld_dir_kif {
+	uint16_t tap_id;
+	const char *kernel_nm;
+};
+
+#define PRE_LD_DIR_MAX_IF_NUM 8
+struct pre_ld_dir_cfg {
+	uint16_t ext_id[PRE_LD_DIR_MAX_IF_NUM];
+	uint8_t ext_num;
+	struct pre_ld_dir_ul_dl_pair pair[PRE_LD_DIR_MAX_IF_NUM];
+	uint8_t pair_num;
+	struct pre_ld_dir_ul_dl_pair recyc_pair[PRE_LD_DIR_MAX_IF_NUM];
+	uint8_t recyc_pair_num;
+	struct pre_ld_dir_kif kif[PRE_LD_DIR_MAX_IF_NUM];
+	uint8_t kif_num;
+};
+
+#define PRE_LD_MUX_MAX_IF_NUM 8
+struct pre_ld_mux_cfg {
+	uint16_t mux_id;
+	uint16_t def_id;
+	const char *def_nm;
+	const char *kernel_nm;
+	uint16_t ep_id[PRE_LD_MUX_MAX_IF_NUM];
+	const char *ep_nm[PRE_LD_MUX_MAX_IF_NUM];
+	uint16_t port_id[PRE_LD_MUX_MAX_IF_NUM];
+	int entry_id[PRE_LD_MUX_MAX_IF_NUM];
+	uint8_t if_num;
+};
+
+#define PRE_LD_PROC_MAX_IF_NUM 8
+struct pre_ld_proc_cfg {
+	char def_nm[RTE_ETH_NAME_MAX_LEN];
+	const char *kernel_nm;
+	char uplink_nm[RTE_ETH_NAME_MAX_LEN];
+	char downlink_nm[PRE_LD_PROC_MAX_IF_NUM][RTE_ETH_NAME_MAX_LEN];
+	uint16_t port_id[PRE_LD_PROC_MAX_IF_NUM];
+	int dir_configured[PRE_LD_PROC_MAX_IF_NUM];
+	uint8_t if_num;
+};
+
+#define PRE_LD_MUX_MAX_NUM 4
+static struct pre_ld_mux_cfg s_mux_cfg[PRE_LD_MUX_MAX_NUM];
+static uint8_t s_mux_num;
+static int s_mux_index = -1;
+
+#define PRE_LD_PROC_MAX_NUM 4
+static struct pre_ld_proc_cfg s_proc_cfg[PRE_LD_PROC_MAX_NUM];
+static uint8_t s_proc_num;
+static int s_proc_index = -1;
+
+static struct pre_ld_dir_cfg s_dir_ports;
+static int s_dir_recyc;
 
 enum pre_ld_port_type {
 	NULL_TYPE = 0,
 	EXTERNAL_TYPE = (1 << 0),
 	UP_LINK_TYPE = (1 << 1),
 	DOWN_LINK_TYPE = (1 << 2),
-	KERNEL_TAP_TYPE = (1 << 3),
-	ALL_TYPE = EXTERNAL_TYPE | UP_LINK_TYPE |
-		DOWN_LINK_TYPE | KERNEL_TAP_TYPE
+	PROC_DOWN_LINK_TYPE = (1 << 3),
+	MUX_DOWN_LINK_TYPE = (1 << 4),
+	KERNEL_TAP_TYPE = (1 << 5),
+	RECYCLE_UP_LINK_TYPE = (1 << 6),
+	RECYCLE_DOWN_LINK_TYPE = (1 << 7)
 };
 
 #define IP_DEFTTL       64
@@ -332,8 +380,6 @@ static int s_pre_ld_quit;
 /** Single rx/tx ports pair support only now, default 0.*/
 static uint16_t s_rx_port;
 static uint16_t s_tx_port;
-
-static int s_dpdmux_entry_index = -1;
 
 static int s_data_path_core = -1;
 
@@ -698,7 +744,7 @@ netwrap_get_current_process_name(char *nm)
 	if (f) {
 		size = fread(ps_nm, sizeof(char), 1024, f);
 		if (size > 0) {
-			RTE_LOG(INFO, pre_ld,
+			RTE_LOG(DEBUG, pre_ld,
 				"This process: PID = %d, name: %s\n",
 				pid, ps_nm);
 			strcpy(nm, ps_nm);
@@ -726,7 +772,7 @@ netwrap_is_usr_process(void)
 		if (!strcmp(s_usr_app_nm, current_nm))
 			return true;
 
-		RTE_LOG(INFO, pre_ld,
+		RTE_LOG(DEBUG, pre_ld,
 			"This process(%s) is not user app(%s)\n",
 			current_nm, s_usr_app_nm);
 	}
@@ -779,20 +825,27 @@ again:
 	}
 }
 
-static int
+static void
 eal_destroy_dpaa2_mux_flow(void)
 {
-	int ret;
+	int ret, i, j, entry;
+	uint32_t id;
 
-	if (s_dpdmux_entry_index < 0 || s_dpdmux_id < 0)
-		return 0;
-
-	ret = rte_pmd_dpaa2_mux_flow_destroy(s_dpdmux_id,
-		s_dpdmux_entry_index);
-	if (!ret)
-		s_dpdmux_entry_index = -1;
-
-	return ret;
+	for (i = 0; i < s_mux_num; i++) {
+		for (j = 0; j < PRE_LD_MUX_MAX_IF_NUM; j++) {
+			entry = s_mux_cfg[i].entry_id[j];
+			id = s_mux_cfg[i].mux_id;
+			if (entry < 0)
+				continue;
+			ret = rte_pmd_dpaa2_mux_flow_destroy(id, entry);
+			if (ret) {
+				RTE_LOG(ERR, pre_ld,
+					"Destroy MUX%d's flow entry%d failed(%d)\n",
+					id, entry, ret);
+			}
+			s_mux_cfg[i].entry_id[j] = -1;
+		}
+	}
 }
 
 static inline int
@@ -826,20 +879,33 @@ usr_socket_fd_release(int sockfd)
 	struct pre_ld_rx_pool *rx_pool;
 	struct rte_mbuf *free_burst[MAX_PKT_BURST];
 	struct pre_ld_lcore_direct_list *list = NULL;
-	struct rte_ring *tx_ring = NULL, *rx_ring = NULL, *free_ring = NULL;
+	struct rte_ring *tx_ring = NULL, *rx_ring = NULL;
+	struct rte_ring *malloc_ring = NULL, *free_ring = NULL;
 	struct pre_ld_ring *pre_ld_tx_ring = NULL;
 	struct pre_ld_ring *pre_ld_rx_ring = NULL;
 	struct pre_ld_ring *pre_ld_free_ring = NULL;
+	struct pre_ld_ring *pre_ld_malloc_ring = NULL;
 	struct pre_ld_port_rx_flow *rx_flow = NULL;
 	struct fd_thread_desc *th_desc;
 	struct fd_desc *desc = &s_fd_desc[sockfd];
 	struct pre_ld_direct_entry *rx_entry;
 	struct pre_ld_direct_entry *tx_entry;
 	struct pre_ld_direct_entry *free_entry;
+	struct pre_ld_direct_entry *malloc_entry = NULL;
+	struct rte_mempool *malloc_pool = NULL;
 
 	pthread_mutex_lock(&s_fd_mutex);
 
-	if (desc->dp_type == FD_DP_DIRECT_TYPE) {
+	if (desc->tx_pool) {
+		malloc_pool = desc->tx_pool;
+	} else if (desc->access_type == FD_THREAD_ACCESS) {
+		malloc_entry = desc->dp_desc.entry_desc.malloc_entry;
+		if (malloc_entry &&
+			malloc_entry->poll.malloc_pool != s_pre_ld_rx_pool)
+			malloc_pool = malloc_entry->poll.malloc_pool;
+	}
+
+	if (desc->access_type == FD_HARDWARE_ACCESS) {
 		rx_flow = desc->dp_desc.hw_desc.rx_flow;
 		rx_port = rx_flow->port_id;
 	} else {
@@ -883,6 +949,11 @@ usr_socket_fd_release(int sockfd)
 		rte_free(free_entry);
 		desc->dp_desc.entry_desc.free_entry = NULL;
 	}
+
+	if (malloc_entry && malloc_entry->dest_type == MALLOC_RING)
+		malloc_ring = malloc_entry->dest.malloc_ring;
+	else if (malloc_entry)
+		pre_ld_malloc_ring = malloc_entry->dest.pre_ld_malloc_ring;
 
 	if (desc->flow) {
 		pre_ld_flow_destroy(rx_port, desc->flow);
@@ -962,6 +1033,28 @@ dq_pre_ld_free_again:
 		pre_ld_ring_free(pre_ld_free_ring);
 	}
 
+	if (pre_ld_malloc_ring) {
+dq_pre_ld_malloc_again:
+		nb = pre_ld_ring_dq(pre_ld_malloc_ring,
+				(void **)free_burst, MAX_PKT_BURST);
+		if (nb > 0) {
+			rte_pktmbuf_free_bulk(free_burst, nb);
+			goto dq_pre_ld_malloc_again;
+		}
+		pre_ld_ring_free(pre_ld_malloc_ring);
+	}
+
+	if (malloc_ring) {
+dq_malloc_ring_again:
+		nb = rte_ring_dequeue_burst(malloc_ring,
+				(void **)free_burst, MAX_PKT_BURST, NULL);
+		if (nb > 0) {
+			rte_pktmbuf_free_bulk(free_burst, nb);
+			goto dq_malloc_ring_again;
+		}
+		rte_ring_free(malloc_ring);
+	}
+
 	rx_pool = &desc->rx_buffer;
 	if (rx_pool->rx_bufs) {
 		while (rx_pool->head != rx_pool->tail) {
@@ -972,10 +1065,8 @@ dq_pre_ld_free_again:
 		rte_free(desc->rx_buffer.rx_bufs);
 	}
 
-	if (desc->tx_pool) {
-		rte_mempool_free(desc->tx_pool);
-		desc->tx_pool = NULL;
-	}
+	if (malloc_pool)
+		rte_mempool_free(malloc_pool);
 
 	for (i = 0; i < desc->eal_thread_nb; i++) {
 		th_desc = &desc->th_desc[i];
@@ -1039,11 +1130,7 @@ static void eal_quit(void)
 		}
 	}
 
-	ret = eal_destroy_dpaa2_mux_flow();
-	if (ret) {
-		RTE_LOG(INFO, pre_ld, "Destroy mux flow failed(%d)",
-			ret);
-	}
+	eal_destroy_dpaa2_mux_flow();
 	RTE_ETH_FOREACH_DEV(portid) {
 		if (portid == s_tx_port && rte_lcore_id() != LCORE_ID_ANY) {
 drain_again:
@@ -1218,7 +1305,7 @@ usr_data_path_free_mbuf(struct fd_desc *desc,
 	struct rte_ring *free_ring;
 	struct pre_ld_ring *pre_ld_free_ring;
 
-	if (desc->dp_type == FD_DP_IN_DIRECT_TYPE) {
+	if (desc->access_type == FD_THREAD_ACCESS) {
 		free_entry = desc->dp_desc.entry_desc.free_entry;
 		if (unlikely(!free_entry)) {
 			/** FD close, have to leak memory*/
@@ -1343,7 +1430,7 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 	if (!remain)
 		goto finsh_recv;
 
-	if (desc->dp_type == FD_DP_IN_DIRECT_TYPE) {
+	if (desc->access_type == FD_THREAD_ACCESS) {
 		rx_entry = desc->dp_desc.entry_desc.rx_entry;
 		if (unlikely(!rx_entry)) {
 			/** FD close*/
@@ -1511,7 +1598,7 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 
 	eal_send_fill_mbufs(sockfd, buf, lens, mbufs, count);
 
-	if (desc->dp_type == FD_DP_IN_DIRECT_TYPE) {
+	if (desc->access_type == FD_THREAD_ACCESS) {
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
 		if (unlikely(!tx_entry)) {
 			/** FD close*/
@@ -2072,13 +2159,21 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	}
 
 	if (sp->dir == XFRM_POLICY_IN) {
-		rx_port = s_dir_ports.dl_id;
-		tx_port = s_dir_ports.ul_id;
+		if (s_dir_recyc) {
+			rx_port = s_dir_ports.recyc_pair[0].dl_id;
+			tx_port = s_dir_ports.recyc_pair[0].dl_id;
+		} else {
+			rx_port = s_dir_ports.pair[0].dl_id;
+			tx_port = s_dir_ports.pair[0].ul_id;
+		}
 		dest_type = SEC_INGRESS;
 		poll_type = SEC_IN_COMPLETE;
 	} else if (sp->dir == XFRM_POLICY_OUT) {
-		rx_port = s_dir_ports.ul_id;
-		tx_port = s_dir_ports.ext_id;
+		if (s_dir_recyc)
+			rx_port = s_dir_ports.recyc_pair[0].ul_id;
+		else
+			rx_port = s_dir_ports.pair[0].ul_id;
+		tx_port = s_dir_ports.ext_id[0];
 		dest_type = SEC_EGRESS;
 		poll_type = SEC_EG_COMPLETE;
 	} else {
@@ -2464,7 +2559,8 @@ pre_ld_build_def_direct_traffic(struct pre_ld_lcore_direct_list *lcore,
 
 static void
 pre_ld_configure_direct_traffic(uint16_t ext_id,
-	uint16_t ul_id, uint16_t dl_id, uint16_t tap_id)
+	uint16_t ul_id, uint16_t dl_id, uint16_t tap_id,
+	int is_recyc)
 {
 	uint16_t lcore_id;
 	struct pre_ld_lcore_direct_list *lcore;
@@ -2485,10 +2581,17 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	lcore = &s_pre_ld_lists[lcore_id];
 	pre_ld_build_def_direct_traffic(lcore, dl_nm, tap_nm,
 		dl_id, tap_id);
-	pre_ld_build_def_direct_traffic(lcore, tap_nm, dl_nm,
-		tap_id, dl_id);
-	pre_ld_build_def_direct_traffic(lcore, ext_nm, ul_nm,
-		ext_id, ul_id);
+	if (is_recyc) {
+		pre_ld_build_def_direct_traffic(lcore, tap_nm, ul_nm,
+			tap_id, ul_id);
+		pre_ld_build_def_direct_traffic(lcore, ext_nm, dl_nm,
+			ext_id, dl_id);
+	} else {
+		pre_ld_build_def_direct_traffic(lcore, tap_nm, dl_nm,
+			tap_id, dl_id);
+		pre_ld_build_def_direct_traffic(lcore, ext_nm, ul_nm,
+			ext_id, ul_id);
+	}
 	pre_ld_build_def_direct_traffic(lcore, ul_nm, ext_nm,
 		ul_id, ext_id);
 }
@@ -2523,66 +2626,6 @@ pre_ld_get_tap_kernel_if_nm(const char *peer_name)
 
 	closedir(dir);
 	return NULL;
-}
-
-static void
-pre_ld_configure_split_traffic(uint32_t portid)
-{
-	const char *ep_name;
-	const char *def_ep_name;
-	int ret, id = -1, ep_id = -1;
-	uint16_t mux_def_id;
-	struct rte_remote_query_rsp rsp;
-
-	ep_name = rte_pmd_dpaa2_ep_name(portid);
-	if (!ep_name)
-		return;
-
-	ret = rte_remote_mux_parse_ep_name(ep_name,
-			NULL, &id, NULL, &ep_id);
-	if (!ret) {
-		if (s_dpdmux_ep_name) {
-			RTE_LOG(WARNING, pre_ld,
-				"Multiple dpdmux ep names(%s)(%s) detected.\n",
-				s_dpdmux_ep_name, ep_name);
-		}
-		s_dpdmux_ep_name = ep_name;
-		s_dpdmux_id = id;
-		s_dpdmux_ep_id = ep_id;
-		if (!s_slow_if &&
-			!rte_pmd_dpaa2_mux_default_id(id, &mux_def_id) &&
-			!rte_pmd_dpaa2_mux_ep_name(id, mux_def_id, &def_ep_name)) {
-			s_slow_if = pre_ld_get_tap_kernel_if_nm(def_ep_name);
-			if (s_slow_if) {
-				RTE_LOG(INFO, pre_ld,
-					"Found tap port(%s)(%s) connected to dpdmux%d.%d\n",
-					s_slow_if, def_ep_name, id, mux_def_id);
-			}
-		}
-
-		return;
-	}
-
-	ret = remote_direct_query(&rsp);
-	if (ret)
-		return;
-
-	if (!s_downlink) {
-		s_downlink = rte_malloc(NULL, RTE_ETH_NAME_MAX_LEN, 0);
-		strcpy(s_downlink, rsp.downlink_nm);
-	}
-	if (!s_uplink) {
-		s_uplink = rte_malloc(NULL, RTE_ETH_NAME_MAX_LEN, 0);
-		strcpy(s_uplink, rsp.uplink_nm);
-	}
-	if (!s_slow_if)
-		s_slow_if = pre_ld_get_tap_kernel_if_nm(rsp.taplink_end_nm);
-
-	if (s_slow_if) {
-		RTE_LOG(INFO, pre_ld,
-			"Found tap port(%s)(%s) connected to %s\n",
-			s_slow_if, rsp.taplink_end_nm, rsp.taplink_nm);
-	}
 }
 
 static inline int
@@ -2651,6 +2694,7 @@ pre_ld_main_loop(void *dummy)
 	int ret;
 	struct pre_ld_lcore_direct_list *list;
 	struct pre_ld_direct_entry *entry, *tentry;
+	uint16_t ul_id, dl_id;
 
 	RTE_SET_USED(dummy);
 
@@ -2668,9 +2712,16 @@ pre_ld_main_loop(void *dummy)
 	list = &s_pre_ld_lists[lcore_id];
 	s_data_path_core = lcore_id;
 
-	pre_ld_configure_direct_traffic(s_dir_ports.ext_id,
-		s_dir_ports.ul_id, s_dir_ports.dl_id,
-		s_dir_ports.tap_id);
+	if (s_dir_recyc) {
+		ul_id = s_dir_ports.recyc_pair[0].ul_id;
+		dl_id = s_dir_ports.recyc_pair[0].dl_id;
+	} else {
+		ul_id = s_dir_ports.pair[0].ul_id;
+		dl_id = s_dir_ports.pair[0].dl_id;
+	}
+	pre_ld_configure_direct_traffic(s_dir_ports.ext_id[0],
+		ul_id, dl_id, s_dir_ports.kif[0].tap_id, s_dir_recyc);
+
 	pthread_mutex_unlock(&s_dp_init_mutex);
 
 	RTE_LOG(INFO, pre_ld,
@@ -2705,16 +2756,127 @@ for_ever_loop:
 	return 0;
 }
 
-static enum pre_ld_port_type
+static void
+pre_ld_ls_listni_clean(void)
+{
+	if (s_ls_listni_info)
+		rte_free(s_ls_listni_info);
+	s_ls_listni_info = NULL;
+	s_safe_ls_listni_info = NULL;
+}
+
+static int
+pre_ld_ls_listni_dump(void)
+{
+	char cmd[512], *env, rst[128], *info;
+	struct stat st;
+	size_t size;
+	int ret;
+	FILE *f = NULL;
+
+	if (s_safe_ls_listni_info)
+		return 0;
+
+	env = getenv("LISTNI_RESULT");
+	if (env)
+		sprintf(rst, "/tmp/%s", env);
+	else
+		sprintf(rst, "/tmp/listni_rst");
+	sprintf(cmd, "ls-listni > %s", rst);
+	ret = system(cmd);
+	if (ret)
+		return ret;
+
+	ret = stat(rst, &st);
+	if (ret)
+		return ret;
+
+	info = rte_malloc(NULL, st.st_size * 2, 0);
+	if (!info)
+		return -ENOMEM;
+
+	f = fopen(rst, "r");
+	if (f) {
+		size = fread(info, sizeof(char), st.st_size, f);
+		if (size != (size_t)st.st_size) {
+			RTE_LOG(WARNING, pre_ld,
+				"Read %s length(%ld) != length(%ld) of state\n",
+				rst, size, (size_t)st.st_size);
+		}
+		s_ls_listni_info = info;
+		s_safe_ls_listni_info = info;
+		fclose(f);
+
+		return 0;
+	}
+
+	rte_free(s_ls_listni_info);
+	s_ls_listni_info = NULL;
+
+	return -EIO;
+}
+
+static int
+pre_ld_ls_listni_peer_info(const char *dpni_nm,
+	uint8_t *dprc_num, char *eth_nm)
+{
+	int i = 0;
+	char search[128];
+	char *found, *dprc_pos, *eth_pos;
+	uint8_t num;
+
+	if (!s_safe_ls_listni_info)
+		return -ENOMEM;
+
+	sprintf(search, "/%s", dpni_nm);
+	found = strstr(s_safe_ls_listni_info, search);
+	if (!found)
+		return -EEXIST;
+
+	/** Assume dprc number is less than 10.*/
+	dprc_pos = found - strlen("dprc.1");
+	if (dprc_pos < s_safe_ls_listni_info)
+		return -EEXIST;
+
+	if (strncmp(dprc_pos, "dprc.", strlen("dprc.")))
+		return -EEXIST;
+
+	num = *(dprc_pos + strlen("dprc.")) - '0';
+	if (dprc_num)
+		*dprc_num = num;
+
+	if (num == 1) {
+		/**ROOT DPRC*/
+		eth_pos = found + strlen(search) +
+			strlen(" (interface: ");
+		if (eth_nm) {
+			while (eth_pos[i] != ' ') {
+				eth_nm[i] = eth_pos[i];
+				i++;
+			}
+			eth_nm[i] = 0;
+		}
+	}
+
+	return 0;
+}
+
+static void
 pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 	uint16_t size)
 {
 	uint16_t portid1, portid2, port_num;
-	char port_name1[RTE_ETH_NAME_MAX_LEN];
-	char port_name2[RTE_ETH_NAME_MAX_LEN];
+	char port_name[RTE_ETH_NAME_MAX_LEN];
 	const char *peer_name;
-	enum pre_ld_port_type type_val = NULL_TYPE;
-	int kernel_port = -1;
+	int ret;
+	const char *eth_nm;
+	uint8_t dprc_num, i;
+	int mux_id, ep_id, found;
+	struct pre_ld_mux_cfg *mux_cfg;
+	struct pre_ld_dir_ul_dl_pair *pair;
+	struct pre_ld_dir_ul_dl_pair *recyc_pair;
+	struct pre_ld_dir_kif *kif;
+	struct rte_remote_query_rsp rsp;
 
 	for (port_num = 0; port_num < size; port_num++)
 		port_type[port_num] = NULL_TYPE;
@@ -2722,79 +2884,186 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 	port_num = 0;
 
 	RTE_ETH_FOREACH_DEV(portid1) {
-		if (rte_pmd_dpaa2_dev_is_dpaa2(portid1))
-			port_num++;
-		if (port_type[portid1] != NULL_TYPE)
+		if (!rte_pmd_dpaa2_dev_is_dpaa2(portid1)) {
+			port_type[portid1] = EXTERNAL_TYPE;
+			s_dir_ports.ext_id[s_dir_ports.ext_num] = portid1;
+			s_dir_ports.ext_num++;
 			continue;
-		rte_eth_dev_get_name_by_port(portid1, port_name1);
+		}
 		peer_name = rte_pmd_dpaa2_ep_name(portid1);
 		if (!peer_name ||
 			!strncmp(peer_name, "dpmac.", strlen("dpmac."))) {
-			if (type_val & EXTERNAL_TYPE) {
-				RTE_LOG(INFO, pre_ld,
-					"Multiple external ports?\n");
-				type_val = NULL_TYPE;
-				goto quit;
-			}
 			port_type[portid1] = EXTERNAL_TYPE;
-			type_val |= EXTERNAL_TYPE;
-			continue;
-		}
-		RTE_ETH_FOREACH_DEV(portid2) {
-			if (portid2 == portid1)
-				continue;
-			rte_eth_dev_get_name_by_port(portid2, port_name2);
-			if (peer_name && !strcmp(peer_name, port_name2)) {
-				if (type_val &
-					(UP_LINK_TYPE | DOWN_LINK_TYPE)) {
-					RTE_LOG(INFO, pre_ld,
-						"Multiple pairs of ul/dl ports?\n");
-					type_val = NULL_TYPE;
-					goto quit;
-				}
-				port_type[portid1] = UP_LINK_TYPE;
-				port_type[portid2] = DOWN_LINK_TYPE;
-				type_val |= UP_LINK_TYPE | DOWN_LINK_TYPE;
-				break;
-			}
-		}
-		if (port_type[portid1] == NULL_TYPE &&
-			rte_pmd_dpaa2_dev_is_dpaa2(portid1)) {
-			if (type_val & KERNEL_TAP_TYPE) {
-				RTE_LOG(INFO, pre_ld,
-					"Multiple tap ports?\n");
-				type_val = NULL_TYPE;
-				goto quit;
-			}
-			port_type[portid1] = KERNEL_TAP_TYPE;
-			type_val |= KERNEL_TAP_TYPE;
-			kernel_port = portid1;
+			s_dir_ports.ext_id[s_dir_ports.ext_num] = portid1;
+			s_dir_ports.ext_num++;
 		}
 	}
 
-	if (port_num == 1) {
-		RTE_ETH_FOREACH_DEV(portid1) {
-			if (rte_pmd_dpaa2_dev_is_dpaa2(portid1)) {
-				port_type[portid1] = DOWN_LINK_TYPE;
-				type_val = DOWN_LINK_TYPE;
+	RTE_ETH_FOREACH_DEV(portid1) {
+		if (!rte_pmd_dpaa2_dev_is_dpaa2(portid1))
+			continue;
+		if (port_type[portid1] != NULL_TYPE)
+			continue;
+		peer_name = rte_pmd_dpaa2_ep_name(portid1);
+		RTE_ETH_FOREACH_DEV(portid2) {
+			pair = &s_dir_ports.pair[s_dir_ports.pair_num];
+			if (portid2 == portid1)
+				continue;
+			ret = rte_eth_dev_get_name_by_port(portid2, port_name);
+			if (ret)
+				continue;
+			if (peer_name && !strcmp(peer_name, port_name)) {
+				pair->ul_id = portid1;
+				pair->dl_id = portid2;
+				port_type[portid1] = UP_LINK_TYPE;
+				port_type[portid2] = DOWN_LINK_TYPE;
+				s_dir_ports.pair_num++;
+				break;
 			}
 		}
-	} else if (kernel_port >= 0 && !s_slow_if) {
-		peer_name = rte_pmd_dpaa2_ep_name(kernel_port);
-		s_slow_if = pre_ld_get_tap_kernel_if_nm(peer_name);
-		if (s_slow_if) {
-			rte_eth_dev_get_name_by_port(kernel_port, port_name1);
-			RTE_LOG(INFO, pre_ld,
-				"Found tap port(%s)(%s) connected to %s\n",
-				s_slow_if, peer_name, port_name1);
+	}
+
+	recyc_pair = s_dir_ports.recyc_pair;
+	RTE_ETH_FOREACH_DEV(portid1) {
+		if (!rte_pmd_dpaa2_dev_is_dpaa2(portid1))
+			continue;
+		if (port_type[portid1] != NULL_TYPE)
+			continue;
+		ret = rte_eth_dev_get_name_by_port(portid1, port_name);
+		if (ret)
+			continue;
+		peer_name = rte_pmd_dpaa2_ep_name(portid1);
+		if (peer_name && !strcmp(peer_name, port_name)) {
+			if (recyc_pair->ul_id < 0) {
+				recyc_pair->ul_id = portid1;
+				port_type[portid1] = RECYCLE_UP_LINK_TYPE;
+			} else if (recyc_pair->dl_id < 0) {
+				recyc_pair->dl_id = portid1;
+				port_type[portid1] = RECYCLE_DOWN_LINK_TYPE;
+			}
+			if (recyc_pair->ul_id >= 0 && recyc_pair->dl_id >= 0) {
+				s_dir_ports.recyc_pair_num++;
+				recyc_pair++;
+			}
 		}
 	}
-quit:
-	if (type_val == NULL_TYPE) {
-		for (port_num = 0; port_num < size; port_num++)
-			port_type[port_num] = NULL_TYPE;
+
+	RTE_ETH_FOREACH_DEV(portid1) {
+		kif = &s_dir_ports.kif[s_dir_ports.kif_num];
+		if (!rte_pmd_dpaa2_dev_is_dpaa2(portid1))
+			continue;
+		if (port_type[portid1] != NULL_TYPE)
+			continue;
+		peer_name = rte_pmd_dpaa2_ep_name(portid1);
+		if (!peer_name)
+			continue;
+		if (strncmp(peer_name, REMOTE_EP_NAME_PREFIX,
+			strlen(REMOTE_EP_NAME_PREFIX)))
+			continue;
+		if (pre_ld_ls_listni_peer_info(peer_name, &dprc_num, NULL))
+			continue;
+		if (dprc_num != 1)
+			continue;
+		eth_nm = pre_ld_get_tap_kernel_if_nm(peer_name);
+		if (eth_nm) {
+			kif->tap_id = portid1;
+			kif->kernel_nm = eth_nm;
+			port_type[portid1] = KERNEL_TAP_TYPE;
+			s_dir_ports.kif_num++;
+		}
 	}
-	return type_val;
+
+	RTE_ETH_FOREACH_DEV(portid1) {
+		if (!rte_pmd_dpaa2_dev_is_dpaa2(portid1))
+			continue;
+		if (port_type[portid1] != NULL_TYPE)
+			continue;
+		peer_name = rte_pmd_dpaa2_ep_name(portid1);
+		if (!peer_name)
+			continue;
+		if (strncmp(peer_name, REMOTE_EP_NAME_PREFIX,
+			strlen(REMOTE_EP_NAME_PREFIX)))
+			continue;
+		if (pre_ld_ls_listni_peer_info(peer_name, &dprc_num, NULL))
+			continue;
+		if (dprc_num == 1)
+			continue;
+		port_type[portid1] = PROC_DOWN_LINK_TYPE;
+		ret = remote_direct_query(&rsp);
+		if (ret)
+			continue;
+
+		/** We support single proc pair only now.*/
+		if (!s_proc_cfg[0].uplink_nm[0])
+			strcpy(s_proc_cfg[0].uplink_nm, rsp.uplink_nm);
+		if (!s_proc_cfg[0].def_nm[0])
+			strcpy(s_proc_cfg[0].def_nm, rsp.taplink_nm);
+
+		if (!s_proc_cfg[0].kernel_nm) {
+			s_proc_cfg[0].kernel_nm =
+				pre_ld_get_tap_kernel_if_nm(rsp.taplink_end_nm);
+		}
+
+		strcpy(s_proc_cfg[0].downlink_nm[s_proc_cfg[0].if_num],
+			rsp.downlink_nm);
+		s_proc_cfg[0].port_id[s_proc_cfg[0].if_num] = portid1;
+		s_proc_cfg[0].if_num++;
+		s_proc_num = 1;
+	}
+
+	RTE_ETH_FOREACH_DEV(portid1) {
+		if (!rte_pmd_dpaa2_dev_is_dpaa2(portid1))
+			continue;
+		if (port_type[portid1] != NULL_TYPE)
+			continue;
+		peer_name = rte_pmd_dpaa2_ep_name(portid1);
+		if (!peer_name)
+			continue;
+		ret = rte_remote_mux_parse_ep_name(peer_name,
+			NULL, &mux_id, NULL, &ep_id);
+		if (ret)
+			continue;
+		port_type[portid1] = MUX_DOWN_LINK_TYPE;
+		found = 0;
+		for (i = 0; i < s_mux_num; i++) {
+			if (s_mux_cfg[i].mux_id != mux_id)
+				continue;
+			s_mux_cfg[i].port_id[s_mux_cfg[i].if_num] = portid1;
+			s_mux_cfg[i].ep_nm[s_mux_cfg[i].if_num] = peer_name;
+			s_mux_cfg[i].ep_id[s_mux_cfg[i].if_num] = ep_id;
+			s_mux_cfg[i].if_num++;
+			found = 1;
+			break;
+		}
+		if (found)
+			continue;
+
+		mux_cfg = &s_mux_cfg[s_mux_num];
+
+		ret = rte_pmd_dpaa2_mux_default_id(mux_id,
+				&mux_cfg->def_id);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"Get default ID of dpdmux%d failed(%d)\n",
+				mux_id, ret);
+			continue;
+		}
+		ret = rte_pmd_dpaa2_mux_ep_name(mux_id,
+				mux_cfg->def_id, &mux_cfg->def_nm);
+		if (ret) {
+			RTE_LOG(ERR, pre_ld,
+				"Get default name of dpdmux%d failed(%d)\n",
+				mux_id, ret);
+			continue;
+		}
+		mux_cfg->kernel_nm =
+			pre_ld_get_tap_kernel_if_nm(mux_cfg->def_nm);
+		mux_cfg->port_id[0] = portid1;
+		mux_cfg->ep_nm[0] = peer_name;
+		mux_cfg->ep_id[0] = ep_id;
+		mux_cfg->if_num++;
+		s_mux_num++;
+	}
 }
 
 #define MAX_ARGV_NUM 32
@@ -3065,6 +3334,122 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 	return 0;
 }
 
+static void pre_ld_dump_port_toplogy(void)
+{
+	int off, i, j, ret;
+	uint16_t portid;
+	char nm[RTE_ETH_NAME_MAX_LEN];
+	const char *space = "        ";
+	char *info = rte_malloc(NULL, 4096, 0);
+
+	if (!info)
+		return;
+
+	if (!s_dir_ports.ext_num && !s_dir_ports.pair_num &&
+		!s_dir_ports.kif_num)
+		goto skip_dir_dump;
+
+	off = sprintf(info,
+		"Direct: %d ext port(s)/%d pair(s)/%d tap(s)\n",
+		s_dir_ports.ext_num, s_dir_ports.pair_num,
+		s_dir_ports.kif_num);
+	if (s_dir_ports.ext_num)
+		off += sprintf(&info[off], "%s", space);
+	for (i = 0; i < s_dir_ports.ext_num; i++) {
+		portid = s_dir_ports.ext_id[i];
+		ret = rte_eth_dev_get_name_by_port(portid, nm);
+		if (ret)
+			goto skip_print_ext;
+		off += sprintf(&info[off], "ext%d(port%d/%s) ",
+			i, portid, nm);
+skip_print_ext:
+		if ((i + 1) == s_dir_ports.ext_num)
+			off += sprintf(&info[off], "\r\n");
+	}
+
+	if (s_dir_ports.pair_num)
+		off += sprintf(&info[off], "%s", space);
+	for (i = 0; i < s_dir_ports.pair_num; i++) {
+		portid = s_dir_ports.pair[i].ul_id;
+		ret = rte_eth_dev_get_name_by_port(portid, nm);
+		if (ret)
+			goto skip_print_pair;
+		off += sprintf(&info[off], "pair%d(ul%d/%s",
+			i, portid, nm);
+		portid = s_dir_ports.pair[i].dl_id;
+		ret = rte_eth_dev_get_name_by_port(portid, nm);
+		if (ret)
+			goto skip_print_pair;
+		off += sprintf(&info[off], "-dl%d/%s) ", portid, nm);
+skip_print_pair:
+		if ((i + 1) == s_dir_ports.pair_num)
+			off += sprintf(&info[off], "\r\n");
+	}
+	if (s_dir_ports.kif_num)
+		off += sprintf(&info[off], "%s", space);
+	for (i = 0; i < s_dir_ports.kif_num; i++) {
+		portid = s_dir_ports.kif[i].tap_id;
+		ret = rte_eth_dev_get_name_by_port(portid, nm);
+		if (ret)
+			goto skip_print_kif;
+		off += sprintf(&info[off], "tap%d(port%d/%s/%s) ",
+			i, portid, nm, s_dir_ports.kif[i].kernel_nm);
+skip_print_kif:
+		if ((i + 1) == s_dir_ports.kif_num)
+			off += sprintf(&info[off], "\r\n");
+	}
+	RTE_LOG(INFO, pre_ld, "%s\n", info);
+
+skip_dir_dump:
+	if (!s_mux_num)
+		goto skip_mux_dump;
+
+	off = sprintf(info, "%d DPDMUX(s)\n%s", s_mux_num, space);
+	for (i = 0; i < s_mux_num; i++) {
+		off += sprintf(&info[off],
+			"DPDMUX%d: default(%s<->%s) ",
+			s_mux_cfg[i].mux_id, s_mux_cfg[i].def_nm,
+			s_mux_cfg[i].kernel_nm);
+		for (j = 0; j < s_mux_cfg[i].if_num; j++) {
+			portid = s_mux_cfg[i].port_id[j];
+			ret = rte_eth_dev_get_name_by_port(portid, nm);
+			if (ret)
+				continue;
+			off += sprintf(&info[off], "IF%d(%s<->%s) ",
+				j, s_mux_cfg[i].ep_nm[j], nm);
+		}
+		if ((i + 1) == s_mux_num)
+			off += sprintf(&info[off], "\r\n");
+	}
+	RTE_LOG(INFO, pre_ld, "%s\n", info);
+
+skip_mux_dump:
+	if (!s_proc_num) {
+		rte_free(info);
+		return;
+	}
+
+	off = sprintf(info, "%d PROC(s)\n%s", s_proc_num, space);
+	for (i = 0; i < s_proc_num; i++) {
+		off += sprintf(&info[off],
+			"PROC%d: default(%s<->%s) uplink(%s) ",
+			i, s_proc_cfg[i].def_nm, s_proc_cfg[i].kernel_nm,
+			s_proc_cfg[i].uplink_nm);
+		for (j = 0; j < s_proc_cfg[i].if_num; j++) {
+			portid = s_proc_cfg[i].port_id[j];
+			ret = rte_eth_dev_get_name_by_port(portid, nm);
+			if (ret)
+				continue;
+			off += sprintf(&info[off], "IF%d(%s<->%s) ",
+				j, s_proc_cfg[i].downlink_nm[j], nm);
+		}
+		if ((i + 1) == s_proc_num)
+			off += sprintf(&info[off], "\r\n");
+	}
+	RTE_LOG(INFO, pre_ld, "%s\n", info);
+	rte_free(info);
+}
+
 static int eal_main(void)
 {
 	int ret;
@@ -3075,12 +3460,11 @@ static int eal_main(void)
 	uint16_t txq_num[RTE_MAX_ETHPORTS];
 	struct rte_eth_conf *port_conf;
 	struct rte_eth_dev_info *dev_info;
-	enum pre_ld_port_type port_type[RTE_MAX_ETHPORTS], type_ret;
+	enum pre_ld_port_type port_type[RTE_MAX_ETHPORTS];
 	size_t eal_argc = 0;
 	char *eal_argv[MAX_ARGV_NUM];
 	char func_nm[64], s_cpu[32], s_cpu_mask[32];
 	char s_file_prefix[32], s_file_prefix_val[32];
-	uint16_t ext_id = 0, ul_id = 0, dl_id = 0, tap_id = 0;
 	uint32_t cpu_mask;
 	pthread_t pid;
 	struct rte_eth_fc_conf fc_conf;
@@ -3152,16 +3536,39 @@ static int eal_main(void)
 			sizeof(s_port_conf));
 	}
 
-	type_ret = pre_ld_set_port_type(port_type, RTE_MAX_ETHPORTS);
+	ret = pre_ld_ls_listni_dump();
+	if (ret) {
+		RTE_LOG(ERR, pre_ld, "ls-listni dump failed(%d)\n", ret);
+	} else {
+		RTE_LOG(INFO, pre_ld, "ls-listni dump created:\n%s\n",
+			s_safe_ls_listni_info);
+	}
+	pre_ld_set_port_type(port_type, RTE_MAX_ETHPORTS);
 
+	pre_ld_ls_listni_clean();
 	RTE_ETH_FOREACH_DEV(portid) {
 		nb_ports_available++;
 		rxq_num[portid] = 0;
 
 		/* init port */
-		RTE_LOG(INFO, pre_ld,
-			"Configuring port%u, type:%d... ",
-			portid, port_type[portid]);
+		RTE_LOG(INFO, pre_ld, "Configuring port%u, type:%d(%s)... ",
+			portid, port_type[portid],
+			port_type[portid] == EXTERNAL_TYPE ?
+			"external" :
+			port_type[portid] == UP_LINK_TYPE ?
+			"up" :
+			port_type[portid] == DOWN_LINK_TYPE ?
+			"down" :
+			port_type[portid] == PROC_DOWN_LINK_TYPE ?
+			"proc down" :
+			port_type[portid] == MUX_DOWN_LINK_TYPE ?
+			"mux down" :
+			port_type[portid] == KERNEL_TAP_TYPE ?
+			"kernel tap" :
+			port_type[portid] == RECYCLE_UP_LINK_TYPE ?
+			"recycle up" :
+			port_type[portid] == RECYCLE_DOWN_LINK_TYPE ?
+			"recycle down" : "unknown");
 
 		ret = rte_eth_dev_info_get(portid, &dev_info[portid]);
 		if (ret) {
@@ -3177,21 +3584,19 @@ static int eal_main(void)
 		}
 
 		if (port_type[portid] == EXTERNAL_TYPE) {
-			ext_id = portid;
 			rxq_num[portid] = 1;
 			txq_num[portid] = 1;
-		} else if (port_type[portid] == UP_LINK_TYPE) {
-			ul_id = portid;
+		} else if (port_type[portid] == UP_LINK_TYPE ||
+			port_type[portid] == RECYCLE_UP_LINK_TYPE) {
 			rxq_num[portid] = dev_info[portid].max_rx_queues;
 			txq_num[portid] = dev_info[portid].max_tx_queues;
-		} else if (port_type[portid] == DOWN_LINK_TYPE) {
-			dl_id = portid;
-			s_rx_port = dl_id;
-			s_tx_port = dl_id;
+		} else if (port_type[portid] == DOWN_LINK_TYPE ||
+			port_type[portid] == PROC_DOWN_LINK_TYPE ||
+			port_type[portid] == MUX_DOWN_LINK_TYPE ||
+			port_type[portid] == RECYCLE_DOWN_LINK_TYPE) {
 			rxq_num[portid] = dev_info[portid].max_rx_queues;
 			txq_num[portid] = dev_info[portid].max_tx_queues;
 		} else if (port_type[portid] == KERNEL_TAP_TYPE) {
-			tap_id = portid;
 			rxq_num[portid] = 1;
 			txq_num[portid] = 1;
 		} else {
@@ -3308,6 +3713,9 @@ static int eal_main(void)
 				 rte_strerror(-ret), portid);
 		}
 
+		if (!rte_pmd_dpaa2_dev_is_dpaa2(portid))
+			continue;
+
 		ret = pre_ld_port_rx_flow_init(portid, &dev_info[portid],
 			rxq_num[portid]);
 		if (ret) {
@@ -3317,25 +3725,57 @@ static int eal_main(void)
 		}
 	}
 
-	if (type_ret == DOWN_LINK_TYPE) {
-		s_fd_mbuf_malloc_direct = 1;
-		pre_ld_configure_split_traffic(dl_id);
-	} else if (type_ret == ALL_TYPE) {
-		s_dir_ports.valid = 1;
-		s_dir_ports.ext_id = ext_id;
-		s_dir_ports.ul_id = ul_id;
-		s_dir_ports.dl_id = dl_id;
-		s_dir_ports.tap_id = tap_id;
+	pre_ld_dump_port_toplogy();
+
+	if (s_dir_ports.ext_num > 0 &&
+		(s_dir_ports.pair_num > 0 ||
+		s_dir_ports.recyc_pair_num > 0) &&
+		s_dir_ports.kif_num > 0) {
+		/** We support single thread/single toplogy only.*/
+		if (s_dir_ports.pair_num > 0) {
+			s_rx_port = s_dir_ports.pair[0].dl_id;
+			s_tx_port = s_dir_ports.pair[0].dl_id;
+		} else {
+			s_rx_port = s_dir_ports.recyc_pair[0].dl_id;
+			s_tx_port = s_dir_ports.recyc_pair[0].ul_id;
+			s_dir_recyc = 1;
+		}
+		s_slow_if = s_dir_ports.kif[0].kernel_nm;
 		ret = rte_eal_mp_remote_launch(pre_ld_main_loop,
 			NULL, SKIP_MAIN);
 		if (ret) {
 			rte_exit(EXIT_FAILURE,
 				"remote launch thread failed!(%d)\n", ret);
 		}
+		while (s_data_path_core < 0) {
+			/** Wait for data path thread running.*/
+			usleep(1);
+		}
 	} else {
-		rte_exit(EXIT_FAILURE,
-			"Invalid port(s) configuration(0x%02x)\n",
-			type_ret);
+		for (i = 0; i < s_mux_num; i++) {
+			if (!s_mux_cfg[i].if_num || !s_mux_cfg[i].kernel_nm)
+				continue;
+			s_rx_port = s_mux_cfg[i].port_id[0];
+			s_tx_port = s_mux_cfg[i].port_id[0];
+			s_slow_if = s_mux_cfg[i].kernel_nm;
+			s_mux_index = i;
+			break;
+		}
+		if (s_mux_index < 0) {
+			for (i = 0; i < s_proc_num; i++) {
+				if (!s_proc_cfg[i].if_num ||
+					!s_proc_cfg[i].kernel_nm)
+					continue;
+				s_rx_port = s_proc_cfg[i].port_id[0];
+				s_tx_port = s_proc_cfg[i].port_id[0];
+				s_slow_if = s_proc_cfg[i].kernel_nm;
+				s_proc_index = i;
+				break;
+			}
+		}
+		if (s_mux_index < 0 && s_proc_index < 0)
+			rte_exit(EXIT_FAILURE, "Port toplogy not supported!\n");
+		s_fd_mbuf_malloc_direct = 1;
 	}
 
 	if (s_statistic_print) {
@@ -3376,11 +3816,9 @@ eal_create_dpaa2_mux_flow(int dpdmux_id,
 		RTE_LOG(ERR, pre_ld,
 			"%s: MUX flow create failed(%d)\n",
 			__func__, ret);
-	} else {
-		s_dpdmux_entry_index = ret;
 	}
 
-	return ret >= 0 ? 0 : ret;
+	return ret;
 }
 
 static int
@@ -3427,12 +3865,13 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 	char config_str[256];
 	int ret, udp_src = 0, udp_dst = 0, offset = 0;
 	struct pre_ld_direct_entry *rx_entry;
-	static int default_created;
 	const char *prot_name;
 	const struct rte_flow_item_udp *udp = NULL;
 	const struct rte_flow_item_udp *mask = NULL;
 	struct pre_ld_port_rx_flow *rx_flow;
 	uint8_t rule[32], rule_size = 0, l3_offset = 0;
+	struct pre_ld_proc_cfg *proc_cfg;
+	struct pre_ld_mux_cfg *mux_cfg;
 
 	if (pattern[0].type == RTE_FLOW_ITEM_TYPE_UDP) {
 		prot_name = "udp";
@@ -3467,29 +3906,38 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 		rte_memcpy(rule, &udp->hdr.src_port, sizeof(rte_be16_t) * 2);
 		rule_size = sizeof(rte_be16_t) * 2;
 		l3_offset = offsetof(struct rte_udp_hdr, src_port);
-	} else {
-		sprintf(config_str,
-			"(%s, %s, %s)",
-			s_uplink, s_downlink, prot_name);
 	}
 
-	if (s_dpdmux_ep_name) {
-		/**dpdmux flow : dpni flow = 1:1*/
-		ret = eal_create_dpaa2_mux_flow(s_dpdmux_id,
-				s_dpdmux_ep_id, pattern);
-		if (ret)
-			return ret;
+	if (s_mux_index < 0)
+		goto skip_mux_flow;
 
-		goto create_local_flow;
+	mux_cfg = &s_mux_cfg[s_mux_index];
+
+	/** Single EP only.*/
+	ret = eal_create_dpaa2_mux_flow(mux_cfg->mux_id,
+			mux_cfg->ep_id[0], pattern);
+	if (ret < 0) {
+		RTE_LOG(ERR, pre_ld,
+			"MUX%d(id=%d).EP%d's flow create failed(%d)\n",
+			s_mux_index, mux_cfg->mux_id, 0, ret);
 	}
+	mux_cfg->entry_id[0] = ret;
 
-	if (!s_uplink || !s_downlink || default_created)
-		goto create_local_flow;
+skip_mux_flow:
+
+	if (s_proc_index < 0)
+		goto skip_proc_flow;
+
+	proc_cfg = &s_proc_cfg[s_proc_index];
+
+	if (proc_cfg->dir_configured[0])
+		goto skip_proc_flow;
 
 	if (udp_src) {
 		offset += sprintf(&config_str[offset],
 			"(%s, %s, %s, src, 0x%04x)",
-			s_uplink, s_downlink, prot_name,
+			proc_cfg->uplink_nm,
+			proc_cfg->downlink_nm[0], prot_name,
 			rte_bswap16(udp->hdr.src_port));
 	}
 
@@ -3498,27 +3946,33 @@ eal_create_flow(int sockfd, struct rte_flow_item pattern[])
 			offset += sprintf(&config_str[offset], ", ");
 		offset += sprintf(&config_str[offset],
 			"(%s, %s, %s, dst, 0x%04x)",
-			s_uplink, s_downlink, prot_name,
+			proc_cfg->uplink_nm,
+			proc_cfg->downlink_nm[0], prot_name,
 			rte_bswap16(udp->hdr.dst_port));
 	}
 
 	if (!udp_src && !udp_dst) {
 		sprintf(config_str,
-			"(%s, %s, %s)",
-			s_uplink, s_downlink, prot_name);
+			"(%s, %s, %s)", proc_cfg->uplink_nm,
+			proc_cfg->downlink_nm[0], prot_name);
+	}
+	proc_cfg->dir_configured[0] = true;
+	ret = rte_remote_direct_parse_config(config_str, 1);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"Remote direct parse: %s failed(%d)\n",
+			config_str, ret);
+		goto skip_proc_flow;
+	}
+	ret = rte_remote_direct_traffic(RTE_REMOTE_DIR_REQ, NULL);
+	if (ret) {
+		RTE_LOG(ERR, pre_ld,
+			"Remote direct request failed(%d)\n", ret);
 	}
 
-	ret = rte_remote_direct_parse_config(config_str, 1);
-	if (ret)
-		return ret;
-	ret = rte_remote_direct_traffic(RTE_REMOTE_DIR_REQ, NULL);
-	if (ret)
-		return ret;
+skip_proc_flow:
 
-	default_created = 1;
-
-create_local_flow:
-	if (s_fd_desc[sockfd].dp_type == FD_DP_DIRECT_TYPE) {
+	if (s_fd_desc[sockfd].access_type == FD_HARDWARE_ACCESS) {
 		rx_flow = s_fd_desc[sockfd].dp_desc.hw_desc.rx_flow;
 	} else {
 		rx_entry = s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry;
@@ -3760,13 +4214,13 @@ usr_socket_fd_desc_init(int sockfd,
 		sizeof(struct pre_ld_port_rx_flow) -
 		offsetof(struct pre_ld_port_rx_flow, cmp_offset_type));
 
-	if (!s_dir_ports.valid) {
-		desc->dp_type = FD_DP_DIRECT_TYPE;
+	if (s_data_path_core < 0) {
+		desc->access_type = FD_HARDWARE_ACCESS;
 		desc->dp_desc.hw_desc.rx_flow = rx_flow;
 		desc->dp_desc.hw_desc.tx_port = tx_port;
 		desc->eal_thread = 1;
 	} else {
-		desc->dp_type = FD_DP_IN_DIRECT_TYPE;
+		desc->access_type = FD_THREAD_ACCESS;
 		list = &s_pre_ld_lists[s_data_path_core];
 		tx_entry = rte_zmalloc(NULL,
 			sizeof(struct pre_ld_direct_entry), 0);
@@ -3929,6 +4383,7 @@ usr_socket_fd_desc_init(int sockfd,
 		if (!tx_pool) {
 			ret = -ENOMEM;
 			RTE_LOG(ERR, pre_ld, "Create %s failed\n", nm);
+			goto fd_init_quit;
 		}
 		rte_mempool_obj_iter(tx_pool, pre_ld_pktmbuf_init, NULL);
 	}
@@ -3937,6 +4392,13 @@ usr_socket_fd_desc_init(int sockfd,
 		desc->tx_pool = tx_pool;
 	} else {
 		desc->tx_pool = NULL;
+		if (desc->access_type != FD_THREAD_ACCESS) {
+			ret = -EINVAL;
+			RTE_LOG(ERR, pre_ld,
+				"FD[%d] needs data path thread to malloc TX buffer\n",
+				sockfd);
+			goto fd_init_quit;
+		}
 		malloc_entry = rte_zmalloc(NULL,
 			sizeof(struct pre_ld_direct_entry), 0);
 		if (!malloc_entry) {
@@ -3998,7 +4460,7 @@ fd_init_quit:
 	if (tx_pool)
 		rte_mempool_free(tx_pool);
 
-	if (!desc || desc->dp_type != FD_DP_IN_DIRECT_TYPE) {
+	if (!desc || desc->access_type != FD_THREAD_ACCESS) {
 		pthread_mutex_unlock(&s_fd_mutex);
 
 		return ret;
@@ -5215,12 +5677,7 @@ __attribute__((destructor)) static void netwrap_main_dtor(void)
 	if (s_fd_desc)
 		free(s_fd_desc);
 	s_fd_desc = NULL;
-	if (s_downlink)
-		rte_free(s_downlink);
-	s_downlink = NULL;
-	if (s_uplink)
-		rte_free(s_uplink);
-	s_uplink = NULL;
+
 	unsetenv(PRE_LOAD_USR_APP_NAME_ENV);
 }
 
@@ -5281,7 +5738,7 @@ __attribute__((constructor(PRE_LD_CONSTRUCTOR_PRIO)))
 static void setup_wrappers(void)
 {
 	char *env;
-	int i, ret;
+	int i, j, ret;
 	pthread_t pid;
 
 	if (!netwrap_is_usr_process())
@@ -5420,6 +5877,18 @@ static void setup_wrappers(void)
 	}
 	for (i = 0; i < MAX_USR_FD_NUM; i++)
 		s_fd_desc[i].fd = INVALID_SOCKFD;
+
+	for (i = 0; i < PRE_LD_MUX_MAX_NUM; i++) {
+		for (j = 0; j < PRE_LD_MUX_MAX_IF_NUM; j++)
+			s_mux_cfg[i].entry_id[j] = -1;
+	}
+
+	for (i = 0; i < PRE_LD_DIR_MAX_IF_NUM; i++) {
+		s_dir_ports.pair[i].ul_id = -1;
+		s_dir_ports.pair[i].dl_id = -1;
+		s_dir_ports.recyc_pair[i].ul_id = -1;
+		s_dir_ports.recyc_pair[i].dl_id = -1;
+	}
 
 	if (PRE_LD_CONSTRUCTOR_PRIO <= RTE_PRIORITY_LAST) {
 		s_in_pre_loading = 0;
