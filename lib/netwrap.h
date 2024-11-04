@@ -54,12 +54,15 @@ union pre_ld_flow_item {
 	struct rte_flow_item_ecpri ecpri_spec;
 };
 
-struct pre_ld_port_rx_flow {
-	int valid;
+struct pre_ld_port_rx_source {
 	uint16_t port_id;
 	uint8_t tc_id;
 	uint16_t flow_id;
 	uint16_t queue_id;
+};
+
+struct pre_ld_port_rx_flow {
+	const struct pre_ld_port_rx_source *src;
 	struct rte_flow *flow;
 	enum rte_flow_item_type type[PRE_LD_FLOW_MAX_ITEM];
 	union pre_ld_flow_item items[PRE_LD_FLOW_MAX_ITEM];
