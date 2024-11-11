@@ -3048,6 +3048,69 @@ pre_ld_pktmbuf_init(struct rte_mempool *mp,
 	m->next = NULL;
 }
 
+enum {
+	PRE_LD_PORT_TRAFFIC_PAUSE = 1,
+	PRE_LD_PORT_TRAFFIC_RESUME_RX = 2,
+	PRE_LD_PORT_TRAFFIC_RESUME_REDIR = 3
+};
+
+struct pre_ld_update_flow_action {
+	int type;
+	union {
+		uint16_t dst_port;
+		uint16_t dst_rxq;
+	};
+};
+
+static int
+pre_ld_port_flow_action_update(uint16_t portid,
+	struct pre_ld_update_flow_action *update)
+{
+	char ext_nm[RTE_ETH_NAME_MAX_LEN];
+	uint16_t i;
+	int ret;
+	struct rte_flow *flow;
+	struct rte_flow_action actions[2];
+	struct rte_flow_action_queue rx_queue;
+	struct rte_flow_action_port_id dst_port;
+
+	ret = rte_eth_dev_get_name_by_port(portid, ext_nm);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < MAX_DEF_DIR_NUM; i++) {
+		if (!strcmp(s_def_dir[i].from_name, ext_nm))
+			break;
+	}
+	if (i == MAX_DEF_DIR_NUM)
+		return -ENXIO;
+
+	flow = s_pre_ld_def_dir.flows[i];
+	if (update->type == PRE_LD_PORT_TRAFFIC_PAUSE) {
+		actions[0].type = RTE_FLOW_ACTION_TYPE_DROP;
+		actions[0].conf = NULL;
+		actions[1].type = RTE_FLOW_ACTION_TYPE_END;
+	} else if (update->type == PRE_LD_PORT_TRAFFIC_RESUME_RX) {
+		rx_queue.index = update->dst_rxq;
+		actions[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+		actions[0].conf = &rx_queue;
+		actions[1].type = RTE_FLOW_ACTION_TYPE_END;
+	} else if (update->type == PRE_LD_PORT_TRAFFIC_RESUME_REDIR) {
+		dst_port.original = 0;
+		dst_port.id = update->dst_port;
+		actions[0].type = RTE_FLOW_ACTION_TYPE_PORT_ID;
+		actions[0].conf = &dst_port;
+		actions[1].type = RTE_FLOW_ACTION_TYPE_END;
+	} else {
+		return -EINVAL;
+	}
+	ret = rte_flow_actions_update(portid, flow, actions, NULL);
+	PRE_LD_LOG(INFO, "Port%d action type(%d) update result(%d)\n",
+		portid, update->type, ret);
+
+	return ret;
+}
+
 static void
 pre_ld_loop_drain_ports(struct pre_ld_lcore_direct_list *list)
 {
@@ -3057,6 +3120,7 @@ pre_ld_loop_drain_ports(struct pre_ld_lcore_direct_list *list)
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint16_t retry;
 	char *env;
+	struct pre_ld_update_flow_action update;
 
 	if (!s_pause_traffic_flow_updating)
 		return;
@@ -3068,11 +3132,11 @@ pre_ld_loop_drain_ports(struct pre_ld_lcore_direct_list *list)
 		retry = PRE_LD_DRAIN_RETRY_TIMES;
 
 	for (i = 0; i < s_dir_ports.ext_num; i++) {
-		/** Down link ext port causes connection lost.*/
-		continue;
-		ret = rte_eth_dev_set_link_down(s_dir_ports.ext_id[i]);
+		update.type = PRE_LD_PORT_TRAFFIC_PAUSE;
+		ret = pre_ld_port_flow_action_update(s_dir_ports.ext_id[i],
+			&update);
 		if (ret) {
-			PRE_LD_LOG(ERR, "DOWN ext port%d failed(%d)\n",
+			PRE_LD_LOG(ERR, "Pause ext port%d failed(%d)\n",
 				s_dir_ports.ext_id[i], ret);
 		}
 	}
@@ -3163,6 +3227,7 @@ pre_ld_loop_up_ports(struct pre_ld_lcore_direct_list *list)
 	int ret;
 	struct pre_ld_direct_entry *entry, *tentry;
 	uint16_t id, i;
+	struct pre_ld_update_flow_action update;
 
 	if (!s_pause_traffic_flow_updating)
 		return;
@@ -3179,11 +3244,12 @@ pre_ld_loop_up_ports(struct pre_ld_lcore_direct_list *list)
 	}
 
 	for (i = 0; i < s_dir_ports.ext_num; i++) {
-		/** Down link ext port causes connection lost.*/
-		continue;
-		ret = rte_eth_dev_set_link_up(s_dir_ports.ext_id[i]);
+		update.type = PRE_LD_PORT_TRAFFIC_RESUME_REDIR;
+		update.dst_port = s_dir_ports.pair[i].ul_id;
+		ret = pre_ld_port_flow_action_update(s_dir_ports.ext_id[i],
+			&update);
 		if (ret) {
-			PRE_LD_LOG(ERR, "UP ext port%d failed(%d)\n",
+			PRE_LD_LOG(ERR, "Resume ext port%d failed(%d)\n",
 				s_dir_ports.ext_id[i], ret);
 		}
 	}
