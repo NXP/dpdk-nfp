@@ -232,6 +232,12 @@ enum pre_ld_crypto_dir {
 	EGRESS_CRYPTO_DQ
 };
 
+struct pre_ld_dev_flow {
+	TAILQ_ENTRY(pre_ld_dev_flow) next;
+	uint16_t portid;
+	struct rte_flow *flow;
+};
+
 static int s_ipsec_ib_flow_ip_addr_extract;
 
 static pthread_mutex_t s_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -241,8 +247,16 @@ TAILQ_HEAD(fd_desc_list, fd_desc);
 static struct fd_desc_list s_fd_desc_list =
 	TAILQ_HEAD_INITIALIZER(s_fd_desc_list);
 
+TAILQ_HEAD(pre_ld_dev_flow_list, pre_ld_dev_flow);
+static struct pre_ld_dev_flow_list s_pre_ld_dev_flow_list =
+	TAILQ_HEAD_INITIALIZER(s_pre_ld_dev_flow_list);
+
+static uint16_t s_tb_dump_port[RTE_MAX_ETHPORTS];
+static uint16_t s_tb_dump_port_num;
+
 static rte_spinlock_t s_fd_list_lock;
 static int s_rte_eal_init_complete;
+static rte_spinlock_t s_dev_flow_list_lock;
 
 #define UDP_HDR_LEN sizeof(struct rte_udp_hdr)
 
@@ -417,9 +431,11 @@ static int s_select_dbg;
 
 static int s_data_verify;
 static int s_data_verify_err_panic;
+static int s_query_flow_err_panic = 1;
 
 static uint16_t s_mempool_cache_size;
 static int s_pause_traffic_flow_updating;
+static int s_flow_table_dump;
 
 struct pre_ld_default_direction {
 	struct rte_remote_dir_req *def_dir;
@@ -491,6 +507,107 @@ pre_ld_log(uint32_t level, uint32_t logtype, const char *format, ...)
 	va_end(ap);
 
 	pthread_mutex_unlock(&s_log_mutex);
+}
+
+static inline int
+pre_ld_dev_flow_list_add(uint16_t portid, struct rte_flow *flow)
+{
+	struct pre_ld_dev_flow *dev_flow;
+
+	dev_flow = rte_zmalloc(NULL,
+		sizeof(struct pre_ld_dev_flow), 0);
+	if (!dev_flow)
+		return -ENOMEM;
+	dev_flow->portid = portid;
+	dev_flow->flow = flow;
+	rte_spinlock_lock(&s_dev_flow_list_lock);
+	TAILQ_INSERT_TAIL(&s_pre_ld_dev_flow_list, dev_flow, next);
+	rte_spinlock_unlock(&s_dev_flow_list_lock);
+
+	return 0;
+}
+
+static inline int
+pre_ld_dev_flow_list_remove(struct rte_flow *flow)
+{
+	struct pre_ld_dev_flow *dev_flow, *tdev_flow;
+	int found = 0;
+
+	rte_spinlock_lock(&s_dev_flow_list_lock);
+	RTE_TAILQ_FOREACH_SAFE(dev_flow, &s_pre_ld_dev_flow_list, next,
+		tdev_flow) {
+		if (dev_flow->flow == flow) {
+			found = 1;
+			break;
+		}
+	}
+	if (found) {
+		TAILQ_REMOVE(&s_pre_ld_dev_flow_list,
+			dev_flow, next);
+	}
+	rte_spinlock_unlock(&s_dev_flow_list_lock);
+
+	if (found)
+		return 0;
+
+	return -ENXIO;
+}
+
+static inline int
+pre_ld_dev_flow_query_all(void)
+{
+	struct pre_ld_dev_flow *dev_flow, *tdev_flow;
+	int ret, ret1, err = 0;
+	char nm[RTE_ETH_NAME_MAX_LEN];
+
+	if (!s_flow_table_dump)
+		return 0;
+
+	rte_spinlock_lock(&s_dev_flow_list_lock);
+	RTE_TAILQ_FOREACH_SAFE(dev_flow, &s_pre_ld_dev_flow_list, next,
+		tdev_flow) {
+		ret = rte_flow_query(dev_flow->portid, dev_flow->flow,
+			NULL, NULL, NULL);
+		if (ret) {
+			ret1 = rte_eth_dev_get_name_by_port(dev_flow->portid,
+				nm);
+			RTE_SET_USED(ret1);
+			PRE_LD_LOG(ERR, "Query port%d(%s)'s flow failed(%d)\n",
+				dev_flow->portid, nm, ret);
+			err = ret;
+		}
+	}
+	rte_spinlock_unlock(&s_dev_flow_list_lock);
+
+	return err;
+}
+
+static inline int
+pre_ld_dev_flow_table_query_all(const char *str)
+{
+	int i, ret, ret1, err = 0;
+	char nm[RTE_ETH_NAME_MAX_LEN];
+
+	if (!s_flow_table_dump)
+		return 0;
+
+	if (str)
+		PRE_LD_LOG(INFO, "Query flow table %s\n", str);
+
+	for (i = 0; i < s_tb_dump_port_num; i++) {
+		ret = rte_pmd_dpaa2_flow_table_query(s_tb_dump_port[i]);
+		if (ret) {
+			ret1 = rte_eth_dev_get_name_by_port(s_tb_dump_port[i],
+				nm);
+			RTE_SET_USED(ret1);
+			PRE_LD_LOG(ERR,
+				"Query port%d(%s)'s flow table failed(%d)\n",
+				s_tb_dump_port[i], nm, ret);
+			err = ret;
+		}
+	}
+
+	return err;
 }
 
 static struct pre_ld_ring *
@@ -816,7 +933,7 @@ convert_ip_addr_to_str(char *str,
 		}
 		str[idx] = 0;
 	} else {
-		PRE_LD_LOG(ERR, "Invalid IP address length(%d)", len);
+		PRE_LD_LOG(ERR, "Invalid IP address length(%d)\n", len);
 		return -EINVAL;
 	}
 
@@ -905,8 +1022,10 @@ pre_ld_rx_flow_verify_set(struct pre_ld_port_rx_flow *rx_flow,
 static int
 pre_ld_flow_destroy(uint16_t port, struct rte_flow *flow)
 {
-	int ret, times = PRE_LD_FLOW_DESTROY_TRY_TIMES;
+	int ret, ret1, times = PRE_LD_FLOW_DESTROY_TRY_TIMES, err = 0;
 
+	err |= pre_ld_dev_flow_table_query_all("Before destroy flow");
+	err |= pre_ld_dev_flow_query_all();
 again:
 	ret = rte_flow_destroy(port, flow, NULL);
 	if (ret) {
@@ -917,6 +1036,19 @@ again:
 		times--;
 		goto again;
 	}
+	if (!ret) {
+		ret1 = pre_ld_dev_flow_list_remove(flow);
+		if (ret1) {
+			PRE_LD_LOG(ERR,
+				"%s: Remove flow from list failed(%d)\n",
+				__func__, ret1);
+		}
+	}
+	err |= pre_ld_dev_flow_table_query_all("After destroy flow");
+	err |= pre_ld_dev_flow_query_all();
+
+	if (err && s_query_flow_err_panic)
+		rte_panic("Err flow in %s!\n", __func__);
 
 	return ret;
 }
@@ -1247,7 +1379,7 @@ static void eal_quit(void)
 			ret = pre_ld_update_dir_list_safe(entry,
 				REMOVE_ENTRY_REQ);
 			if (ret) {
-				PRE_LD_LOG(ERR, "%s: Remove entry failed(%d)",
+				PRE_LD_LOG(ERR, "%s: Remove entry failed(%d)\n",
 					__func__, ret);
 				if (ret == (-EBUSY) &&
 					entry->poll_type == RX_QUEUE &&
@@ -2534,7 +2666,7 @@ failure_return:
 			REMOVE_ENTRY_REQ);
 		if (ret) {
 			PRE_LD_LOG(ERR,
-				"%s line %d: Recover SEC eq entry failed(%d)",
+				"%s line %d: Recover SEC eq entry failed(%d)\n",
 				__func__, __LINE__, ret);
 		}
 	}
@@ -2543,7 +2675,7 @@ failure_return:
 			REMOVE_ENTRY_REQ);
 		if (ret) {
 			PRE_LD_LOG(ERR,
-				"%s line %d: Recover SEC dq entry failed(%d)",
+				"%s line %d: Recover SEC dq entry failed(%d)\n",
 				__func__, __LINE__, ret);
 		}
 	}
@@ -2559,7 +2691,7 @@ failure_return:
 			crypt_qid);
 		if (ret) {
 			PRE_LD_LOG(ERR,
-				"%s: Recover Crypto%d's queue%d failed(%d)",
+				"%s: Recover Crypto%d's queue%d failed(%d)\n",
 				__func__, sp->crypt_id, *crypt_qid, ret);
 		}
 	}
@@ -2568,7 +2700,7 @@ failure_return:
 			rx_flow);
 		if (ret) {
 			PRE_LD_LOG(ERR,
-				"%s: Recover port%d's rx flow failed(%d)",
+				"%s: Recover port%d's rx flow failed(%d)\n",
 				__func__, rx_port, ret);
 		}
 	}
@@ -3066,7 +3198,7 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	struct rte_flow_action flow_action[2];
 	struct rte_flow_action_queue rxq;
 	union pre_ld_flow_item zero_mask;
-	int i = 0, ret;
+	int i = 0, ret, err = 0;
 
 	memset(&zero_mask, 0, sizeof(union pre_ld_flow_item));
 
@@ -3103,16 +3235,29 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	ret = rte_flow_validate(rx_flow->src->port_id, &flow_attr,
 		flow_item, flow_action, NULL);
 	if (ret) {
-		PRE_LD_LOG(ERR, "%s: flow validate failed(%d)", __func__, ret);
+		PRE_LD_LOG(ERR, "%s: flow validate failed(%d)\n",
+			__func__, ret);
 		return ret;
 	}
+	err |= pre_ld_dev_flow_table_query_all("Before update/create flow");
+	err |= pre_ld_dev_flow_query_all();
 	rx_flow->flow = rte_flow_create(rx_flow->src->port_id, &flow_attr,
 		flow_item, flow_action, NULL);
 	if (!rx_flow->flow) {
-		PRE_LD_LOG(ERR, "%s: flow create failed", __func__);
+		PRE_LD_LOG(ERR, "%s: flow create failed\n", __func__);
 
 		return -EIO;
 	}
+	ret = pre_ld_dev_flow_list_add(rx_flow->src->port_id,
+		rx_flow->flow);
+	if (ret) {
+		PRE_LD_LOG(ERR, "%s: Add flow to list failed(%d)\n",
+			__func__, ret);
+	}
+	err |= pre_ld_dev_flow_table_query_all("After update/create flow");
+	err |= pre_ld_dev_flow_query_all();
+	if (err && s_query_flow_err_panic)
+		rte_panic("Err flow in %s!\n", __func__);
 
 	return 0;
 }
@@ -4032,6 +4177,7 @@ static int eal_main(void)
 	s_main_td = pthread_self();
 
 	rte_spinlock_init(&s_fd_list_lock);
+	rte_spinlock_init(&s_dev_flow_list_lock);
 
 	PRE_LD_LOG(INFO, "Main core%d, current core%d, CPU mask is 0x%08x\n",
 		rte_get_main_lcore(), sched_getcpu(),
@@ -4125,12 +4271,16 @@ static int eal_main(void)
 			port_type[portid] == RECYCLE_UP_LINK_TYPE) {
 			rxq_num[portid] = dev_info[portid].max_rx_queues;
 			txq_num[portid] = dev_info[portid].max_tx_queues;
+			s_tb_dump_port[s_tb_dump_port_num] = portid;
+			s_tb_dump_port_num++;
 		} else if (port_type[portid] == DOWN_LINK_TYPE ||
 			port_type[portid] == PROC_DOWN_LINK_TYPE ||
 			port_type[portid] == MUX_DOWN_LINK_TYPE ||
 			port_type[portid] == RECYCLE_DOWN_LINK_TYPE) {
 			rxq_num[portid] = dev_info[portid].max_rx_queues;
 			txq_num[portid] = dev_info[portid].max_tx_queues;
+			s_tb_dump_port[s_tb_dump_port_num] = portid;
+			s_tb_dump_port_num++;
 		} else if (port_type[portid] == KERNEL_TAP_TYPE) {
 			rxq_num[portid] = 1;
 			txq_num[portid] = 1;
@@ -4362,7 +4512,7 @@ eal_create_local_flow(int sockfd)
 	struct rte_flow_action flow_action[2];
 	struct rte_flow_item pattern[PRE_LD_FLOW_MAX_ITEM];
 	struct rte_flow_attr attr;
-	int i = 0;
+	int i = 0, ret, err = 0;
 	struct pre_ld_port_rx_flow *rx_flow;
 	struct pre_ld_direct_entry *entry;
 
@@ -4397,12 +4547,25 @@ eal_create_local_flow(int sockfd)
 	attr.ingress = 1;
 	attr.egress = 0;
 
+	err |= pre_ld_dev_flow_table_query_all("Before create local flow");
+	err |= pre_ld_dev_flow_query_all();
 	rx_flow->flow = rte_flow_create(rx_flow->src->port_id, &attr,
 		pattern, flow_action, NULL);
 	if (!rx_flow->flow) {
 		PRE_LD_LOG(ERR, "%s: flow create failed\n", __func__);
 		return -EIO;
 	}
+	ret = pre_ld_dev_flow_list_add(rx_flow->src->port_id,
+		rx_flow->flow);
+	if (ret) {
+		PRE_LD_LOG(ERR, "%s: Add flow to list failed(%d)\n",
+			__func__, ret);
+	}
+	err |= pre_ld_dev_flow_table_query_all("After create local flow");
+	err |= pre_ld_dev_flow_query_all();
+
+	if (err && s_query_flow_err_panic)
+		rte_panic("Err flow in %s!\n", __func__);
 
 	return 0;
 }
@@ -5276,10 +5439,8 @@ socket(int domain, int type, int protocol)
 
 			return sockfd;
 		}
-		if (!netwrap_is_usr_process())
-			return sockfd;
-		if (s_in_pre_loading)
-			return sockfd;
+		if (!netwrap_is_usr_process() || s_in_pre_loading)
+			goto quit;
 
 		ret = eal_init(domain, type);
 		if (ret > 0 && (type & SOCK_TYPE_MASK) == SOCK_DGRAM) {
@@ -5296,6 +5457,7 @@ socket(int domain, int type, int protocol)
 		}
 	}
 
+quit:
 	PRE_LD_LOG(INFO,
 		"Socket FD(%d) created, domain=%d, type=%d, protocol=%d\n",
 		sockfd, domain, type, protocol);
@@ -6465,6 +6627,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_PAUSE_TRAFFIC_FLOW_UPDATING");
 	if (env)
 		s_pause_traffic_flow_updating = atoi(env);
+
+	env = getenv("PRE_LOAD_FLOW_TABLE_DUMP");
+	if (env)
+		s_flow_table_dump = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
