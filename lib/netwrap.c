@@ -86,6 +86,7 @@ static int s_in_pre_loading;
 static int s_eal_inited;
 static pthread_mutex_t s_eal_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t s_dp_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_update_dir_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint16_t s_cpu_start = 1;
 #define SYS_CORE_ID 0
@@ -704,7 +705,7 @@ pre_ld_update_dir_list_safe(struct pre_ld_direct_entry *dir,
 {
 	struct pre_ld_dir_entry_update_msg req, *rsp;
 	struct rte_ring *req_r, *rsp_r;
-	int ret, timeout = PRE_LD_DIR_UPDATE_TIME_OUT;
+	int ret = 0, timeout = PRE_LD_DIR_UPDATE_TIME_OUT;
 
 	if (s_data_path_core < 0)
 		return -EACCES;
@@ -715,13 +716,17 @@ pre_ld_update_dir_list_safe(struct pre_ld_direct_entry *dir,
 	req.msg_type = type;
 	req.dir = dir;
 
+	pthread_mutex_lock(&s_update_dir_mutex);
+
 req_again:
 	ret = rte_ring_enqueue(req_r, &req);
 	if (ret) {
 		usleep(PRE_LD_DIR_UPDATE_WAIT_INTERVAL);
 		timeout -= PRE_LD_DIR_UPDATE_WAIT_INTERVAL;
-		if (timeout < 0)
-			return -EBUSY;
+		if (timeout < 0) {
+			ret = -EBUSY;
+			goto quit;
+		}
 		goto req_again;
 	}
 
@@ -731,22 +736,28 @@ rsp_again:
 	if (ret) {
 		usleep(PRE_LD_DIR_UPDATE_WAIT_INTERVAL);
 		timeout -= PRE_LD_DIR_UPDATE_WAIT_INTERVAL;
-		if (timeout < 0)
-			return -EBUSY;
+		if (timeout < 0) {
+			ret = -EBUSY;
+			goto quit;
+		}
 		goto rsp_again;
 	}
 	if (rsp != &req) {
 		PRE_LD_LOG(ERR, "%s: response(%p) != request(%p)\n",
 			__func__, rsp, &req);
-		return -EIO;
+		ret = -EIO;
+		goto quit;
 	}
 	if (rsp->msg_type != UPDATE_ENTRY_SUCCESS_RSP) {
 		PRE_LD_LOG(ERR, "%s: Get failed or un-expected response(%d)\n",
 			__func__, rsp->msg_type);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto quit;
 	}
+quit:
+	pthread_mutex_unlock(&s_update_dir_mutex);
 
-	return 0;
+	return ret;
 }
 
 static void
