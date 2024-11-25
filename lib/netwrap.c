@@ -235,8 +235,7 @@ enum pre_ld_crypto_dir {
 
 struct pre_ld_dev_flow {
 	TAILQ_ENTRY(pre_ld_dev_flow) next;
-	uint16_t portid;
-	struct rte_flow *flow;
+	struct pre_ld_port_rx_flow *rx_flow;
 };
 
 static int s_ipsec_ib_flow_ip_addr_extract;
@@ -513,7 +512,7 @@ pre_ld_log(uint32_t level, uint32_t logtype, const char *format, ...)
 }
 
 static inline int
-pre_ld_dev_flow_list_add(uint16_t portid, struct rte_flow *flow)
+pre_ld_dev_flow_list_add(struct pre_ld_port_rx_flow *rx_flow)
 {
 	struct pre_ld_dev_flow *dev_flow;
 
@@ -521,8 +520,8 @@ pre_ld_dev_flow_list_add(uint16_t portid, struct rte_flow *flow)
 		sizeof(struct pre_ld_dev_flow), 0);
 	if (!dev_flow)
 		return -ENOMEM;
-	dev_flow->portid = portid;
-	dev_flow->flow = flow;
+	dev_flow->rx_flow = rx_flow;
+	rx_flow->ref++;
 	rte_spinlock_lock(&s_dev_flow_list_lock);
 	TAILQ_INSERT_TAIL(&s_pre_ld_dev_flow_list, dev_flow, next);
 	rte_spinlock_unlock(&s_dev_flow_list_lock);
@@ -531,7 +530,7 @@ pre_ld_dev_flow_list_add(uint16_t portid, struct rte_flow *flow)
 }
 
 static inline int
-pre_ld_dev_flow_list_remove(struct rte_flow *flow)
+pre_ld_dev_flow_list_remove(struct pre_ld_port_rx_flow *rx_flow)
 {
 	struct pre_ld_dev_flow *dev_flow, *tdev_flow;
 	int found = 0;
@@ -539,7 +538,7 @@ pre_ld_dev_flow_list_remove(struct rte_flow *flow)
 	rte_spinlock_lock(&s_dev_flow_list_lock);
 	RTE_TAILQ_FOREACH_SAFE(dev_flow, &s_pre_ld_dev_flow_list, next,
 		tdev_flow) {
-		if (dev_flow->flow == flow) {
+		if (dev_flow->rx_flow == rx_flow) {
 			found = 1;
 			break;
 		}
@@ -547,6 +546,7 @@ pre_ld_dev_flow_list_remove(struct rte_flow *flow)
 	if (found) {
 		TAILQ_REMOVE(&s_pre_ld_dev_flow_list,
 			dev_flow, next);
+		rte_free(dev_flow);
 	}
 	rte_spinlock_unlock(&s_dev_flow_list_lock);
 
@@ -556,12 +556,35 @@ pre_ld_dev_flow_list_remove(struct rte_flow *flow)
 	return -ENXIO;
 }
 
+static inline struct pre_ld_port_rx_flow *
+pre_ld_dev_flow_find_rx_flow(uint16_t portid,
+	const struct pre_ld_port_rx_flow_pattern *flow_pattern)
+{
+	struct pre_ld_dev_flow *dev_flow, *tdev_flow;
+	struct pre_ld_port_rx_flow *rx_flow = NULL;
+
+	rte_spinlock_lock(&s_dev_flow_list_lock);
+	RTE_TAILQ_FOREACH_SAFE(dev_flow, &s_pre_ld_dev_flow_list, next,
+		tdev_flow) {
+		if (dev_flow->rx_flow->src->port_id == portid &&
+			!memcmp(&dev_flow->rx_flow->flow_pattern,
+				flow_pattern,
+				sizeof(struct pre_ld_port_rx_flow_pattern))) {
+			rx_flow = dev_flow->rx_flow;
+			break;
+		}
+	}
+	rte_spinlock_unlock(&s_dev_flow_list_lock);
+	return rx_flow;
+}
+
 static inline int
 pre_ld_dev_flow_query_all(void)
 {
 	struct pre_ld_dev_flow *dev_flow, *tdev_flow;
 	int ret, ret1, err = 0;
 	char nm[RTE_ETH_NAME_MAX_LEN];
+	uint16_t port_id;
 
 	if (!s_flow_table_dump)
 		return 0;
@@ -569,14 +592,14 @@ pre_ld_dev_flow_query_all(void)
 	rte_spinlock_lock(&s_dev_flow_list_lock);
 	RTE_TAILQ_FOREACH_SAFE(dev_flow, &s_pre_ld_dev_flow_list, next,
 		tdev_flow) {
-		ret = rte_flow_query(dev_flow->portid, dev_flow->flow,
+		port_id = dev_flow->rx_flow->src->port_id;
+		ret = rte_flow_query(port_id, dev_flow->rx_flow->flow,
 			NULL, NULL, NULL);
 		if (ret) {
-			ret1 = rte_eth_dev_get_name_by_port(dev_flow->portid,
-				nm);
+			ret1 = rte_eth_dev_get_name_by_port(port_id, nm);
 			RTE_SET_USED(ret1);
 			PRE_LD_LOG(ERR, "Query port%d(%s)'s flow failed(%d)\n",
-				dev_flow->portid, nm, ret);
+				port_id, nm, ret);
 			err = ret;
 		}
 	}
@@ -642,6 +665,9 @@ pre_ld_ring_create(const char *name, uint16_t size)
 	_r->pre_ld_tail = 0;
 	_r->pre_ld_size = size;
 
+	rte_spinlock_init(&_r->eq_lock);
+	rte_spinlock_init(&_r->dq_lock);
+
 	return _r;
 }
 
@@ -657,6 +683,8 @@ pre_ld_ring_eq(struct pre_ld_ring *plr, void **elem, uint16_t num)
 {
 	uint16_t idx = 0, pos;
 
+	rte_spinlock_lock(&plr->eq_lock);
+
 	pos = plr->pre_ld_tail;
 	while (((pos + 1) & (plr->pre_ld_size - 1)) !=
 		plr->pre_ld_head) {
@@ -668,6 +696,7 @@ pre_ld_ring_eq(struct pre_ld_ring *plr, void **elem, uint16_t num)
 	}
 	rte_io_wmb();
 	plr->pre_ld_tail = pos;
+	rte_spinlock_unlock(&plr->eq_lock);
 
 	return idx;
 }
@@ -677,6 +706,7 @@ pre_ld_ring_dq(struct pre_ld_ring *plr, void **elem, uint16_t num)
 {
 	uint16_t idx = 0, pos;
 
+	rte_spinlock_lock(&plr->dq_lock);
 	pos = plr->pre_ld_head;
 	while (plr->pre_ld_tail != pos) {
 		if (unlikely(idx == num))
@@ -688,6 +718,7 @@ pre_ld_ring_dq(struct pre_ld_ring *plr, void **elem, uint16_t num)
 	rte_io_wmb();
 	rte_io_rmb();
 	plr->pre_ld_head = pos;
+	rte_spinlock_unlock(&plr->dq_lock);
 
 	return idx;
 }
@@ -1051,9 +1082,20 @@ pre_ld_rx_flow_verify_set(struct pre_ld_port_rx_flow *rx_flow,
 }
 
 static int
-pre_ld_flow_destroy(uint16_t port, struct rte_flow *flow)
+pre_ld_flow_destroy(uint16_t port,
+	struct pre_ld_port_rx_flow *rx_flow)
 {
 	int ret, ret1, times = PRE_LD_FLOW_DESTROY_TRY_TIMES, err = 0;
+	struct rte_flow *flow = rx_flow->flow;
+
+	rte_spinlock_lock(&rx_flow->flow_lock);
+
+	rx_flow->ref--;
+	if (rx_flow->ref > 0) {
+		rte_spinlock_unlock(&rx_flow->flow_lock);
+
+		return 0;
+	}
 
 	err |= pre_ld_dev_flow_table_query_all("Before destroy flow");
 	err |= pre_ld_dev_flow_query_all();
@@ -1068,7 +1110,7 @@ again:
 		goto again;
 	}
 	if (!ret) {
-		ret1 = pre_ld_dev_flow_list_remove(flow);
+		ret1 = pre_ld_dev_flow_list_remove(rx_flow);
 		if (ret1) {
 			PRE_LD_LOG(ERR,
 				"%s: Remove flow from list failed(%d)\n",
@@ -1080,6 +1122,8 @@ again:
 
 	if (err && s_query_flow_err_panic)
 		rte_panic("Err flow in %s!\n", __func__);
+
+	rte_spinlock_unlock(&rx_flow->flow_lock);
 
 	return ret;
 }
@@ -1152,7 +1196,7 @@ static int
 usr_socket_fd_release(int sockfd)
 {
 	int ret = 0, i;
-	uint16_t rx_port;
+	uint16_t rx_port = 0;
 	struct pre_ld_rx_pool *rx_pool;
 	struct rte_ring *tx_ring = NULL, *rx_ring = NULL;
 	struct rte_ring *malloc_ring = NULL, *free_ring = NULL;
@@ -1168,6 +1212,7 @@ usr_socket_fd_release(int sockfd)
 	struct pre_ld_direct_entry *free_entry = NULL;
 	struct pre_ld_direct_entry *malloc_entry = NULL;
 	struct rte_mempool *malloc_pool = NULL;
+	uint16_t port;
 
 	pthread_mutex_lock(&s_fd_mutex);
 
@@ -1194,12 +1239,14 @@ usr_socket_fd_release(int sockfd)
 		rx_entry = desc->dp_desc.entry_desc.rx_entry;
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
 		free_entry = desc->dp_desc.entry_desc.free_entry;
-		rx_flow = rx_entry->poll.rx_flow;
-		rx_port = rx_flow->src->port_id;
-		if (rx_entry && rx_entry->dest_type == RX_RING)
-			rx_ring = rx_entry->dest.rx_ring;
-		else if (rx_entry)
-			pre_ld_rx_ring = rx_entry->dest.pre_ld_rx_ring;
+		if (rx_entry) {
+			rx_flow = rx_entry->poll.rx_flow;
+			rx_port = rx_flow->src->port_id;
+			if (rx_entry->dest_type == RX_RING)
+				rx_ring = rx_entry->dest.rx_ring;
+			else
+				pre_ld_rx_ring = rx_entry->dest.pre_ld_rx_ring;
+		}
 		if (tx_entry && tx_entry->poll_type == TX_RING)
 			tx_ring = tx_entry->poll.tx_ring;
 		else if (tx_entry)
@@ -1223,7 +1270,7 @@ usr_socket_fd_release(int sockfd)
 				__func__, sockfd, ret);
 		}
 		if (ret == (-EBUSY) && rx_flow && rx_flow->flow) {
-			ret = pre_ld_flow_destroy(rx_port, rx_flow->flow);
+			ret = pre_ld_flow_destroy(rx_port, rx_flow);
 			if (ret) {
 				PRE_LD_LOG(ERR,
 					"%s line %d: destroy FD[%d]'s flow failed(%d)\n",
@@ -1231,13 +1278,27 @@ usr_socket_fd_release(int sockfd)
 			}
 		}
 	}
-	if (rx_entry && rx_entry->poll_prefix)
-		rte_free(rx_entry->poll_prefix);
-	if (rx_entry && rx_entry->action_prefix)
-		rte_free(rx_entry->action_prefix);
-	if (rx_entry) {
-		rte_free(rx_entry);
-		desc->dp_desc.entry_desc.rx_entry = NULL;
+	if (rx_flow && !rx_flow->ref) {
+		port = rx_flow->src->port_id;
+		if (rx_entry && rx_entry->poll_prefix)
+			rte_free(rx_entry->poll_prefix);
+		if (rx_entry && rx_entry->action_prefix)
+			rte_free(rx_entry->action_prefix);
+		if (rx_entry) {
+			rte_free(rx_entry);
+			desc->dp_desc.entry_desc.rx_entry = NULL;
+		}
+		ret = rte_ring_enqueue(s_port_flow_r[port], rx_flow);
+		if (ret) {
+			PRE_LD_LOG(ERR,
+				"%s release port[%d]'s RX flow failed(%d)\n",
+				__func__, port, ret);
+		}
+		if (pre_ld_rx_ring)
+			pre_ld_ring_free(pre_ld_rx_ring);
+
+		if (rx_ring)
+			rte_ring_free(rx_ring);
 	}
 
 	if (tx_entry) {
@@ -1286,27 +1347,23 @@ usr_socket_fd_release(int sockfd)
 		desc->dp_desc.entry_desc.malloc_entry = NULL;
 	}
 
-	if (desc->access_type == FD_HARDWARE_ACCESS) {
-		ret = pre_ld_flow_destroy(rx_port, rx_flow->flow);
+	if (desc->access_type == FD_HARDWARE_ACCESS && rx_flow) {
+		port = rx_flow->src->port_id;
+		ret = pre_ld_flow_destroy(rx_port, rx_flow);
 		if (ret) {
 			PRE_LD_LOG(ERR,
 				"%s destroy FD[%d]'s rte flow failed(%d)\n",
 				__func__, sockfd, ret);
 		}
-		rx_flow->flow = NULL;
+		if (!rx_flow->ref) {
+			ret = rte_ring_enqueue(s_port_flow_r[port], rx_flow);
+			if (ret) {
+				PRE_LD_LOG(ERR,
+					"%s release port[%d]'s RX flow failed(%d)\n",
+					__func__, port, ret);
+			}
+		}
 	}
-
-	ret = rte_ring_enqueue(s_port_flow_r[rx_port], rx_flow);
-	if (ret) {
-		PRE_LD_LOG(ERR, "%s release FD[%d]'s RX flow failed(%d)\n",
-			__func__, sockfd, ret);
-	}
-
-	if (pre_ld_rx_ring)
-		pre_ld_ring_free(pre_ld_rx_ring);
-
-	if (rx_ring)
-		rte_ring_free(rx_ring);
 
 	if (pre_ld_tx_ring)
 		pre_ld_ring_free(pre_ld_tx_ring);
@@ -1418,7 +1475,7 @@ static void eal_quit(void)
 					entry->poll.rx_flow->flow) {
 					src = entry->poll.rx_flow->src;
 					ret = pre_ld_flow_destroy(src->port_id,
-						entry->poll.rx_flow->flow);
+						entry->poll.rx_flow);
 					if (ret) {
 						PRE_LD_LOG(ERR,
 							"%s: remove flow failed(%d)\n",
@@ -2041,7 +2098,7 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 			__func__, ret);
 		if (ret == (-EBUSY) && entry_to_sec->poll.rx_flow->flow) {
 			ret = pre_ld_flow_destroy(rx_port,
-				entry_to_sec->poll.rx_flow->flow);
+				entry_to_sec->poll.rx_flow);
 			if (ret) {
 				PRE_LD_LOG(ERR,
 					"%s line %d: remove flow -> SEC failed(%d)\n",
@@ -2553,6 +2610,7 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	uint16_t rx_port, tx_port;
 	enum pre_ld_dir_poll_type poll_type;
 	enum pre_ld_dir_dest_type dest_type;
+	struct pre_ld_port_rx_flow_pattern *pattern;
 
 	if (s_data_path_core < 0) {
 		rte_exit(EXIT_FAILURE,
@@ -2593,52 +2651,53 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	memset(&rx_flow->flow, 0,
 		sizeof(struct pre_ld_port_rx_flow) -
 		offsetof(struct pre_ld_port_rx_flow, flow));
+	pattern = &rx_flow->flow_pattern;
 
 	if (sp->family == AF_INET &&
 		(sp->dir == XFRM_POLICY_OUT ||
 		s_ipsec_ib_flow_ip_addr_extract)) {
-		rx_flow->type[idx] = RTE_FLOW_ITEM_TYPE_IPV4;
-		rte_memcpy(&rx_flow->items[idx].ipv4_spec.hdr.src_addr,
+		pattern->type[idx] = RTE_FLOW_ITEM_TYPE_IPV4;
+		rte_memcpy(&pattern->items[idx].ipv4_spec.hdr.src_addr,
 			&sp->src, sizeof(rte_be32_t));
-		rte_memcpy(&rx_flow->items[idx].ipv4_spec.hdr.dst_addr,
+		rte_memcpy(&pattern->items[idx].ipv4_spec.hdr.dst_addr,
 			&sp->dst, sizeof(rte_be32_t));
-		rx_flow->masks[idx].ipv4_spec.hdr.src_addr = 0xffffffff;
-		rx_flow->masks[idx].ipv4_spec.hdr.dst_addr = 0xffffffff;
+		pattern->masks[idx].ipv4_spec.hdr.src_addr = 0xffffffff;
+		pattern->masks[idx].ipv4_spec.hdr.dst_addr = 0xffffffff;
 
-		cmp_data = (void *)&rx_flow->items[idx].ipv4_spec.hdr.src_addr;
+		cmp_data = (void *)&pattern->items[idx].ipv4_spec.hdr.src_addr;
 		offset = offsetof(struct rte_ipv4_hdr, src_addr);
 		size = sizeof(rte_be32_t) * 2;
 		idx++;
 	} else if (sp->family == AF_INET6 &&
 		(sp->dir == XFRM_POLICY_OUT ||
 		s_ipsec_ib_flow_ip_addr_extract)) {
-		rx_flow->type[idx] = RTE_FLOW_ITEM_TYPE_IPV6;
-		rte_memcpy(&rx_flow->items[idx].ipv6_spec.hdr.src_addr,
+		pattern->type[idx] = RTE_FLOW_ITEM_TYPE_IPV6;
+		rte_memcpy(&pattern->items[idx].ipv6_spec.hdr.src_addr,
 			&sp->src, 16);
-		rte_memcpy(&rx_flow->items[idx].ipv6_spec.hdr.dst_addr,
+		rte_memcpy(&pattern->items[idx].ipv6_spec.hdr.dst_addr,
 			&sp->dst, 16);
-		memset(&rx_flow->masks[idx].ipv6_spec.hdr.src_addr,
+		memset(&pattern->masks[idx].ipv6_spec.hdr.src_addr,
 			0xff, 16);
-		memset(&rx_flow->masks[idx].ipv6_spec.hdr.dst_addr,
+		memset(&pattern->masks[idx].ipv6_spec.hdr.dst_addr,
 			0xff, 16);
 
-		cmp_data = rx_flow->items[idx].ipv6_spec.hdr.src_addr;
+		cmp_data = pattern->items[idx].ipv6_spec.hdr.src_addr;
 		offset = offsetof(struct rte_ipv6_hdr, src_addr);
 		size = 16 * 2;
 		idx++;
 	}
 
 	if (sp->dir == XFRM_POLICY_IN) {
-		rx_flow->type[idx] = RTE_FLOW_ITEM_TYPE_ESP;
-		rx_flow->items[idx].esp_spec.hdr.spi = spi;
-		rx_flow->masks[idx].esp_spec.hdr.spi = 0xffffffff;
+		pattern->type[idx] = RTE_FLOW_ITEM_TYPE_ESP;
+		pattern->items[idx].esp_spec.hdr.spi = spi;
+		pattern->masks[idx].esp_spec.hdr.spi = 0xffffffff;
 
 		offset = sp->family == AF_INET ?
 			sizeof(struct rte_ipv4_hdr) :
 			sizeof(struct rte_ipv6_hdr);
 		offset += offsetof(struct rte_esp_hdr, spi);
 		size = sizeof(rte_be32_t);
-		cmp_data = (void *)&rx_flow->items[idx].esp_spec.hdr.spi;
+		cmp_data = (void *)&pattern->items[idx].esp_spec.hdr.spi;
 		idx++;
 	}
 	if (!idx) {
@@ -2648,7 +2707,7 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 		goto failure_return;
 	}
 
-	rx_flow->type[idx] = RTE_FLOW_ITEM_TYPE_END;
+	pattern->type[idx] = RTE_FLOW_ITEM_TYPE_END;
 
 	pre_ld_rx_flow_verify_set(rx_flow,
 		PRE_LD_CMP_L3_OFFSET, offset, size, cmp_data);
@@ -2905,9 +2964,10 @@ pre_ld_detach_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 static void
 pre_ld_configure_default_flow(struct pre_ld_port_rx_flow *def_flow)
 {
-	def_flow->type[0] = RTE_FLOW_ITEM_TYPE_ETH;
-	memset(&def_flow->masks[0], 0, sizeof(union pre_ld_flow_item));
-	def_flow->type[1] = RTE_FLOW_ITEM_TYPE_END;
+	def_flow->flow_pattern.type[0] = RTE_FLOW_ITEM_TYPE_ETH;
+	memset(&def_flow->flow_pattern.masks[0], 0,
+		sizeof(union pre_ld_flow_item));
+	def_flow->flow_pattern.type[1] = RTE_FLOW_ITEM_TYPE_END;
 }
 
 static void
@@ -3356,12 +3416,13 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	struct rte_flow_action_queue rxq;
 	union pre_ld_flow_item zero_mask;
 	int i = 0, ret, err = 0;
+	struct pre_ld_port_rx_flow_pattern *pattern;
 
 	memset(&zero_mask, 0, sizeof(union pre_ld_flow_item));
 
 	if (msg_type == REMOVE_ENTRY_REQ) {
 		return pre_ld_flow_destroy(rx_flow->src->port_id,
-			rx_flow->flow);
+			rx_flow);
 	}
 
 	memset(&flow_attr, 0, sizeof(struct rte_flow_attr));
@@ -3370,15 +3431,16 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	flow_attr.ingress = 1;
 	flow_attr.egress = 0;
 
-	while (rx_flow->type[i] != RTE_FLOW_ITEM_TYPE_END) {
-		flow_item[i].type = rx_flow->type[i];
-		if (!memcmp(&zero_mask, &rx_flow->masks[i],
+	pattern = &rx_flow->flow_pattern;
+	while (pattern->type[i] != RTE_FLOW_ITEM_TYPE_END) {
+		flow_item[i].type = pattern->type[i];
+		if (!memcmp(&zero_mask, &pattern->masks[i],
 			sizeof(union pre_ld_flow_item))) {
 			flow_item[i].spec = NULL;
 			flow_item[i].mask = NULL;
 		} else {
-			flow_item[i].spec = &rx_flow->items[i];
-			flow_item[i].mask = &rx_flow->masks[i];
+			flow_item[i].spec = &pattern->items[i];
+			flow_item[i].mask = &pattern->masks[i];
 		}
 		flow_item[i].last = NULL;
 		i++;
@@ -3405,8 +3467,7 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 
 		return -EIO;
 	}
-	ret = pre_ld_dev_flow_list_add(rx_flow->src->port_id,
-		rx_flow->flow);
+	ret = pre_ld_dev_flow_list_add(rx_flow);
 	if (ret) {
 		PRE_LD_LOG(ERR, "%s: Add flow to list failed(%d)\n",
 			__func__, ret);
@@ -3522,18 +3583,23 @@ for_ever_loop:
 
 	pre_ld_loop_drain_ports(list);
 
+	if (msg->dir->poll_type == RX_QUEUE) {
+		ret = pre_ld_port_rx_flow_update(msg->dir->poll.rx_flow,
+			msg->msg_type);
+		if (msg->msg_type == REMOVE_ENTRY_REQ &&
+			msg->dir->poll.rx_flow->ref > 0)
+			goto skip_update_list;
+	}
+
 	if (msg->msg_type == INSERT_ENTRY_REQ)
 		TAILQ_INSERT_TAIL(list, msg->dir, next);
 	else
 		TAILQ_REMOVE(list, msg->dir, next);
 
-	if (msg->dir->poll_type == RX_QUEUE) {
-		ret = pre_ld_port_rx_flow_update(msg->dir->poll.rx_flow,
-			msg->msg_type);
-	}
 	if (msg->msg_type == REMOVE_ENTRY_REQ)
 		msg->dir->entry_cb(msg->dir, true);
 
+skip_update_list:
 	pre_ld_loop_up_ports(list);
 	if (!ret)
 		msg->msg_type = UPDATE_ENTRY_SUCCESS_RSP;
@@ -4674,6 +4740,7 @@ eal_create_local_flow(int sockfd)
 	int i = 0, ret, err = 0;
 	struct pre_ld_port_rx_flow *rx_flow;
 	struct pre_ld_direct_entry *entry;
+	struct pre_ld_port_rx_flow_pattern *fp;
 
 	if (s_fd_desc[sockfd].access_type == FD_THREAD_ACCESS) {
 		entry = s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry;
@@ -4692,10 +4759,11 @@ eal_create_local_flow(int sockfd)
 	flow_action[0].conf = &ingress_queue;
 	flow_action[1].type = RTE_FLOW_ACTION_TYPE_END;
 
-	while (rx_flow->type[i] != RTE_FLOW_ITEM_TYPE_END) {
-		pattern[i].type = rx_flow->type[i];
-		pattern[i].spec = &rx_flow->items[i];
-		pattern[i].mask = &rx_flow->masks[i];
+	fp = &rx_flow->flow_pattern;
+	while (fp->type[i] != RTE_FLOW_ITEM_TYPE_END) {
+		pattern[i].type = fp->type[i];
+		pattern[i].spec = &fp->items[i];
+		pattern[i].mask = &fp->masks[i];
 		pattern[i].last = NULL;
 		i++;
 	}
@@ -4714,8 +4782,7 @@ eal_create_local_flow(int sockfd)
 		PRE_LD_LOG(ERR, "%s: flow create failed\n", __func__);
 		return -EIO;
 	}
-	ret = pre_ld_dev_flow_list_add(rx_flow->src->port_id,
-		rx_flow->flow);
+	ret = pre_ld_dev_flow_list_add(rx_flow);
 	if (ret) {
 		PRE_LD_LOG(ERR, "%s: Add flow to list failed(%d)\n",
 			__func__, ret);
@@ -4729,46 +4796,155 @@ eal_create_local_flow(int sockfd)
 	return 0;
 }
 
+static void
+pre_ld_entry_usr_rx_process(struct pre_ld_direct_entry *entry,
+	int drain)
+{
+	uint16_t nb_rx, nb_tx, drain_times = 0;
+	struct rte_mbuf *mbufs[MAX_PKT_BURST];
+	uint64_t lens[MAX_PKT_BURST];
+
+	RTE_ASSERT(entry->poll_type == RX_QUEUE &&
+		(entry->dest_type == RX_RING ||
+		entry->dest_type == PRE_LD_RX_RING));
+
+drain_again:
+	nb_rx = pre_ld_entry_port_recv(entry, mbufs, lens);
+	if (unlikely(drain)) {
+		if (pre_ld_drain_traffic_again(mbufs, nb_rx, &drain_times))
+			goto drain_again;
+		return;
+	}
+	if (!nb_rx)
+		return;
+
+	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
+
+	if (entry->dest_type == RX_RING) {
+		nb_tx = rte_ring_enqueue_burst(entry->dest.rx_ring,
+					(void * const *)mbufs, nb_rx, NULL);
+	} else {
+		nb_tx = pre_ld_ring_eq(entry->dest.pre_ld_rx_ring,
+			(void **)mbufs, nb_rx);
+	}
+
+	pre_ld_entry_stat_update(&entry->tx_stat, lens, nb_tx, false);
+
+	if (unlikely(nb_tx < nb_rx))
+		rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_rx - nb_tx);
+}
+
 static int
-eal_create_flow(int sockfd)
+eal_create_flow(int sockfd,
+	struct pre_ld_port_rx_flow_pattern *pattern)
 {
 	char config_str[256];
 	int ret, udp_src = 0, udp_dst = 0, offset = 0;
-	struct pre_ld_direct_entry *rx_entry;
+	struct pre_ld_direct_entry *rx_entry = NULL;
 	const char *prot_name;
 	const struct rte_flow_item_udp *udp = NULL;
 	const struct rte_flow_item_udp *mask = NULL;
-	struct pre_ld_port_rx_flow *rx_flow;
 	uint8_t rule[32], rule_size = 0, l3_offset = 0;
 	struct pre_ld_proc_cfg *proc_cfg;
 	struct pre_ld_mux_cfg *mux_cfg;
-	struct rte_flow_item pattern[2];
+	struct rte_flow_item mux_pattern[2];
+	struct pre_ld_port_rx_flow *rx_flow = NULL;
+	char nm[RTE_MEMZONE_NAMESIZE];
+	uint16_t rx_port;
+	struct fd_desc *desc = &s_fd_desc[sockfd];
 
-	if (s_fd_desc[sockfd].access_type == FD_HARDWARE_ACCESS) {
-		rx_flow = s_fd_desc[sockfd].dp_desc.hw_desc.rx_flow;
-	} else {
-		rx_entry = s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry;
-		rx_flow = rx_entry->poll.rx_flow;
+	if (s_mux_index < 0)
+		rx_port = s_rx_port;
+	else
+		rx_port = s_mux_cfg[s_mux_index].port_id[0];
+	rx_flow = pre_ld_dev_flow_find_rx_flow(rx_port, pattern);
+	if (rx_flow) {
+		if (desc->access_type == FD_HARDWARE_ACCESS)
+			desc->dp_desc.hw_desc.rx_flow = rx_flow;
+		else
+			desc->dp_desc.entry_desc.rx_entry = rx_flow->rx_entry;
+		rte_spinlock_lock(&rx_flow->flow_lock);
+		rx_flow->ref++;
+		rte_spinlock_unlock(&rx_flow->flow_lock);
+		return 0;
 	}
 
-	if (rx_flow->type[0] == RTE_FLOW_ITEM_TYPE_UDP) {
+	ret = rte_ring_dequeue(s_port_flow_r[rx_port],
+			(void **)&rx_flow);
+	if (ret) {
+		PRE_LD_LOG(ERR,
+			"port%d: RX flow allocated for socket(%d) failed(%d)\n",
+			rx_port, sockfd, ret);
+
+		return ret;
+	}
+	rx_flow->rx_entry = NULL;
+	rte_memcpy(&rx_flow->flow_pattern, pattern,
+		sizeof(struct pre_ld_port_rx_flow_pattern));
+	if (s_fd_desc[sockfd].access_type == FD_THREAD_ACCESS) {
+		rx_entry = rte_zmalloc(NULL,
+			sizeof(struct pre_ld_direct_entry), 0);
+		if (!rx_entry) {
+			ret = -ENOMEM;
+			goto create_flow_failed;
+		}
+		rx_entry->poll_type = RX_QUEUE;
+		rx_entry->poll.rx_flow = rx_flow;
+		if (s_fd_rte_ring) {
+			sprintf(nm, "rx_dst_ring_%p", rx_entry);
+			rx_entry->dest_type = RX_RING;
+			rx_entry->dest.rx_ring = rte_ring_create(nm,
+				MEMPOOL_USR_SIZE, 0, RING_F_SP_ENQ);
+			if (!rx_entry->dest.rx_ring) {
+				ret = -ENOMEM;
+				goto create_flow_failed;
+			}
+		} else {
+			sprintf(nm, "pre_ld_rx_dst_ring_%p", rx_entry);
+			rx_entry->dest_type = PRE_LD_RX_RING;
+			rx_entry->dest.pre_ld_rx_ring = pre_ld_ring_create(nm,
+				MEMPOOL_USR_SIZE);
+			if (!rx_entry->dest.pre_ld_rx_ring) {
+				ret = -ENOMEM;
+				goto create_flow_failed;
+			}
+		}
+		rx_entry->entry_cb = pre_ld_entry_usr_rx_process;
+		rx_entry->poll_prefix = rte_zmalloc(NULL, 1024, 0);
+		if (rx_entry->poll_prefix) {
+			sprintf(rx_entry->poll_prefix,
+				"Receive from port%d/queue%d",
+				rx_port, rx_flow->src->queue_id);
+		}
+		rx_entry->action_prefix = rte_zmalloc(NULL, 1024, 0);
+		if (rx_entry->action_prefix) {
+			sprintf(rx_entry->action_prefix,
+				"-> send to %s", nm);
+		}
+		rx_flow->rx_entry = rx_entry;
+		s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry = rx_entry;
+	} else {
+		s_fd_desc[sockfd].dp_desc.hw_desc.rx_flow = rx_flow;
+	}
+
+	if (pattern->type[0] == RTE_FLOW_ITEM_TYPE_UDP) {
 		prot_name = "udp";
-		udp = &rx_flow->items[0].udp_spec;
-		mask = &rx_flow->masks[0].udp_spec;
+		udp = &pattern->items[0].udp_spec;
+		mask = &pattern->masks[0].udp_spec;
 		if (mask->hdr.src_port)
 			udp_src = 1;
 		if (mask->hdr.dst_port)
 			udp_dst = 1;
-	} else if (rx_flow->type[0] == RTE_FLOW_ITEM_TYPE_GTP) {
+	} else if (pattern->type[0] == RTE_FLOW_ITEM_TYPE_GTP) {
 		prot_name = "gtp";
-	} else if (rx_flow->type[0] == RTE_FLOW_ITEM_TYPE_ETH) {
+	} else if (pattern->type[0] == RTE_FLOW_ITEM_TYPE_ETH) {
 		prot_name = "eth";
-	} else if (rx_flow->type[0] == RTE_FLOW_ITEM_TYPE_ECPRI) {
+	} else if (pattern->type[0] == RTE_FLOW_ITEM_TYPE_ECPRI) {
 		prot_name = "ecpri";
 	} else {
 		prot_name = "unsupported protocol";
 		PRE_LD_LOG(ERR, "Unsupported protocol type(%d)\n",
-			rx_flow->type[0]);
+			pattern->type[0]);
 	}
 
 	if (udp_src && !udp_dst) {
@@ -4788,15 +4964,15 @@ eal_create_flow(int sockfd)
 	if (s_mux_index < 0)
 		goto skip_mux_flow;
 
-	pattern[0].type = rx_flow->type[0];
-	pattern[0].spec = &rx_flow->items[0];
-	pattern[0].mask = &rx_flow->masks[0];
-	pattern[1].type = RTE_FLOW_ITEM_TYPE_END;
+	mux_pattern[0].type = pattern->type[0];
+	mux_pattern[0].spec = &pattern->items[0];
+	mux_pattern[0].mask = &pattern->masks[0];
+	mux_pattern[1].type = RTE_FLOW_ITEM_TYPE_END;
 	mux_cfg = &s_mux_cfg[s_mux_index];
 
 	/** Single EP only.*/
 	ret = eal_create_dpaa2_mux_flow(mux_cfg->mux_id,
-			mux_cfg->ep_id[0], pattern);
+			mux_cfg->ep_id[0], mux_pattern);
 	if (ret < 0) {
 		PRE_LD_LOG(ERR, "MUX%d(id=%d).EP%d's flow create failed(%d)\n",
 			s_mux_index, mux_cfg->mux_id, 0, ret);
@@ -4860,6 +5036,14 @@ skip_proc_flow:
 			rx_flow->src->flow_id, rx_flow->src->queue_id, ret);
 	}
 
+create_flow_failed:
+	if (ret) {
+		if (rx_flow)
+			rte_ring_enqueue(s_port_flow_r[rx_port], rx_flow);
+		if (rx_entry)
+			rte_free(rx_entry);
+	}
+
 	return ret;
 }
 
@@ -4918,44 +5102,6 @@ drain_again:
 	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
 
 	nb_tx = rte_eth_tx_burst(entry->dest.dest_port, 0, mbufs, nb_rx);
-
-	pre_ld_entry_stat_update(&entry->tx_stat, lens, nb_tx, false);
-
-	if (unlikely(nb_tx < nb_rx))
-		rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_rx - nb_tx);
-}
-
-static void
-pre_ld_entry_usr_rx_process(struct pre_ld_direct_entry *entry,
-	int drain)
-{
-	uint16_t nb_rx, nb_tx, drain_times = 0;
-	struct rte_mbuf *mbufs[MAX_PKT_BURST];
-	uint64_t lens[MAX_PKT_BURST];
-
-	RTE_ASSERT(entry->poll_type == RX_QUEUE &&
-		(entry->dest_type == RX_RING ||
-		entry->dest_type == PRE_LD_RX_RING));
-
-drain_again:
-	nb_rx = pre_ld_entry_port_recv(entry, mbufs, lens);
-	if (unlikely(drain)) {
-		if (pre_ld_drain_traffic_again(mbufs, nb_rx, &drain_times))
-			goto drain_again;
-		return;
-	}
-	if (!nb_rx)
-		return;
-
-	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
-
-	if (entry->dest_type == RX_RING) {
-		nb_tx = rte_ring_enqueue_burst(entry->dest.rx_ring,
-					(void * const *)mbufs, nb_rx, NULL);
-	} else {
-		nb_tx = pre_ld_ring_eq(entry->dest.pre_ld_rx_ring,
-			(void **)mbufs, nb_rx);
-	}
 
 	pre_ld_entry_stat_update(&entry->tx_stat, lens, nb_tx, false);
 
@@ -5054,12 +5200,10 @@ usr_socket_fd_desc_init(int sockfd,
 	int ret = 0, i;
 	struct pre_ld_lcore_direct_list *list = NULL;
 	struct fd_desc *desc = NULL;
-	struct pre_ld_direct_entry *rx_entry = NULL;
 	struct pre_ld_direct_entry *tx_entry = NULL;
 	struct pre_ld_direct_entry *free_entry = NULL;
 	struct pre_ld_direct_entry *malloc_entry = NULL;
 	struct pre_ld_direct_entry *rm;
-	struct pre_ld_port_rx_flow *rx_flow = NULL;
 	uint16_t mtu;
 	char nm[RTE_MEMZONE_NAMESIZE];
 	struct rte_mempool *tx_pool = NULL;
@@ -5103,22 +5247,9 @@ usr_socket_fd_desc_init(int sockfd,
 	}
 	desc->rx_buffer.max_num = MAX_PKT_BURST * 2;
 
-	ret = rte_ring_dequeue(s_port_flow_r[rx_port],
-			(void **)&rx_flow);
-	if (ret) {
-		PRE_LD_LOG(ERR,
-			"port%d: RX flow allocated for socket(%d) failed(%d)\n",
-			tx_port, sockfd, ret);
-
-		goto fd_init_quit;
-	}
-	memset(&rx_flow->flow, 0,
-		sizeof(struct pre_ld_port_rx_flow) -
-		offsetof(struct pre_ld_port_rx_flow, flow));
-
 	if (s_data_path_core < 0) {
 		desc->access_type = FD_HARDWARE_ACCESS;
-		desc->dp_desc.hw_desc.rx_flow = rx_flow;
+		desc->dp_desc.hw_desc.rx_flow = NULL;
 		desc->dp_desc.hw_desc.tx_port = tx_port;
 		desc->eal_thread = 1;
 	} else {
@@ -5172,48 +5303,10 @@ usr_socket_fd_desc_init(int sockfd,
 		}
 		desc->dp_desc.entry_desc.tx_entry = tx_entry;
 
-		rx_entry = rte_zmalloc(NULL,
-			sizeof(struct pre_ld_direct_entry), 0);
-		if (!rx_entry) {
-			ret = -ENOMEM;
-			goto fd_init_quit;
-		}
-		rx_entry->poll_type = RX_QUEUE;
-		rx_entry->poll.rx_flow = rx_flow;
-		if (s_fd_rte_ring) {
-			sprintf(nm, "rx_ring_fd%d", sockfd);
-			rx_entry->dest_type = RX_RING;
-			rx_entry->dest.rx_ring = rte_ring_create(nm,
-				MEMPOOL_USR_SIZE,
-				0, RING_F_SP_ENQ | RING_F_SC_DEQ);
-			if (!rx_entry->dest.rx_ring) {
-				ret = -ENOMEM;
-				goto fd_init_quit;
-			}
-		} else {
-			sprintf(nm, "pre_ld_rx_ring_fd%d", sockfd);
-			rx_entry->dest_type = PRE_LD_RX_RING;
-			rx_entry->dest.pre_ld_rx_ring = pre_ld_ring_create(nm,
-				MEMPOOL_USR_SIZE);
-			if (!rx_entry->dest.pre_ld_rx_ring) {
-				ret = -ENOMEM;
-				goto fd_init_quit;
-			}
-		}
-		rx_entry->entry_cb = pre_ld_entry_usr_rx_process;
-		rx_entry->poll_prefix = rte_zmalloc(NULL, 1024, 0);
-		if (rx_entry->poll_prefix) {
-			sprintf(rx_entry->poll_prefix,
-				"Receive from port%d/queue%d",
-				rx_port, rx_flow->src->queue_id);
-		}
-		rx_entry->action_prefix = rte_zmalloc(NULL, 1024, 0);
-		if (rx_entry->action_prefix) {
-			sprintf(rx_entry->action_prefix,
-				"-> send to %s", nm);
-		}
-		desc->dp_desc.entry_desc.rx_entry = rx_entry;
-		/** Postpone insert entry untile socket connects.*/
+		desc->dp_desc.entry_desc.rx_entry = NULL;
+		/** Malloc rx entry when creating flow. the entry may be shared
+		 * between multiple FDs with same port.
+		 */
 
 		free_entry = rte_zmalloc(NULL,
 			sizeof(struct pre_ld_direct_entry), 0);
@@ -5379,9 +5472,6 @@ fd_init_quit:
 		return 0;
 	}
 
-	if (rx_flow)
-		rte_ring_enqueue(s_port_flow_r[rx_port], rx_flow);
-
 	if (tx_pool)
 		rte_mempool_free(tx_pool);
 
@@ -5432,17 +5522,6 @@ fd_init_quit:
 		pre_ld_ring_free(tx_entry->poll.pre_ld_tx_ring);
 	if (tx_entry)
 		rte_free(tx_entry);
-
-	if (rx_entry &&
-		rx_entry->dest_type == RX_RING &&
-		rx_entry->dest.rx_ring)
-		rte_ring_free(rx_entry->dest.rx_ring);
-	else if (rx_entry &&
-		rx_entry->dest_type == PRE_LD_RX_RING &&
-		rx_entry->dest.pre_ld_rx_ring)
-		pre_ld_ring_free(rx_entry->dest.pre_ld_rx_ring);
-	if (rx_entry)
-		rte_free(rx_entry);
 
 	if (free_entry &&
 		free_entry->poll_type == MBUF_FREE_RING &&
@@ -6051,41 +6130,83 @@ netwrap_collect_info(int sockfd)
 static int
 socket_create_ingress_flow(int sockfd)
 {
-	struct pre_ld_port_rx_flow *rx_flow;
-	struct pre_ld_direct_entry *rx_entry;
+	struct pre_ld_port_rx_flow_pattern flow_pattern;
 	int ret;
+	struct pre_ld_direct_entry *rx_entry;
+	struct pre_ld_port_rx_flow *rx_flow;
+	uint16_t port_id;
 
 	pthread_mutex_lock(&s_fd_mutex);
-	if (is_usr_socket_connected(sockfd)) {
-		pthread_mutex_unlock(&s_fd_mutex);
-		return 0;
-	}
-	if ((s_fd_desc[sockfd].hdr_init &
-		(LOCAL_UDP_INIT | REMOTE_UDP_INIT)) !=
-		(LOCAL_UDP_INIT | REMOTE_UDP_INIT)) {
-		PRE_LD_LOG(INFO, "%s: Socket(%d) UDP header not initialized.\n",
-			__func__, sockfd);
+
+	if (!(s_fd_desc[sockfd].hdr_init & LOCAL_UDP_INIT)) {
+		PRE_LD_LOG(ERR,
+			"Socket(%d) local UDP port not initialized.\n",
+			sockfd);
 		pthread_mutex_unlock(&s_fd_mutex);
 		return -EINVAL;
 	}
 
 	if (s_fd_desc[sockfd].access_type == FD_HARDWARE_ACCESS) {
 		rx_flow = s_fd_desc[sockfd].dp_desc.hw_desc.rx_flow;
+		if (rx_flow) {
+			port_id = rx_flow->src->port_id;
+			ret = pre_ld_flow_destroy(port_id, rx_flow);
+			if (ret) {
+				PRE_LD_LOG(ERR,
+					"%s destroy FD[%d]'s rte flow failed(%d)\n",
+					__func__, sockfd, ret);
+			}
+			if (!rx_flow->ref) {
+				ret = rte_ring_enqueue(s_port_flow_r[port_id],
+					rx_flow);
+				if (ret) {
+					PRE_LD_LOG(ERR,
+						"%s release port[%d]'s RX flow failed(%d)\n",
+						__func__, port_id, ret);
+				}
+			}
+			s_fd_desc[sockfd].dp_desc.hw_desc.rx_flow = NULL;
+		}
 	} else {
 		rx_entry = s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry;
-		rx_flow = rx_entry->poll.rx_flow;
+		if (rx_entry) {
+			rx_flow = rx_entry->poll.rx_flow;
+			port_id = rx_flow->src->port_id;
+			ret = pre_ld_update_dir_list_safe(rx_entry,
+				REMOVE_ENTRY_REQ);
+			if (ret) {
+				PRE_LD_LOG(ERR,
+					"%s remove FD[%d]'s RX entry failed(%d)\n",
+					__func__, sockfd, ret);
+			}
+			if (!rx_flow->ref) {
+				ret = rte_ring_enqueue(s_port_flow_r[port_id],
+					rx_flow);
+				if (ret) {
+					PRE_LD_LOG(ERR,
+						"%s release port[%d]'s RX flow failed(%d)\n",
+						__func__, port_id, ret);
+				}
+				if (rx_entry->dest_type == RX_RING)
+					rte_ring_free(rx_entry->dest.rx_ring);
+				else
+					pre_ld_ring_free(rx_entry->dest.pre_ld_rx_ring);
+				rte_free(rx_entry->poll_prefix);
+				rte_free(rx_entry->action_prefix);
+				rte_free(rx_entry);
+			}
+			s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry = NULL;
+		}
 	}
-	rx_flow->type[0] = RTE_FLOW_ITEM_TYPE_UDP;
-	memset(&rx_flow->items[0], 0, sizeof(union pre_ld_flow_item));
-	memset(&rx_flow->masks[0], 0, sizeof(union pre_ld_flow_item));
-	rx_flow->items[0].udp_spec.hdr.src_port =
-		s_fd_desc[sockfd].hdr.udp_hdr.dst_port;
-	rx_flow->items[0].udp_spec.hdr.dst_port =
-		s_fd_desc[sockfd].hdr.udp_hdr.src_port;
-	rx_flow->masks[0].udp_spec.hdr.src_port = 0xffff;
-	rx_flow->masks[0].udp_spec.hdr.dst_port = 0xffff;
 
-	ret = eal_create_flow(sockfd);
+	memset(&flow_pattern, 0,
+		sizeof(struct pre_ld_port_rx_flow_pattern));
+	flow_pattern.type[0] = RTE_FLOW_ITEM_TYPE_UDP;
+	flow_pattern.items[0].udp_spec.hdr.dst_port =
+		s_fd_desc[sockfd].hdr.udp_hdr.src_port;
+	flow_pattern.masks[0].udp_spec.hdr.dst_port = 0xffff;
+
+	ret = eal_create_flow(sockfd, &flow_pattern);
 	pthread_mutex_unlock(&s_fd_mutex);
 
 	return ret;
@@ -6095,8 +6216,9 @@ int
 bind(int sockfd, const struct sockaddr *addr,
 	socklen_t addrlen)
 {
-	int bind_value = 0;
+	int bind_value = 0, ret;
 	const struct sockaddr_in *sa = (const void *)addr;
+	char ipl[INET6_ADDRSTRLEN];
 
 	if (s_socket_dbg) {
 		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_bind:%p\n",
@@ -6117,9 +6239,23 @@ bind(int sockfd, const struct sockaddr *addr,
 		}
 	}
 
-	PRE_LD_LOG(INFO, "%s sockfd:%d, family(%d), port(%04x) %s.\n",
+	convert_ip_addr_to_str(ipl, &sa->sin_addr.s_addr, 4);
+
+	if (is_usr_socket(sockfd)) {
+		s_fd_desc[sockfd].hdr.udp_hdr.src_port = sa->sin_port;
+		s_fd_desc[sockfd].hdr_init |= LOCAL_UDP_INIT;
+		ret = socket_create_ingress_flow(sockfd);
+		if (ret) {
+			PRE_LD_LOG(ERR,
+				"%s user socket:%d create ingress flow failed(%d)\n",
+				__func__, sockfd, ret);
+		}
+	}
+
+	PRE_LD_LOG(INFO,
+		"%s sockfd:%d, family(%d), %s, port(%04x) %s.\n",
 		__func__, sockfd, sa->sin_family,
-		rte_be_to_cpu_16(sa->sin_port),
+		ipl, rte_be_to_cpu_16(sa->sin_port),
 		bind_value ? "failed" : "successfully");
 
 	return bind_value;

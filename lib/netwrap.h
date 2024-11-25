@@ -61,16 +61,23 @@ struct pre_ld_port_rx_source {
 	uint16_t queue_id;
 };
 
-struct pre_ld_port_rx_flow {
-	const struct pre_ld_port_rx_source *src;
-	struct rte_flow *flow;
+struct pre_ld_port_rx_flow_pattern {
 	enum rte_flow_item_type type[PRE_LD_FLOW_MAX_ITEM];
 	union pre_ld_flow_item items[PRE_LD_FLOW_MAX_ITEM];
 	union pre_ld_flow_item masks[PRE_LD_FLOW_MAX_ITEM];
+};
+
+struct pre_ld_port_rx_flow {
+	const struct pre_ld_port_rx_source *src;
+	struct rte_flow *flow;
+	struct pre_ld_port_rx_flow_pattern flow_pattern;
+	struct pre_ld_direct_entry *rx_entry;
 	enum pre_ld_cmp_offset cmp_offset_type;
 	uint8_t cmp_offset;
 	uint8_t cmp_size;
 	uint8_t cmp_data[64];
+	uint16_t ref;
+	rte_spinlock_t flow_lock;
 };
 
 struct pre_ld_sp_node;
@@ -83,6 +90,8 @@ struct pre_ld_sec_desc {
 
 struct pre_ld_ring {
 	char name[RTE_MEMZONE_NAMESIZE];
+	rte_spinlock_t eq_lock;
+	rte_spinlock_t dq_lock;
 	uint16_t pre_ld_head;
 	uint16_t pre_ld_tail;
 	uint16_t pre_ld_size;
