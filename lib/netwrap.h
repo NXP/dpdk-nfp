@@ -261,6 +261,8 @@ int
 pre_ld_attach_sec_path(struct pre_ld_ipsec_sp_entry *sp);
 int
 pre_ld_detach_sec_path(struct pre_ld_ipsec_sp_entry *sp);
+double
+pre_ld_get_cycs_per_us(void);
 
 extern void
 eal_lcore_non_eal_release(uint32_t lcore_id);

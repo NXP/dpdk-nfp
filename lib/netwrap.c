@@ -335,6 +335,8 @@ static struct rte_ring *s_dir_msg_rsp_r[RTE_MAX_LCORE];
 
 static struct rte_mempool *s_pre_ld_rx_pool;
 
+static double s_pre_ld_cycs_per_us;
+
 struct pre_ld_dir_ul_dl_pair {
 	int ul_id;
 	int dl_id;
@@ -758,6 +760,24 @@ quit:
 	pthread_mutex_unlock(&s_update_dir_mutex);
 
 	return ret;
+}
+
+static void
+pre_ld_calculate_cycles_per_us(void)
+{
+	uint64_t start_cycles, end_cycles;
+
+	start_cycles = rte_get_timer_cycles();
+	rte_delay_ms(100);
+	end_cycles = rte_get_timer_cycles();
+	s_pre_ld_cycs_per_us = (end_cycles - start_cycles) / (100 * 1000);
+	PRE_LD_LOG(INFO, "Cycles per us is: %ld\n",
+		(unsigned long)s_pre_ld_cycs_per_us);
+}
+
+double pre_ld_get_cycs_per_us(void)
+{
+	return s_pre_ld_cycs_per_us;
 }
 
 static void
@@ -1642,6 +1662,66 @@ usr_data_path_malloc_mbuf(struct fd_desc *desc,
 	RTE_ASSERT(alloc == count);
 
 	return 0;
+}
+
+static int
+eal_recv_available(int sockfd)
+{
+	int ret = false;
+	struct fd_desc *desc;
+	struct pre_ld_rx_pool *rx_pool;
+	struct pre_ld_direct_entry *rx_entry;
+
+	/** Assume recv always be available.*/
+	return true;
+
+	rte_spinlock_lock(&s_fd_list_lock);
+	if (unlikely(!is_usr_socket(sockfd))) {
+		rte_spinlock_unlock(&s_fd_list_lock);
+		return false;
+	}
+	rte_spinlock_unlock(&s_fd_list_lock);
+
+	desc = &s_fd_desc[sockfd];
+	rx_pool = &desc->rx_buffer;
+
+	ret = eal_data_path_thread_register(desc);
+	if (ret)
+		return false;
+
+	if (unlikely(!desc->rx_enable))
+		goto finsh_check;
+
+	if (rx_pool->head != rx_pool->tail) {
+		ret = true;
+		goto finsh_check;
+	}
+
+	if (desc->access_type == FD_THREAD_ACCESS) {
+		rx_entry = desc->dp_desc.entry_desc.rx_entry;
+		if (unlikely(!rx_entry)) {
+			/** FD close*/
+			goto finsh_check;
+		}
+		if (rx_entry->dest_type == RX_RING) {
+			if (rte_ring_count(rx_entry->dest.rx_ring))
+				ret = true;
+			else
+				ret = false;
+		} else {
+			if (pre_ld_ring_count(rx_entry->dest.pre_ld_rx_ring))
+				ret = true;
+			else
+				ret = false;
+		}
+	} else {
+		PRE_LD_LOG(ERR, "%s: support thread access only.\n");
+		ret = false;
+	}
+
+finsh_check:
+
+	return ret;
 }
 
 static int
@@ -4486,6 +4566,8 @@ static int eal_main(void)
 		}
 	}
 
+	pre_ld_calculate_cycles_per_us();
+
 	pre_ld_dump_port_toplogy();
 
 	if (s_dir_ports.ext_num > 0 &&
@@ -6342,51 +6424,248 @@ send_to_kernel:
 	return send_value;
 }
 
-static uint16_t
-netwrap_filter_fd_set(const fd_set *fds,
-	const fd_set *filterd_fds, fd_set *rest_fds, int fd[])
+static void
+pre_ld_merge_fds(fd_set *fds, const fd_set *fds1, const fd_set *fds2)
 {
-	uint16_t num = 0;
-	const uint8_t *_f, *_t;
-	uint8_t *_r;
+	const uint8_t *f1 = (const void *)fds1, *f2 = (const void *)fds2;
+	uint8_t *f = (void *)fds;
+	uint64_t i;
+
+	for (i = 0; i < sizeof(fd_set); i++)
+		f[i] = f1[i] | f2[i];
+}
+
+static void
+pre_ld_sys_usr_fds(int nfds, fd_set *fds, fd_set *sysfds,
+	fd_set *usrfds, uint32_t *sys_num, uint32_t *usr_num,
+	uint64_t *max_sys, uint64_t *max_usr)
+{
+	struct fd_desc *usr, *tusr;
+	const uint8_t *f, *u;
+	uint8_t *s;
+	const __uint128_t *f128, *u128;
+	__uint128_t *s128;
 	uint64_t i, j;
 
-	_f = (const void *)filterd_fds;
-	_t = (const void *)fds;
-	_r = (void *)rest_fds;
+	memset(usrfds, 0, sizeof(fd_set));
+	if (sys_num)
+		*sys_num = 0;
+	if (usr_num)
+		*usr_num = 0;
+	if (max_sys)
+		*max_sys = 0;
+	if (max_usr)
+		*max_usr = 0;
+
+	RTE_TAILQ_FOREACH_SAFE(usr, &s_fd_desc_list, next, tusr) {
+		if (usr->fd >= nfds)
+			continue;
+		if (FD_ISSET(usr->fd, fds) &&
+			is_usr_socket_connected(usr->fd)) {
+			FD_SET(usr->fd, usrfds);
+			if (max_usr && usr->fd > (int)(*max_usr))
+				(*max_usr) = usr->fd;
+			if (usr_num)
+				(*usr_num)++;
+		}
+	}
+	if (!memcmp(fds, usrfds, sizeof(fd_set)))
+		return;
+
+	memset(sysfds, 0, sizeof(fd_set));
+
+	if (likely(!((sizeof(fd_set) % sizeof(__uint128_t)))))
+		goto fast_sysfds;
+
+	f = (const void *)fds;
+	u = (const void *)usrfds;
+	s = (void *)sysfds;
 	for (i = 0; i < sizeof(fd_set); i++) {
-		_r[i] = _t[i] & (~_f[i]);
-		if (!_r[i])
+		if (f[i] == u[i]) {
+			s[i] = 0;
+			continue;
+		}
+		s[i] = f[i] & (~u[i]);
+		if (!s[i])
 			continue;
 		for (j = 0; j < 8; j++) {
-			if ((1 << j) & _r[i] &&
-				!is_usr_socket(j + 8 * i)) {
-				fd[num] = j + 8 * i;
-				num++;
+			if ((1 << j) & s[i]) {
+				if (max_sys && (j + 8 * i) > (*max_sys))
+					*max_sys = j + 8 * i;
+				if (sys_num)
+					(*sys_num)++;
 			}
 		}
 	}
 
-	return num;
+	return;
+
+fast_sysfds:
+	f128 = (const void *)fds;
+	u128 = (const void *)usrfds;
+	s128 = (void *)sysfds;
+	for (i = 0; i < sizeof(fd_set) / sizeof(__uint128_t); i++) {
+		if (f128[i] == u128[i]) {
+			s128[i] = 0;
+			continue;
+		}
+		s128[i] = f128[i] & (~u128[i]);
+		if (!s128[i])
+			continue;
+		for (j = 0; j < 128; j++) {
+			if ((((__uint128_t)1) << j) & s128[i]) {
+				if (max_sys && (j + 8 * i) > (*max_sys))
+					*max_sys = j + 8 * i;
+				if (sys_num)
+					(*sys_num)++;
+			}
+		}
+	}
+}
+
+#define SELECT_BLOCK_TIME ((int64_t)(~0UL >> 1))
+
+static int
+pre_ld_usr_select(int nfds, fd_set *readfds, fd_set *writefds,
+	struct timeval *timeout)
+{
+	struct fd_desc *usr, *tusr;
+	int hit, ret, total = 0, imm = 0;
+	uint64_t max = 0, start, end;
+
+	if (timeout) {
+		if (!timeout->tv_sec && !timeout->tv_usec)
+			imm = 1;
+		max = timeout->tv_sec * 1000 * 1000 + timeout->tv_usec;
+		max = max * s_pre_ld_cycs_per_us;
+	}
+
+select_again:
+	start = rte_get_timer_cycles();
+
+	RTE_TAILQ_FOREACH_SAFE(usr, &s_fd_desc_list, next, tusr) {
+		if (usr->fd >= nfds)
+			continue;
+		hit = 0;
+		if (readfds && FD_ISSET(usr->fd, readfds)) {
+			ret = eal_recv_available(usr->fd);
+			if (ret == true)
+				hit++;
+			else
+				FD_CLR(usr->fd, readfds);
+		}
+		if (writefds && FD_ISSET(usr->fd, writefds)) {
+			PRE_LD_LOG(WARNING,
+				"Select user FD%d writefds not supported!\n",
+				usr->fd);
+			FD_CLR(usr->fd, writefds);
+		}
+		if (hit)
+			total++;
+	}
+	if (imm)
+		return total;
+	if (!total)
+		rte_delay_us_sleep(1);
+	end = rte_get_timer_cycles();
+	if (timeout && max > (end - start) && !total) {
+		max -= (end - start);
+		goto select_again;
+	} else if (!timeout && !total) {
+		goto select_again;
+	}
+
+	return total;
+}
+
+static int pre_ld_select_usr_sys_mix(int nfds,
+	fd_set *usr_rfds, fd_set *usr_wfds,
+	fd_set *sys_rfds, fd_set *sys_wfds,
+	fd_set *merge_rfds, fd_set *merge_wfds,
+	fd_set *exceptfds, struct timeval *timeout)
+{
+#define SELECT_MIX_MIN_TIME 1000
+	int sys_ret, usr_ret, quit = 0, ret = 0;
+	struct timeval iteral;
+	int64_t total = timeout ?
+		(timeout->tv_sec * 1000 * 1000 + timeout->tv_usec) :
+		SELECT_BLOCK_TIME;
+	fd_set tusr_rfds, tusr_wfds, tsys_rfds, tsys_wfds;
+
+	if (merge_rfds)
+		memset(merge_rfds, 0, sizeof(fd_set));
+	if (merge_wfds)
+		memset(merge_wfds, 0, sizeof(fd_set));
+	if (usr_rfds)
+		rte_memcpy(&tusr_rfds, usr_rfds, sizeof(fd_set));
+	if (usr_wfds)
+		rte_memcpy(&tusr_wfds, usr_wfds, sizeof(fd_set));
+	if (sys_rfds)
+		rte_memcpy(&tsys_rfds, sys_rfds, sizeof(fd_set));
+	if (sys_wfds)
+		rte_memcpy(&tsys_wfds, sys_wfds, sizeof(fd_set));
+	while (total > 0) {
+		iteral.tv_sec = 0;
+		iteral.tv_usec = total > SELECT_MIX_MIN_TIME ?
+			SELECT_MIX_MIN_TIME : total;
+		if (usr_rfds)
+			rte_memcpy(usr_rfds, &tusr_rfds, sizeof(fd_set));
+		if (usr_wfds)
+			rte_memcpy(usr_wfds, &tusr_wfds, sizeof(fd_set));
+		if (sys_rfds)
+			rte_memcpy(sys_rfds, &tsys_rfds, sizeof(fd_set));
+		if (sys_wfds)
+			rte_memcpy(sys_wfds, &tsys_wfds, sizeof(fd_set));
+		sys_ret = (*libc_select)(nfds, sys_rfds, sys_wfds,
+			exceptfds, &iteral);
+		usr_ret = pre_ld_usr_select(nfds, usr_rfds, usr_wfds, timeout);
+		if (usr_ret > 0) {
+			if (merge_rfds && usr_rfds) {
+				rte_memcpy(merge_rfds, usr_rfds,
+					sizeof(fd_set));
+			}
+			if (merge_wfds && usr_wfds) {
+				rte_memcpy(merge_rfds, usr_wfds,
+					sizeof(fd_set));
+			}
+			quit = 1;
+		}
+		if (sys_ret > 0) {
+			if (merge_rfds && sys_rfds) {
+				pre_ld_merge_fds(merge_rfds, merge_rfds,
+					sys_rfds);
+			}
+			if (merge_wfds && sys_wfds) {
+				pre_ld_merge_fds(merge_wfds, merge_wfds,
+					sys_wfds);
+			}
+			quit = 1;
+		} else if (sys_ret < 0) {
+			quit = 1;
+		}
+		if (quit)
+			break;
+		total -= SELECT_MIX_MIN_TIME;
+	}
+
+	if (quit) {
+		if (usr_ret > 0)
+			ret += usr_ret;
+		if (sys_ret > 0)
+			ret += sys_ret;
+		if (!ret)
+			ret = sys_ret;
+	}
+
+	return ret;
 }
 
 int select(int nfds, fd_set *readfds, fd_set *writefds,
 	fd_set *exceptfds, struct timeval *timeout)
 {
-	int ret = 0, i, off, hit;
-	fd_set usr_rfds;
-	fd_set usr_wfds;
-	int usr_r_fd_num = 0, usr_w_fd_num = 0, user_fd_num = 0;
-	fd_set sys_rfds;
-	fd_set sys_wfds;
-	fd_set *rfds = NULL, *wfds = NULL;
-	int sys_r_fd_num = 0, sys_w_fd_num = 0;
-	char log_buf[1024];
-	int usr_r_fd[sizeof(fd_set) * 8];
-	int usr_w_fd[sizeof(fd_set) * 8];
-	int sys_r_fd[sizeof(fd_set) * 8];
-	int sys_w_fd[sizeof(fd_set) * 8];
-	struct fd_desc *usr, *tusr;
+	int rusr = 0, rsys = 0, wusr = 0, wsys = 0;
+	fd_set usr_rfds, usr_wfds, sys_rfds, sys_wfds;
+	uint32_t sys_num, usr_num;
 
 	if (s_socket_dbg) {
 		PRE_LD_LOG(INFO, "%s starts: nfds:%d, libc_select:%p\n",
@@ -6397,108 +6676,45 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 	if (unlikely(!libc_select)) {
 		LIBC_FUNCTION(select);
 		if (!libc_select) {
-			ret = -1;
 			errno = EACCES;
 
-			return ret;
+			return -1;
 		}
 	}
-
-	RTE_TAILQ_FOREACH_SAFE(usr, &s_fd_desc_list, next, tusr) {
-		hit = 0;
-		if (readfds && FD_ISSET(usr->fd, readfds) &&
-			is_usr_socket_connected(usr->fd)) {
-			usr_r_fd[usr_r_fd_num] = usr->fd;
-			usr_r_fd_num++;
-			hit++;
-		}
-		if (writefds && FD_ISSET(usr->fd, writefds)) {
-			usr_w_fd[usr_w_fd_num] = usr->fd;
-			usr_w_fd_num++;
-			hit++;
-		}
-		if (hit)
-			user_fd_num++;
-	}
-
-	if (!user_fd_num) {
-		return (*libc_select)(nfds, readfds, writefds,
-				exceptfds, timeout);
-	}
-
-	memset(&usr_rfds, 0, sizeof(fd_set));
-	memset(&usr_wfds, 0, sizeof(fd_set));
-	for (i = 0; i < usr_r_fd_num; i++)
-		FD_SET(usr_r_fd[i], &usr_rfds);
-	for (i = 0; i < usr_w_fd_num; i++)
-		FD_SET(usr_w_fd[i], &usr_wfds);
-
-	memset(&sys_rfds, 0, sizeof(fd_set));
-	memset(&sys_wfds, 0, sizeof(fd_set));
 
 	if (readfds) {
-		sys_r_fd_num = netwrap_filter_fd_set(readfds,
-			&usr_rfds, &sys_rfds, sys_r_fd);
+		sys_num = 0;
+		usr_num = 0;
+		pre_ld_sys_usr_fds(nfds, readfds, &sys_rfds, &usr_rfds,
+			&sys_num, &usr_num, NULL, NULL);
+		rsys = sys_num ? 1 : 0;
+		rusr = usr_num ? 1 : 0;
+	} else {
+		rusr = 0;
+		rsys = 0;
 	}
 	if (writefds) {
-		sys_w_fd_num = netwrap_filter_fd_set(writefds,
-			&usr_wfds, &sys_wfds, sys_w_fd);
-	}
-
-	if (!s_select_dbg)
-		goto select_fds;
-
-	off = 0;
-	if (sys_r_fd_num) {
-		off += sprintf(&log_buf[off],
-			"Sys read FD(s)(=%d): ", sys_r_fd_num);
-		for (i = 0; i < sys_r_fd_num; i++)
-			off += sprintf(&log_buf[off], "%d ", sys_r_fd[i]);
-	}
-	if (sys_w_fd_num) {
-		off += sprintf(&log_buf[off],
-			"/Sys write FD(s)(=%d): ", sys_w_fd_num);
-		for (i = 0; i < sys_w_fd_num; i++)
-			off += sprintf(&log_buf[off], "%d ", sys_w_fd[i]);
-	}
-	if (usr_r_fd_num) {
-		off += sprintf(&log_buf[off],
-			"/Usr read FD(s)(=%d): ", usr_r_fd_num);
-		for (i = 0; i < usr_r_fd_num; i++)
-			off += sprintf(&log_buf[off], "%d ", usr_r_fd[i]);
-	}
-	if (usr_w_fd_num) {
-		off += sprintf(&log_buf[off],
-			"/Usr write FD(s)(=%d): ", usr_w_fd_num);
-		for (i = 0; i < usr_w_fd_num; i++)
-			off += sprintf(&log_buf[off], "%d ", usr_w_fd[i]);
-	}
-
-	PRE_LD_LOG(INFO, "%s: %s\n", __func__, log_buf);
-
-select_fds:
-	if ((readfds && !memcmp(&usr_rfds, readfds, sizeof(fd_set)) &&
-		writefds && !memcmp(&usr_wfds, writefds, sizeof(fd_set))) ||
-		(readfds && !writefds &&
-		!memcmp(&usr_rfds, readfds, sizeof(fd_set))) ||
-		(writefds && !readfds &&
-		!memcmp(&usr_wfds, writefds, sizeof(fd_set)))) {
-		/** TBD: User FD select only.*/
-		ret = user_fd_num;
+		sys_num = 0;
+		usr_num = 0;
+		pre_ld_sys_usr_fds(nfds, writefds, &sys_wfds, &usr_wfds,
+			&sys_num, &usr_num, NULL, NULL);
+		wsys = sys_num ? 1 : 0;
+		wusr = usr_num ? 1 : 0;
 	} else {
-		if (sys_r_fd_num)
-			rfds = &sys_rfds;
-		if (sys_w_fd_num)
-			wfds = &sys_wfds;
-
-		ret = (*libc_select)(nfds, rfds, wfds, exceptfds, timeout);
-		if (readfds && rfds)
-			rte_memcpy(readfds, rfds, sizeof(fd_set));
-		if (writefds && wfds)
-			rte_memcpy(writefds, wfds, sizeof(fd_set));
+		wusr = 0;
+		wsys = 0;
 	}
+	if (!rusr && !wusr) {
+		return (*libc_select)(nfds, readfds, writefds,
+			exceptfds, timeout);
+	}
+	if (!rsys && !wsys)
+		return pre_ld_usr_select(nfds, readfds, writefds, timeout);
 
-	return ret;
+	return pre_ld_select_usr_sys_mix(nfds,
+		rusr ? &usr_rfds : NULL, wusr ? &usr_wfds : NULL,
+		rsys ? &sys_rfds : NULL, wsys ? &sys_wfds : NULL,
+		readfds, writefds, exceptfds, timeout);
 }
 
 __attribute__((destructor)) static void netwrap_main_dtor(void)

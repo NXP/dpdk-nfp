@@ -128,8 +128,6 @@ static const struct xfm_auth_support s_auth_xfm[] = {
 
 static struct pre_ld_ipsec_cntx s_pre_ld_ipsec_cntx;
 
-static double s_xfm_cycs_per_us;
-
 struct pre_ld_xfm_flow {
 	TAILQ_ENTRY(pre_ld_xfm_flow) next;
 	struct rte_flow *flow;
@@ -637,7 +635,7 @@ xfm_dump_all_sa_sp(const char *prefix, const char *tail)
 			sa->sp ? "Associated" : "None associated");
 		off += sprintf(&info[off], "lifetime(%.2f s)\n",
 			(rte_get_timer_cycles() - sa->created_cyc) /
-			(s_xfm_cycs_per_us * 1000 * 1000));
+			(pre_ld_get_cycs_per_us() * 1000 * 1000));
 		num++;
 		sa = LIST_NEXT(sa, next);
 	}
@@ -1011,7 +1009,7 @@ process_del_sa_entry(struct pre_ld_ipsec_sa_entry *sa)
 		"OUT" : "Not directed",
 		sa->sess_conf.ipsec.spi,
 		(rte_get_timer_cycles() - sa->created_cyc) /
-		(s_xfm_cycs_per_us * 1000 * 1000));
+		(pre_ld_get_cycs_per_us() * 1000 * 1000));
 	rte_free(sa);
 
 	return ret;
@@ -1783,19 +1781,6 @@ resolve_xfrm_notif(const struct nlmsghdr *nh, int len,
 	return ret;
 }
 
-static void
-xfm_calculate_cycles_per_us(void)
-{
-	uint64_t start_cycles, end_cycles;
-
-	start_cycles = rte_get_timer_cycles();
-	rte_delay_ms(100);
-	end_cycles = rte_get_timer_cycles();
-	s_xfm_cycs_per_us = (end_cycles - start_cycles) / (100 * 1000);
-	PRE_LD_LOG(INFO, "Cycles per us is: %ld\n",
-		(unsigned long)s_xfm_cycs_per_us);
-}
-
 static void *xfrm_msg_loop(void *data)
 {
 	int xfrm_sd;
@@ -1838,8 +1823,6 @@ static void *xfrm_msg_loop(void *data)
 	msg.msg_namelen = sizeof(sa);
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
-
-	xfm_calculate_cycles_per_us();
 
 	/* XFRM notification loop */
 	while (1) {
