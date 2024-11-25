@@ -30,6 +30,7 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <dirent.h>
+#include <ifaddrs.h>
 
 #include <rte_common.h>
 #include <rte_log.h>
@@ -152,9 +153,11 @@ enum hdr_init_enum {
 	REMOTE_ETH_INIT = (1 << 3),
 	REMOTE_IP_INIT = (1 << 4),
 	REMOTE_UDP_INIT = (1 << 5),
-	HDR_INIT_ALL = LOCAL_ETH_INIT | LOCAL_IP_INIT |
-		LOCAL_UDP_INIT | REMOTE_ETH_INIT |
-		REMOTE_IP_INIT | REMOTE_UDP_INIT
+	LOCAL_HDR_INIT = (LOCAL_ETH_INIT | LOCAL_IP_INIT |
+		LOCAL_UDP_INIT),
+	REMOTE_HDR_INIT = (REMOTE_ETH_INIT | REMOTE_IP_INIT |
+		REMOTE_UDP_INIT),
+	HDR_INIT_ALL = LOCAL_HDR_INIT | REMOTE_HDR_INIT
 };
 
 enum pre_ld_statistic_dir {
@@ -196,6 +199,21 @@ union fd_data_path_desc {
 	struct fd_hw_desc hw_desc;
 	struct fd_entry_desc entry_desc;
 };
+
+struct pre_ld_arp_entry {
+	TAILQ_ENTRY(pre_ld_arp_entry) next;
+	union {
+		rte_be32_t ip4addr;
+		uint8_t  ip6addr[16];
+	};
+	uint16_t family;
+	uint8_t hwaddr[RTE_ETHER_ADDR_LEN];
+};
+
+TAILQ_HEAD(pre_ld_arp_entry_list, pre_ld_arp_entry);
+
+static struct pre_ld_arp_entry_list s_arp_list =
+	TAILQ_HEAD_INITIALIZER(s_arp_list);
 
 struct fd_desc {
 	TAILQ_ENTRY(fd_desc) next;
@@ -278,6 +296,11 @@ static ssize_t (*libc_read)(int, void *, size_t);
 static ssize_t (*libc_write)(int, const void *, size_t);
 static ssize_t (*libc_recv)(int, void *, size_t, int);
 static ssize_t (*libc_send)(int, const void *, size_t, int);
+static ssize_t (*libc_recvfrom)(int, void *, size_t, int,
+	struct sockaddr *, socklen_t *);
+static ssize_t (*libc_sendto)(int, const void *, size_t, int,
+	const struct sockaddr *, socklen_t);
+
 static int (*libc_select)(int, fd_set *, fd_set *, fd_set *,
 	struct timeval *);
 
@@ -451,9 +474,17 @@ static struct pre_ld_default_direction s_pre_ld_def_dir;
 static struct pre_ld_port_rx_flow *s_pre_ld_rx_flows[RTE_MAX_ETHPORTS];
 static struct pre_ld_port_rx_source *s_pre_ld_rx_src[RTE_MAX_ETHPORTS];
 
-struct pre_ld_udp_desc {
-	uint16_t offset;
+struct pre_ld_frame_desc {
+	uint16_t l3_off;
+	uint16_t l4_off;
+	uint16_t l5_off;
 	uint16_t length;
+	uint16_t family;
+	rte_be16_t src_port;
+	union {
+		uint8_t  src_ipv6[16];
+		rte_be32_t src_ipv4;
+	};
 } __rte_packed;
 
 #define PRE_LD_MP_PRIV_SIZE \
@@ -972,7 +1003,7 @@ pre_ld_crypto_init(struct rte_mempool *mbuf_pool)
 	return 0;
 }
 
-static inline int
+static inline void
 convert_ip_addr_to_str(char *str,
 	const void *_addr, uint8_t len)
 {
@@ -996,10 +1027,7 @@ convert_ip_addr_to_str(char *str,
 		str[idx] = 0;
 	} else {
 		PRE_LD_LOG(ERR, "Invalid IP address length(%d)\n", len);
-		return -EINVAL;
 	}
-
-	return 0;
 }
 
 static int
@@ -1149,6 +1177,189 @@ eal_destroy_dpaa2_mux_flow(void)
 			s_mux_cfg[i].entry_id[j] = -1;
 		}
 	}
+}
+
+static void
+netwrap_execute_ping(const uint8_t *ip4_dst)
+{
+	char ping_cmd[512];
+	int ret;
+
+	sprintf(ping_cmd, "ping -c 1 %d.%d.%d.%d > /dev/null\n",
+		ip4_dst[0], ip4_dst[1], ip4_dst[2], ip4_dst[3]);
+	ret = system(ping_cmd);
+	if (ret) {
+		PRE_LD_LOG(ERR, "Execute %s failed(%d)\n",
+			ping_cmd, ret);
+	}
+	usleep(1000);
+}
+
+static int
+netwrap_get_remote_hw(int sockfd)
+{
+	int ret = 0, offset = 0, i, arp_s, close_ret, try_time = 0;
+	struct arpreq arpreq;
+	char mac_addr[64];
+	uint8_t *ip4_dst = NULL;
+	uint8_t addr_bytes[RTE_ETHER_ADDR_LEN];
+	struct sockaddr_in ia;
+	struct eth_ipv4_udp_hdr *hdr = &s_fd_desc[sockfd].hdr;
+	struct pre_ld_arp_entry *entry;
+	int tunnel;
+
+	if ((s_fd_desc[sockfd].hdr_init & REMOTE_ETH_INIT) ==
+		REMOTE_ETH_INIT)
+		return 0;
+
+	if (!s_slow_if) {
+		PRE_LD_LOG(ERR, "%s: No tap port specified!\n", __func__);
+		return -EINVAL;
+	}
+
+	if ((s_fd_desc[sockfd].hdr_init &
+		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) !=
+		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) {
+		PRE_LD_LOG(ERR, "%s: fd:%d, remote IP/UDP not initialized.\n",
+			__func__, sockfd);
+		return -EINVAL;
+	}
+
+	if (!libc_socket)
+		LIBC_FUNCTION(socket);
+
+	if (!libc_close)
+		LIBC_FUNCTION(close);
+
+	arp_s = libc_socket(AF_INET, SOCK_STREAM, 0);
+	if (arp_s < 0) {
+		PRE_LD_LOG(ERR, "%s: Create arp socket failed(%d)\n",
+			__func__, arp_s);
+
+		return arp_s;
+	}
+
+arp_req_again:
+	tunnel = false;
+	memset(&ia, 0, sizeof(ia));
+	ia.sin_family = AF_INET;
+	ia.sin_addr.s_addr = hdr->ip_hdr.dst_addr;
+
+	memset(&arpreq, 0, sizeof(struct arpreq));
+	rte_memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
+	snprintf(arpreq.arp_dev, IFNAMSIZ, "%s", s_slow_if);
+	arpreq.arp_pa.sa_family = AF_INET;
+	arpreq.arp_ha.sa_family = AF_UNSPEC;
+
+	ip4_dst = (void *)&ia.sin_addr.s_addr;
+	netwrap_execute_ping(ip4_dst);
+	ret = ioctl(arp_s, SIOCGARP, &arpreq);
+	if (ret) {
+		PRE_LD_LOG(WARNING,
+			"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
+			__func__, ip4_dst[0], ip4_dst[1],
+			ip4_dst[2], ip4_dst[3], ret);
+		ip4_dst = (void *)&hdr->ip_hdr.dst_addr;
+		ret = xfm_find_sa_addrs_by_sp_addrs(NULL,
+				(const xfrm_address_t *)&hdr->ip_hdr.dst_addr,
+				AF_INET, XFRM_POLICY_OUT, NULL,
+				(xfrm_address_t *)&ia.sin_addr.s_addr);
+		if (ret) {
+			PRE_LD_LOG(WARNING,
+				"%s: Find SA by %d.%d.%d.%d failed(%d)\n",
+				__func__, ip4_dst[0], ip4_dst[1],
+				ip4_dst[2], ip4_dst[3], ret);
+		} else {
+			ip4_dst = (void *)&ia.sin_addr.s_addr;
+			rte_memcpy(&arpreq.arp_pa, &ia,
+				sizeof(struct sockaddr_in));
+			netwrap_execute_ping(ip4_dst);
+			ret = ioctl(arp_s, SIOCGARP, &arpreq);
+			if (ret) {
+				PRE_LD_LOG(ERR,
+					"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
+					__func__, ip4_dst[0], ip4_dst[1],
+					ip4_dst[2], ip4_dst[3], ret);
+			} else {
+				tunnel = true;
+			}
+		}
+	}
+
+	if (ret) {
+		try_time++;
+		if (try_time < 10)
+			goto arp_req_again;
+		goto close_arp_socket;
+	}
+
+	rte_memcpy(&s_fd_desc[sockfd].hdr.eth_hdr.dst_addr,
+		&arpreq.arp_ha.sa_data,
+		RTE_ETHER_ADDR_LEN);
+	rte_memcpy(addr_bytes, &arpreq.arp_ha.sa_data,
+		RTE_ETHER_ADDR_LEN);
+	for (i = 0; i < RTE_ETHER_ADDR_LEN; i++) {
+		if (i != (RTE_ETHER_ADDR_LEN - 1)) {
+			offset += sprintf(&mac_addr[offset],
+				"%02x:", addr_bytes[i]);
+		} else {
+			offset += sprintf(&mac_addr[offset],
+				"%02x", addr_bytes[i]);
+		}
+	}
+	PRE_LD_LOG(INFO, "FD[%d] Get Remote Mac: %s by %d.%d.%d.%d\n",
+		sockfd, mac_addr,
+		ip4_dst[0], ip4_dst[1], ip4_dst[2], ip4_dst[3]);
+
+	s_fd_desc[sockfd].hdr_init |= REMOTE_ETH_INIT;
+
+	entry = rte_zmalloc(NULL, sizeof(struct pre_ld_arp_entry), 0);
+	entry->family = AF_INET;
+	entry->ip4addr = ia.sin_addr.s_addr;
+	rte_memcpy(entry->hwaddr, addr_bytes, RTE_ETHER_ADDR_LEN);
+	TAILQ_INSERT_TAIL(&s_arp_list, entry, next);
+	if (tunnel) {
+		entry = rte_zmalloc(NULL, sizeof(struct pre_ld_arp_entry), 0);
+		entry->family = AF_INET;
+		entry->ip4addr = hdr->ip_hdr.dst_addr;
+		rte_memcpy(entry->hwaddr, addr_bytes, RTE_ETHER_ADDR_LEN);
+		TAILQ_INSERT_TAIL(&s_arp_list, entry, next);
+	}
+
+close_arp_socket:
+	close_ret = (*libc_close)(arp_s);
+	if (close_ret) {
+		PRE_LD_LOG(ERR, "%s: close arp socket(%d) failed(%d)\n",
+			__func__, arp_s, close_ret);
+	}
+
+	return ret;
+}
+
+static inline int
+pre_ld_arp_find_mac_by_ip(int fd,
+	const struct sockaddr_in *ia, uint8_t hwaddr[])
+{
+	struct pre_ld_arp_entry *entry, *tentry;
+	int ret;
+	struct eth_ipv4_udp_hdr *hdr = &s_fd_desc[fd].hdr;
+
+	RTE_TAILQ_FOREACH_SAFE(entry, &s_arp_list, next, tentry) {
+		if (entry->family == AF_INET &&
+			entry->family == ia->sin_family &&
+			entry->ip4addr == ia->sin_addr.s_addr) {
+			rte_memcpy(hwaddr, entry->hwaddr, RTE_ETHER_ADDR_LEN);
+			return 0;
+		}
+	}
+
+	ret = netwrap_get_remote_hw(fd);
+	if (ret)
+		return ret;
+
+	rte_memcpy(hwaddr, &hdr->eth_hdr.dst_addr, RTE_ETHER_ADDR_LEN);
+
+	return 0;
 }
 
 static inline int
@@ -1456,6 +1667,7 @@ static void eal_quit(void)
 	int ret;
 	struct pre_ld_lcore_direct_list *list;
 	struct pre_ld_direct_entry *entry;
+	struct pre_ld_arp_entry *arp_entry;
 	const struct pre_ld_port_rx_source *src;
 
 	usr_socket_force_release();
@@ -1488,6 +1700,12 @@ static void eal_quit(void)
 	}
 
 	s_pre_ld_quit = 1;
+
+	while (RTE_TAILQ_FIRST(&s_arp_list)) {
+		arp_entry = RTE_TAILQ_FIRST(&s_arp_list);
+		TAILQ_REMOVE(&s_arp_list, arp_entry, next);
+		rte_free(arp_entry);
+	}
 
 	eal_destroy_dpaa2_mux_flow();
 	RTE_ETH_FOREACH_DEV(portid) {
@@ -1597,14 +1815,16 @@ static int
 pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 {
 	int ret;
-	uint8_t l4_offset = 0;
-	struct rte_udp_hdr *udp_hdr;
+	uint8_t l3_offset = 0, l4_offset = 0, l5_offset = 0;
+	struct rte_ipv4_hdr *ipv4_hdr = NULL;
+	struct rte_ipv6_hdr *ipv6_hdr = NULL;
+	struct rte_udp_hdr *udp_hdr = NULL;
 	uint16_t length;
-	struct pre_ld_udp_desc *desc;
+	struct pre_ld_frame_desc *desc;
 	struct rte_udp_hdr *flow_hdr = &s_fd_desc[sockfd].hdr.udp_hdr;
 
 	ret = rte_pmd_dpaa2_rx_get_offset(mbuf,
-			NULL, &l4_offset, NULL);
+			&l3_offset, &l4_offset, &l5_offset);
 	if (unlikely(ret))
 		return ret;
 
@@ -1621,13 +1841,28 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 		return -EINVAL;
 	}
 
+	desc = (void *)mbuf->dynfield1;
 	udp_hdr = rte_pktmbuf_mtod_offset(mbuf, void *, l4_offset);
-	if (unlikely(udp_hdr->src_port != flow_hdr->dst_port ||
-		udp_hdr->dst_port != flow_hdr->src_port)) {
+
+	if (mbuf->packet_type & RTE_PTYPE_L3_IPV4) {
+		ipv4_hdr = rte_pktmbuf_mtod_offset(mbuf, void *,
+			l3_offset);
+		desc->family = AF_INET;
+		desc->src_ipv4 = ipv4_hdr->src_addr;
+	} else if (mbuf->packet_type & RTE_PTYPE_L3_IPV6) {
+		ipv6_hdr = rte_pktmbuf_mtod_offset(mbuf, void *,
+			l3_offset);
+		desc->family = AF_INET6;
+		rte_memcpy(desc->src_ipv6, ipv6_hdr->dst_addr, 16);
+	} else {
+		return -EINVAL;
+	}
+	desc->src_port = udp_hdr->src_port;
+
+	if (unlikely(udp_hdr->dst_port != flow_hdr->src_port)) {
 		PRE_LD_LOG(WARNING,
-			"FD(%d): UDP(%p) RX ERR(src %04x!=%04x, dst %04x!=%04x)\n",
-			sockfd, udp_hdr, udp_hdr->src_port, flow_hdr->dst_port,
-			udp_hdr->dst_port, flow_hdr->src_port);
+			"FD(%d): RX ERR(port dst %04x!=%04x)\n",
+			sockfd, udp_hdr->dst_port, flow_hdr->src_port);
 		rte_pktmbuf_dump(stdout, mbuf, 60);
 		if (s_data_verify_err_panic) {
 			rte_panic("%s line %d: verify failure!\r\n",
@@ -1637,11 +1872,11 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 	}
 	length = rte_be_to_cpu_16(udp_hdr->dgram_len) -
 		sizeof(struct rte_udp_hdr);
-	desc = (struct pre_ld_udp_desc *)udp_hdr - 1;
-	desc->offset = sizeof(struct pre_ld_udp_desc) +
-		sizeof(struct rte_udp_hdr);
+	desc->l3_off = l3_offset;
+	desc->l4_off = l4_offset;
+	desc->l5_off = l5_offset;
 	desc->length = length;
-	mbuf->data_off = (uint16_t)((uint8_t *)desc -
+	mbuf->data_off = (uint16_t)((uint8_t *)(udp_hdr + 1) -
 		(uint8_t *)mbuf->buf_addr);
 
 	return 0;
@@ -1721,6 +1956,32 @@ usr_data_path_malloc_mbuf(struct fd_desc *desc,
 	return 0;
 }
 
+static inline void
+pre_ld_socket_in_fill(void *socket_addr,
+	const struct pre_ld_frame_desc *frm_desc, socklen_t *len)
+{
+	struct sockaddr_in *ia4;
+	struct sockaddr_in6 *ia6;
+
+	if (frm_desc->family == AF_INET) {
+		if ((*len) < sizeof(struct sockaddr_in))
+			return;
+		ia4 = socket_addr;
+		ia4->sin_family = AF_INET;
+		ia4->sin_port = frm_desc->src_port;
+		ia4->sin_addr.s_addr = frm_desc->src_ipv4;
+		*len = sizeof(struct sockaddr_in);
+	} else {
+		if ((*len) < sizeof(struct sockaddr_in6))
+			return;
+		ia6 = socket_addr;
+		ia6->sin6_family = AF_INET6;
+		ia6->sin6_port = frm_desc->src_port;
+		rte_memcpy(&ia6->sin6_addr, frm_desc->src_ipv6, 16);
+		*len = sizeof(struct sockaddr_in6);
+	}
+}
+
 static int
 eal_recv_available(int sockfd)
 {
@@ -1782,14 +2043,15 @@ finsh_check:
 }
 
 static int
-eal_recv(int sockfd, void *buf, size_t len, int flags)
+eal_recv(int sockfd, void *buf, size_t len, int flags,
+	void *socket_addr, socklen_t *socket_len)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	struct rte_mbuf *free_burst[MAX_PKT_BURST];
 	struct rte_mbuf *mbuf;
 	uint32_t nb_rx = 0, i, total_bytes = 0, j;
 	size_t length, remain = len;
-	struct pre_ld_udp_desc *udp_desc;
+	struct pre_ld_frame_desc *frm_desc;
 	int ret;
 	uint8_t *buf_u8 = buf, *pkt;
 	struct fd_desc *desc;
@@ -1822,26 +2084,41 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 	while (rx_pool->head != rx_pool->tail &&
 		total_bytes < len) {
 		mbuf = rx_pool->rx_bufs[rx_pool->head];
-		udp_desc = rte_pktmbuf_mtod(mbuf, void *);
-		length = udp_desc->length;
-		pkt = ((uint8_t *)udp_desc + udp_desc->offset);
+		frm_desc = (void *)mbuf->dynfield1;
+		pkt = rte_pktmbuf_mtod(mbuf, void *);
+		length = frm_desc->length;
 		if (length <= remain) {
 			rte_memcpy(&buf_u8[total_bytes], pkt, length);
 			desc->rx_stat.usr_bytes += length;
-			remain -= length;
+			if (socket_addr) {
+				pre_ld_socket_in_fill(socket_addr,
+					frm_desc, socket_len);
+				remain = 0;
+			} else {
+				remain -= length;
+			}
 			total_bytes += length;
 			free_burst[i] = mbuf;
 			i++;
 			rx_pool->rx_bufs[rx_pool->head] = NULL;
 			rx_pool->head = (rx_pool->head + 1) &
 				(rx_pool->max_num - 1);
-		} else {
+			if (socket_addr)
+				break;
+		} else if (!socket_addr) {
 			rte_memcpy(&buf_u8[total_bytes], pkt, remain);
 			desc->rx_stat.usr_bytes += remain;
 			total_bytes += remain;
-			udp_desc->offset += remain;
-			udp_desc->length -= remain;
+			mbuf->data_off += remain;
+			frm_desc->length -= remain;
 			remain = 0;
+		} else {
+			free_burst[i] = mbuf;
+			i++;
+			rx_pool->rx_bufs[rx_pool->head] = NULL;
+			rx_pool->head = (rx_pool->head + 1) &
+				(rx_pool->max_num - 1);
+			break;
 		}
 		if (i == MAX_PKT_BURST) {
 			usr_data_path_free_mbuf(desc, free_burst, i);
@@ -1888,13 +2165,19 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 		ret = pre_ld_adjust_rx_l4_info(sockfd, pkts_burst[i]);
 		if (unlikely(ret))
 			break;
-		udp_desc = rte_pktmbuf_mtod(pkts_burst[i], void *);
-		pkt = (uint8_t *)udp_desc + udp_desc->offset;
-		length = udp_desc->length;
+		frm_desc = (void *)pkts_burst[i]->dynfield1;
+		pkt = rte_pktmbuf_mtod(pkts_burst[i], void *);
+		length = frm_desc->length;
 		if (remain >= length) {
 			rte_memcpy(&buf_u8[total_bytes], pkt, length);
 			desc->rx_stat.usr_bytes += length;
-			remain -= length;
+			if (socket_addr) {
+				pre_ld_socket_in_fill(socket_addr, frm_desc,
+					socket_len);
+				remain = 0;
+			} else {
+				remain -= length;
+			}
 			total_bytes += length;
 			free_burst[j] = pkts_burst[i];
 			j++;
@@ -1903,8 +2186,8 @@ eal_recv(int sockfd, void *buf, size_t len, int flags)
 			desc->rx_stat.usr_bytes += remain;
 			remain = 0;
 			total_bytes += remain;
-			udp_desc->offset += remain;
-			udp_desc->length -= remain;
+			pkts_burst[i]->data_off += remain;
+			frm_desc->length -= remain;
 			rx_pool->rx_bufs[rx_pool->tail] = pkts_burst[i];
 			rx_pool->tail = (rx_pool->tail + 1) &
 				(rx_pool->max_num - 1);
@@ -1939,9 +2222,10 @@ finsh_recv:
 	return total_bytes;
 }
 
-static void
+static int
 eal_send_fill_mbufs(int fd, const uint8_t *buf, uint16_t lens[],
-	struct rte_mbuf *mbufs[], uint16_t count)
+	struct rte_mbuf *mbufs[], uint16_t count,
+	const struct sockaddr *to)
 {
 	void *udp_data;
 	struct rte_ether_hdr *eth_hdr;
@@ -1949,6 +2233,16 @@ eal_send_fill_mbufs(int fd, const uint8_t *buf, uint16_t lens[],
 	struct rte_udp_hdr *udp_hdr;
 	uint16_t i;
 	struct rte_mbuf *m;
+	uint8_t hwaddr[RTE_ETHER_ADDR_LEN];
+	int ret;
+	const struct sockaddr_in *ia4 = (const void *)to;
+
+	/** We support ipv4 only now.*/
+	if (ia4) {
+		ret = pre_ld_arp_find_mac_by_ip(fd, ia4, hwaddr);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < count; i++) {
 		m = mbufs[i];
@@ -1959,13 +2253,21 @@ eal_send_fill_mbufs(int fd, const uint8_t *buf, uint16_t lens[],
 
 		rte_memcpy(eth_hdr, &s_fd_desc[fd].hdr,
 			sizeof(struct eth_ipv4_udp_hdr));
+		if (ia4) {
+			rte_memcpy(&eth_hdr->dst_addr, hwaddr,
+				RTE_ETHER_ADDR_LEN);
+		}
 		/* Set IP header length then calculate checksum.*/
 		ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+		if (ia4)
+			ip_hdr->dst_addr = ia4->sin_addr.s_addr;
 		ip_hdr->total_length = rte_cpu_to_be_16(lens[i] + IPv4_HDR_LEN);
 		ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
 		/* Set UDP header length only*/
 		udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+		if (ia4)
+			udp_hdr->dst_port = ia4->sin_port;
 		udp_hdr->dgram_len = rte_cpu_to_be_16(lens[i] + UDP_HDR_LEN);
 
 		udp_data = (void *)(udp_hdr + 1);
@@ -1980,10 +2282,13 @@ eal_send_fill_mbufs(int fd, const uint8_t *buf, uint16_t lens[],
 			RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
 		buf += lens[i];
 	}
+
+	return 0;
 }
 
 static int
-eal_send(int sockfd, const void *buf, size_t len, int flags)
+eal_send(int sockfd, const void *buf, size_t len, int flags,
+	const struct sockaddr *to)
 {
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint16_t lens[MAX_PKT_BURST];
@@ -2018,6 +2323,14 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 	hdr_len = RTE_ETHER_HDR_LEN + IPv4_HDR_LEN;
 	if (pre_ld_sp_out_ready())
 		hdr_len += IPv4_ESP_HDR_LEN + ESP_TAIL_MAX_LEN;
+	if (to && (len + hdr_len) > max_len) {
+		goto quit_send;
+	} else if (to) {
+		lens[count] = len;
+		len = 0;
+		count++;
+		goto start_send;
+	}
 	while ((len + hdr_len) > max_len) {
 		if (unlikely(count >= MAX_PKT_BURST))
 			break;
@@ -2030,6 +2343,8 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 		lens[count] = len;
 		count++;
 	}
+
+start_send:
 	ret = usr_data_path_malloc_mbuf(desc, mbufs, count);
 	if (unlikely(ret)) {
 		ret = 0;
@@ -2037,7 +2352,13 @@ eal_send(int sockfd, const void *buf, size_t len, int flags)
 		goto quit_send;
 	}
 
-	eal_send_fill_mbufs(sockfd, buf, lens, mbufs, count);
+	ret = eal_send_fill_mbufs(sockfd, buf, lens, mbufs, count, to);
+	if (unlikely(ret)) {
+		ret = 0;
+		count = 0;
+		rte_pktmbuf_free_bulk(mbufs, count);
+		goto quit_send;
+	}
 
 	if (desc->access_type == FD_THREAD_ACCESS) {
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
@@ -3095,9 +3416,6 @@ pre_ld_configure_direct_traffic(uint16_t ext_id,
 	rte_eth_dev_get_name_by_port(dl_id, dl_nm);
 	rte_eth_dev_get_name_by_port(tap_id, tap_nm);
 
-	if (s_data_path_core < 0)
-		rte_exit(EXIT_FAILURE, "No data path core available\n");
-
 	pre_ld_build_def_direct_traffic(dl_nm, tap_nm, dl_id, tap_id);
 	if (is_recyc) {
 		pre_ld_build_def_direct_traffic(tap_nm, ul_nm, tap_id, ul_id);
@@ -3504,7 +3822,6 @@ pre_ld_main_loop(void *dummy)
 	}
 	lcore_id = rte_lcore_id();
 	list = &s_pre_ld_lists[lcore_id];
-	s_data_path_core = lcore_id;
 
 	if (s_dir_recyc) {
 		ul_id = s_dir_ports.recyc_pair[0].ul_id;
@@ -3532,6 +3849,8 @@ pre_ld_main_loop(void *dummy)
 	s_dir_msg_req_r[lcore_id] = rte_ring_create(nm, 128, 0, 0);
 	sprintf(nm, "dir_core%d_flow_rsp", lcore_id);
 	s_dir_msg_rsp_r[lcore_id] = rte_ring_create(nm, 128, 0, 0);
+
+	s_data_path_core = lcore_id;
 
 for_ever_loop:
 	if (s_pre_ld_quit)
@@ -4143,6 +4462,7 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 	char ring_nm[RTE_MEMZONE_NAMESIZE];
 	struct pre_ld_port_rx_source *src;
 	struct rte_eth_rxq_info qinfo;
+	struct pre_ld_port_rx_flow *rx_flow;
 
 	if (portid >= RTE_MAX_ETHPORTS)
 		return -EINVAL;
@@ -4186,7 +4506,9 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 		if (flow_id >= dist_size)
 			continue;
 		src = &s_pre_ld_rx_src[portid][i];
-		s_pre_ld_rx_flows[portid][total_num].src = src;
+		rx_flow = &s_pre_ld_rx_flows[portid][total_num];
+		rte_spinlock_init(&rx_flow->flow_lock);
+		rx_flow->src = src;
 		src->port_id = portid;
 		src->tc_id = tc_index;
 		src->flow_id = flow_id;
@@ -5793,7 +6115,47 @@ map_ipv4_to_regular_ipv4(char *str)
 }
 
 static int
-netwrap_get_local_ip(int sockfd)
+_netwrap_get_local_ip(rte_be32_t *local_addr,
+	rte_be16_t *local_port)
+{
+	struct ifaddrs *interfaces = NULL;
+	struct ifaddrs *addr = NULL;
+	struct sockaddr_in *ip_addr;
+	char ipl[INET6_ADDRSTRLEN];
+	int ret = getifaddrs(&interfaces), found = 0;
+
+	if (ret)
+		return ret;
+
+	for (addr = interfaces; addr; addr = addr->ifa_next) {
+		if (!addr->ifa_addr || addr->ifa_addr->sa_family != AF_INET)
+			continue;
+		if (!strcmp(addr->ifa_name, s_slow_if)) {
+			ip_addr = (void *)addr->ifa_addr;
+			if (local_addr)
+				*local_addr = ip_addr->sin_addr.s_addr;
+			if (local_port)
+				*local_port = ip_addr->sin_port;
+			convert_ip_addr_to_str(ipl,
+				&ip_addr->sin_addr.s_addr, 4);
+			PRE_LD_LOG(INFO,
+				"%s: Get local ip(%s), port(%04x) of %s\n",
+				__func__, ipl,
+				ntohs(ip_addr->sin_port), s_slow_if);
+			found = 1;
+			break;
+		}
+	}
+	freeifaddrs(interfaces);
+
+	if (found)
+		return 0;
+
+	return -ENOENT;
+}
+
+static int
+netwrap_get_local_ip_connected(int sockfd)
 {
 	struct sockaddr_in ia;
 	socklen_t addrlen;
@@ -5820,10 +6182,7 @@ netwrap_get_local_ip(int sockfd)
 	}
 
 	if (ia.sin_family == AF_INET) {
-		ret = convert_ip_addr_to_str(ipl,
-			&ia.sin_addr.s_addr, 4);
-		if (ret)
-			return ret;
+		convert_ip_addr_to_str(ipl, &ia.sin_addr.s_addr, 4);
 
 		PRE_LD_LOG(INFO, "FD[%d] local AF_INET: port=%x, IP addr=%s\n",
 			sockfd, ntohs(ia.sin_port), ipl);
@@ -5866,119 +6225,125 @@ netwrap_get_local_ip(int sockfd)
 }
 
 static int
-netwrap_get_remote_hw(int sockfd)
+netwrap_get_local_ip(int sockfd)
 {
-	int ret = 0, offset = 0, i, arp_s, close_ret;
-	struct arpreq arpreq;
-	char mac_addr[64];
-	uint8_t *ip4_addr;
-	uint8_t addr_bytes[RTE_ETHER_ADDR_LEN];
-	struct sockaddr_in ia;
-	struct eth_ipv4_udp_hdr *hdr = &s_fd_desc[sockfd].hdr;
+	int ret;
+	struct eth_ipv4_udp_hdr *hdr;
+	rte_be32_t local_addr;
+	rte_be16_t local_port;
+	struct sockaddr_in sa;
+	socklen_t len;
+	char ipl[INET6_ADDRSTRLEN];
 
-	if (!s_slow_if) {
-		PRE_LD_LOG(ERR, "%s: No tap port specified!\n", __func__);
-		return -EINVAL;
+	if ((s_fd_desc[sockfd].hdr_init &
+		(LOCAL_IP_INIT | LOCAL_UDP_INIT)) ==
+		(LOCAL_IP_INIT | LOCAL_UDP_INIT))
+		return 0;
+
+	hdr = &s_fd_desc[sockfd].hdr;
+
+	ret = _netwrap_get_local_ip(&local_addr, &local_port);
+	if (ret)
+		return ret;
+
+	if (local_addr != INADDR_ANY) {
+		hdr->ip_hdr.src_addr = local_addr;
+		s_fd_desc[sockfd].hdr_init |= LOCAL_IP_INIT;
 	}
 
 	if ((s_fd_desc[sockfd].hdr_init &
-		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) !=
-		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) {
-		PRE_LD_LOG(ERR, "%s: fd:%d, remote IP/UDP not initialized.\n",
-			__func__, sockfd);
-		return -EINVAL;
-	}
-	memset(&ia, 0, sizeof(ia));
-	ia.sin_family = AF_INET;
-	ia.sin_addr.s_addr = hdr->ip_hdr.dst_addr;
-	ia.sin_port = hdr->udp_hdr.dst_port;
+		(LOCAL_IP_INIT | LOCAL_UDP_INIT)) ==
+		(LOCAL_IP_INIT | LOCAL_UDP_INIT))
+		return 0;
 
-	memset(&arpreq, 0, sizeof(struct arpreq));
-	rte_memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
-	snprintf(arpreq.arp_dev, IFNAMSIZ, "%s", s_slow_if);
-	arpreq.arp_pa.sa_family = AF_INET;
-	arpreq.arp_ha.sa_family = AF_UNSPEC;
-
-	if (!libc_socket)
-		LIBC_FUNCTION(socket);
-
-	if (!libc_close)
-		LIBC_FUNCTION(close);
-
-	arp_s = libc_socket(AF_INET, SOCK_STREAM, 0);
-	if (arp_s < 0) {
-		PRE_LD_LOG(ERR, "%s: Create arp socket failed(%d)\n",
-			__func__, arp_s);
-
-		return arp_s;
-	}
-	ip4_addr = (void *)&ia.sin_addr.s_addr;
-	ret = ioctl(arp_s, SIOCGARP, &arpreq);
+	memset(&sa, 0, sizeof(struct sockaddr_in));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = local_addr;
+	sa.sin_port = local_port;
+	len = sizeof(struct sockaddr_in);
+	ret = (*libc_bind)(sockfd, (const struct sockaddr *)&sa, len);
 	if (ret) {
-		PRE_LD_LOG(WARNING,
-			"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
-			__func__, ip4_addr[0], ip4_addr[1],
-			ip4_addr[2], ip4_addr[3], ret);
-		ret = xfm_find_sa_addrs_by_sp_addrs(NULL,
-				(const xfrm_address_t *)&hdr->ip_hdr.dst_addr,
-				AF_INET, XFRM_POLICY_OUT, NULL,
-				(xfrm_address_t *)&ia.sin_addr.s_addr);
-		if (ret)
-			goto close_arp_socket;
-		ip4_addr = (void *)&ia.sin_addr.s_addr;
-		rte_memcpy(&arpreq.arp_pa, &ia, sizeof(struct sockaddr_in));
-		ret = ioctl(arp_s, SIOCGARP, &arpreq);
-		if (ret) {
-			PRE_LD_LOG(ERR,
-				"%s: Get arp table by %d.%d.%d.%d failed(%d)\n",
-				__func__, ip4_addr[0], ip4_addr[1],
-				ip4_addr[2], ip4_addr[3], ret);
-			goto close_arp_socket;
-		}
+		convert_ip_addr_to_str(ipl, &local_addr, sizeof(rte_be32_t));
+		PRE_LD_LOG(ERR,
+			"%s: sockfd %d bind ip(%s), port(%04x) failed(%d)\n",
+			__func__, sockfd, ipl,
+			ntohs(local_port), ret);
+		return ret;
 	}
 
-	rte_memcpy(&s_fd_desc[sockfd].hdr.eth_hdr.dst_addr,
-		&arpreq.arp_ha.sa_data,
-		RTE_ETHER_ADDR_LEN);
-	rte_memcpy(addr_bytes, &arpreq.arp_ha.sa_data,
-		RTE_ETHER_ADDR_LEN);
-	for (i = 0; i < RTE_ETHER_ADDR_LEN; i++) {
-		if (i != (RTE_ETHER_ADDR_LEN - 1)) {
-			offset += sprintf(&mac_addr[offset],
-				"%02x:", addr_bytes[i]);
-		} else {
-			offset += sprintf(&mac_addr[offset],
-				"%02x", addr_bytes[i]);
-		}
+	ret = getsockname(sockfd, (struct sockaddr *)&sa, &len);
+	if (ret) {
+		PRE_LD_LOG(ERR,
+			"%s: Get socket(%d)'s name failed(%d)\n",
+			__func__, sockfd, ret);
+		return ret;
 	}
-	PRE_LD_LOG(INFO, "FD[%d], Get Remote Mac: %s by %d.%d.%d.%d\n",
-		sockfd, mac_addr,
-		ip4_addr[0], ip4_addr[1], ip4_addr[2], ip4_addr[3]);
+	convert_ip_addr_to_str(ipl, &sa.sin_addr.s_addr,
+		sizeof(rte_be32_t));
+	PRE_LD_LOG(INFO,
+		"%s: Get socket(%d)'s name: ip(%s), port:%04x\n",
+		__func__, sockfd, ipl, ntohs(sa.sin_port));
 
-	s_fd_desc[sockfd].hdr_init |= REMOTE_ETH_INIT;
+	hdr->ip_hdr.src_addr = sa.sin_addr.s_addr;
+	hdr->udp_hdr.src_port = sa.sin_port;
 
-close_arp_socket:
-	close_ret = (*libc_close)(arp_s);
-	if (close_ret) {
-		PRE_LD_LOG(ERR, "%s: close arp socket(%d) failed(%d)\n",
-			__func__, arp_s, close_ret);
-	}
+	s_fd_desc[sockfd].hdr_init |= (LOCAL_IP_INIT | LOCAL_UDP_INIT);
 
-	return ret;
+	return 0;
 }
 
 static int
-netwrap_get_remote_ip(int sockfd)
+netwrap_get_remote_ip(int sockfd,
+	const void *peer_addr, socklen_t len)
 {
-	int ret;
+	int ret, usr_set = false;
 	struct sockaddr_in ia;
 	socklen_t addrlen;
 	char ipl[INET6_ADDRSTRLEN];
 	struct eth_ipv4_udp_hdr *hdr;
+	const struct sockaddr_in *ia4;
+	const struct sockaddr_in6 *ia6;
+
+	hdr = &s_fd_desc[sockfd].hdr;
+	if ((s_fd_desc[sockfd].hdr_init &
+		(REMOTE_IP_INIT | REMOTE_UDP_INIT)) ==
+		(REMOTE_IP_INIT | REMOTE_UDP_INIT))
+		return 0;
+	if (peer_addr && len == sizeof(struct sockaddr_in)) {
+		ia4 = peer_addr;
+		hdr->ip_hdr.dst_addr = ia4->sin_addr.s_addr;
+		hdr->udp_hdr.dst_port = ia4->sin_port;
+		usr_set = true;
+	} else if (peer_addr && len == sizeof(struct sockaddr_in6)) {
+		ia6 = peer_addr;
+		hdr->ip_hdr.dst_addr = ia6->sin6_addr.__in6_u.__u6_addr32[3];
+		hdr->udp_hdr.dst_port = ia6->sin6_port;
+		usr_set = true;
+	}
+
+	if (usr_set) {
+		convert_ip_addr_to_str(ipl, &hdr->ip_hdr.dst_addr, 4);
+		PRE_LD_LOG(INFO,
+			"Set FD[%d]'s remote by user: port=%x, IP addr=%s\n",
+			sockfd, ntohs(hdr->udp_hdr.dst_port), ipl);
+		s_fd_desc[sockfd].hdr_init |=
+			(REMOTE_IP_INIT | REMOTE_UDP_INIT);
+
+		return 0;
+	}
+
+	if ((s_fd_desc[sockfd].hdr_init &
+		(LOCAL_IP_INIT | LOCAL_UDP_INIT)) !=
+		(LOCAL_IP_INIT | LOCAL_UDP_INIT)) {
+		PRE_LD_LOG(ERR,
+			"%s: Socket(%d) doesn't get local IP yet.\n",
+			__func__, sockfd);
+		return -EINVAL;
+	}
 
 	ia.sin_family = AF_INET;
-	ia.sin_addr.s_addr = htonl(INADDR_ANY);
-	ia.sin_port = 0;
+	ia.sin_addr.s_addr = hdr->ip_hdr.src_addr;
+	ia.sin_port = hdr->udp_hdr.src_port;
 	addrlen = sizeof(ia);
 
 	ret = getpeername(sockfd, (struct sockaddr *)&ia, &addrlen);
@@ -5990,12 +6355,8 @@ netwrap_get_remote_ip(int sockfd)
 		return ret;
 	}
 
-	hdr = &s_fd_desc[sockfd].hdr;
 	if (ia.sin_family == AF_INET) {
-		ret = convert_ip_addr_to_str(ipl,
-				&ia.sin_addr.s_addr, 4);
-		if (ret)
-			return ret;
+		convert_ip_addr_to_str(ipl, &ia.sin_addr.s_addr, 4);
 
 		PRE_LD_LOG(INFO,
 			"FD[%d] remote: AF_INET, port=%x, IP addr=%s\n",
@@ -6005,7 +6366,6 @@ netwrap_get_remote_ip(int sockfd)
 		hdr->udp_hdr.dst_port = ia.sin_port;
 	} else if (ia.sin_family == AF_INET6) {
 		struct sockaddr_storage local_addr;
-		struct sockaddr_in6 *ia6;
 
 		/** Get socket name again.*/
 		addrlen = sizeof(struct sockaddr_storage);
@@ -6018,8 +6378,9 @@ netwrap_get_remote_ip(int sockfd)
 
 			return ret;
 		}
-		ia6 = (void *)&local_addr;
-		inet_ntop(AF_INET6, (void *)&ia6->sin6_addr, ipl, sizeof(ipl));
+		ia6 = (const void *)&local_addr;
+		inet_ntop(AF_INET6, (const void *)&ia6->sin6_addr, ipl,
+			sizeof(ipl));
 		map_ipv4_to_regular_ipv4(ipl);
 
 		hdr->ip_hdr.dst_addr = ia6->sin6_addr.__in6_u.__u6_addr32[3];
@@ -6088,11 +6449,15 @@ netwrap_get_local_hw(int sockfd)
 }
 
 static int
-netwrap_collect_info(int sockfd)
+netwrap_collect_info(int sockfd, const void *peer_addr,
+	socklen_t peerlen, int connected)
 {
 	int ret;
 
-	ret = netwrap_get_local_ip(sockfd);
+	if (connected)
+		ret = netwrap_get_local_ip_connected(sockfd);
+	else
+		ret = netwrap_get_local_ip(sockfd);
 	if (ret) {
 		PRE_LD_LOG(ERR,
 			"%s: User socket(%d) Get local IP failed(%d)\n",
@@ -6106,7 +6471,7 @@ netwrap_collect_info(int sockfd)
 			__func__, sockfd, ret);
 		return ret;
 	}
-	ret = netwrap_get_remote_ip(sockfd);
+	ret = netwrap_get_remote_ip(sockfd, peer_addr, peerlen);
 	if (ret) {
 		PRE_LD_LOG(ERR,
 			"%s: User socket(%d) Get remote info failed(%d)\n",
@@ -6121,14 +6486,14 @@ netwrap_collect_info(int sockfd)
 		return ret;
 	}
 
-	PRE_LD_LOG(ERR, "User socket(%d) collect info successfully.\n",
+	PRE_LD_LOG(INFO, "User socket(%d) collect info successfully.\n",
 		sockfd);
 
 	return 0;
 }
 
 static int
-socket_create_ingress_flow(int sockfd)
+socket_create_ingress_flow(int sockfd, int connected)
 {
 	struct pre_ld_port_rx_flow_pattern flow_pattern;
 	int ret;
@@ -6141,6 +6506,15 @@ socket_create_ingress_flow(int sockfd)
 	if (!(s_fd_desc[sockfd].hdr_init & LOCAL_UDP_INIT)) {
 		PRE_LD_LOG(ERR,
 			"Socket(%d) local UDP port not initialized.\n",
+			sockfd);
+		pthread_mutex_unlock(&s_fd_mutex);
+		return -EINVAL;
+	}
+
+	if (connected &&
+		!(s_fd_desc[sockfd].hdr_init & REMOTE_UDP_INIT)) {
+		PRE_LD_LOG(ERR,
+			"Socket(%d) remote UDP port not initialized.\n",
 			sockfd);
 		pthread_mutex_unlock(&s_fd_mutex);
 		return -EINVAL;
@@ -6205,6 +6579,12 @@ socket_create_ingress_flow(int sockfd)
 	flow_pattern.items[0].udp_spec.hdr.dst_port =
 		s_fd_desc[sockfd].hdr.udp_hdr.src_port;
 	flow_pattern.masks[0].udp_spec.hdr.dst_port = 0xffff;
+	if (s_fd_desc[sockfd].hdr_init & REMOTE_UDP_INIT &&
+		connected) {
+		flow_pattern.items[0].udp_spec.hdr.src_port =
+			s_fd_desc[sockfd].hdr.udp_hdr.dst_port;
+		flow_pattern.masks[0].udp_spec.hdr.src_port = 0xffff;
+	}
 
 	ret = eal_create_flow(sockfd, &flow_pattern);
 	pthread_mutex_unlock(&s_fd_mutex);
@@ -6239,12 +6619,18 @@ bind(int sockfd, const struct sockaddr *addr,
 		}
 	}
 
-	convert_ip_addr_to_str(ipl, &sa->sin_addr.s_addr, 4);
+	convert_ip_addr_to_str(ipl, &sa->sin_addr.s_addr,
+		sizeof(rte_be32_t));
 
 	if (is_usr_socket(sockfd)) {
+		if (sa->sin_addr.s_addr != INADDR_ANY) {
+			s_fd_desc[sockfd].hdr.ip_hdr.src_addr =
+				sa->sin_addr.s_addr;
+			s_fd_desc[sockfd].hdr_init |= LOCAL_IP_INIT;
+		}
 		s_fd_desc[sockfd].hdr.udp_hdr.src_port = sa->sin_port;
 		s_fd_desc[sockfd].hdr_init |= LOCAL_UDP_INIT;
-		ret = socket_create_ingress_flow(sockfd);
+		ret = socket_create_ingress_flow(sockfd, false);
 		if (ret) {
 			PRE_LD_LOG(ERR,
 				"%s user socket:%d create ingress flow failed(%d)\n",
@@ -6289,16 +6675,35 @@ accept(int sockfd, struct sockaddr *addr,
 	return accept_value;
 }
 
+static int
+pre_ld_kernel_connect(int sockfd, const struct sockaddr *addr,
+	socklen_t addrlen)
+{
+	int connect_value = 0, connect_times = 0;
+#define CONNECT_MAX_TIMES 5
+
+connect_usr:
+	connect_value = (*libc_connect)(sockfd, addr, addrlen);
+	connect_times++;
+	if (connect_times < CONNECT_MAX_TIMES && connect_value) {
+		sleep(1);
+		PRE_LD_LOG(WARNING,
+			"Connect user fd:%d failed, try again\n", sockfd);
+		goto connect_usr;
+	}
+
+	return connect_value;
+}
+
 int
 connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-	int connect_value = 0, ret, offset = 0, connect_times = 0;
+	int ret, offset = 0;
 	const struct sockaddr_in *sa = (const void *)addr;
 	const struct sockaddr_in6 *ia6 = (const void *)addr;
 	char connect_info[512];
 	char ipl[INET6_ADDRSTRLEN];
 	const uint8_t *ip_addr;
-#define CONNECT_MAX_TIMES 5
 
 	if (unlikely(!libc_connect)) {
 		LIBC_FUNCTION(connect);
@@ -6313,44 +6718,25 @@ connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	}
 
 	if (is_usr_socket(sockfd)) {
-connect_usr:
-		connect_value = (*libc_connect)(sockfd, addr, addrlen);
-		connect_times++;
-		if (connect_times < CONNECT_MAX_TIMES && connect_value) {
-			sleep(1);
-			PRE_LD_LOG(WARNING,
-				"Connect user fd:%d failed, try again\n",
-				sockfd);
-			goto connect_usr;
-		}
-		if (connect_value)
+		ret = pre_ld_kernel_connect(sockfd, addr, addrlen);
+		if (ret)
 			goto connect_quit;
 
-		ret = netwrap_collect_info(sockfd);
+		ret = netwrap_collect_info(sockfd, NULL, 0, true);
 		if (ret) {
 			PRE_LD_LOG(ERR, "%s fd:%d, collect info failed(%d)\n",
 				__func__, sockfd, ret);
-			connect_value = ret;
 			goto connect_quit;
 		}
 
-		connect_value = socket_create_ingress_flow(sockfd);
+		ret = socket_create_ingress_flow(sockfd, true);
 	} else {
-connect_sys:
-		connect_value = (*libc_connect)(sockfd, addr, addrlen);
-		connect_times++;
-		if (connect_times < CONNECT_MAX_TIMES && connect_value) {
-			sleep(1);
-			PRE_LD_LOG(WARNING,
-				"Connect sys fd:%d failed, try again\n",
-				sockfd);
-			goto connect_sys;
-		}
+		ret = pre_ld_kernel_connect(sockfd, addr, addrlen);
 	}
 
 connect_quit:
-	if (connect_value)
-		offset = sprintf(connect_info, "failed(%d):", connect_value);
+	if (ret)
+		offset = sprintf(connect_info, "failed(%d):", ret);
 	else
 		offset = sprintf(connect_info, "successfully:");
 
@@ -6371,7 +6757,7 @@ connect_quit:
 	PRE_LD_LOG(INFO, "Connect fd:%d, addrlen(%d) %s\n",
 		sockfd, addrlen, connect_info);
 
-	return connect_value;
+	return ret;
 }
 
 ssize_t
@@ -6387,7 +6773,7 @@ read(int sockfd, void *buf, size_t len)
 	}
 
 	if (is_usr_socket(sockfd) && is_usr_socket_connected(sockfd))
-		return eal_recv(sockfd, buf, len, 0);
+		return eal_recv(sockfd, buf, len, 0, NULL, NULL);
 
 	if (libc_read) {
 		read_value = (*libc_read)(sockfd, buf, len);
@@ -6403,14 +6789,14 @@ read(int sockfd, void *buf, size_t len)
 	}
 
 	if (is_usr_socket(sockfd)) {
-		ret = netwrap_collect_info(sockfd);
+		ret = netwrap_collect_info(sockfd, NULL, 0, false);
 		if (ret) {
 			PRE_LD_LOG(ERR,
 				"%s Socket(%d) collect info failed(%d)\n",
 				__func__, sockfd, ret);
 		}
 
-		ret = socket_create_ingress_flow(sockfd);
+		ret = socket_create_ingress_flow(sockfd, false);
 		if (ret) {
 			PRE_LD_LOG(ERR,
 				"%s Socket(%d) create ingress flow failed(%d)\n",
@@ -6436,7 +6822,7 @@ write(int sockfd, const void *buf, size_t len)
 	if (likely(is_usr_socket(sockfd))) {
 		if (unlikely((s_fd_desc[sockfd].hdr_init &
 			HDR_INIT_ALL) != HDR_INIT_ALL)) {
-			ret = netwrap_collect_info(sockfd);
+			ret = netwrap_collect_info(sockfd, NULL, 0, false);
 			if (ret) {
 				PRE_LD_LOG(ERR,
 					"%s sockfd(%d) collect info failed(%d)\n",
@@ -6444,7 +6830,7 @@ write(int sockfd, const void *buf, size_t len)
 				goto send_to_kernel;
 			}
 		}
-		write_value = eal_send(sockfd, buf, len, 0);
+		write_value = eal_send(sockfd, buf, len, 0, NULL);
 		errno = 0;
 
 		return write_value;
@@ -6479,7 +6865,7 @@ recv(int sockfd, void *buf, size_t len, int flags)
 	}
 
 	if (is_usr_socket(sockfd) && is_usr_socket_connected(sockfd))
-		return eal_recv(sockfd, buf, len, flags);
+		return eal_recv(sockfd, buf, len, flags, NULL, NULL);
 
 	if (libc_recv) {
 		recv_value = (*libc_recv)(sockfd, buf, len, flags);
@@ -6495,14 +6881,65 @@ recv(int sockfd, void *buf, size_t len, int flags)
 	}
 
 	if (is_usr_socket(sockfd)) {
-		ret = netwrap_collect_info(sockfd);
+		ret = netwrap_collect_info(sockfd, NULL, 0, false);
 		if (ret) {
 			PRE_LD_LOG(ERR,
 				"%s Socket(%d) collect info failed(%d)\n",
 				__func__, sockfd, ret);
 		}
 
-		ret = socket_create_ingress_flow(sockfd);
+		ret = socket_create_ingress_flow(sockfd, false);
+		if (ret) {
+			PRE_LD_LOG(ERR,
+				"%s Socket(%d) create ingress flow failed(%d)\n",
+				__func__, sockfd, ret);
+		}
+	}
+
+	return recv_value;
+}
+
+ssize_t
+recvfrom(int sockfd, void *buf, size_t len, int flags,
+	struct sockaddr *from, socklen_t *fromlen)
+{
+	ssize_t recv_value = 0;
+	int ret;
+
+	if (s_socket_dbg) {
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_recvfrom:%p\n",
+			__func__, sockfd, libc_recvfrom);
+		dump_usr_fd(__func__);
+	}
+
+	if (is_usr_socket(sockfd) && is_usr_socket_connected(sockfd))
+		return eal_recv(sockfd, buf, len, flags, from, fromlen);
+
+	if (libc_recvfrom) {
+		recv_value = (*libc_recvfrom)(sockfd, buf, len, flags,
+			from, fromlen);
+	} else { /* pre init*/
+		LIBC_FUNCTION(recvfrom);
+
+		if (libc_recvfrom) {
+			recv_value = (*libc_recvfrom)(sockfd, buf, len, flags,
+				from, fromlen);
+		} else {
+			recv_value = -EACCES;
+			errno = EACCES;
+		}
+	}
+
+	if (is_usr_socket(sockfd)) {
+		ret = netwrap_collect_info(sockfd, from,
+			fromlen ? *fromlen : 0, false);
+		if (ret) {
+			PRE_LD_LOG(ERR,
+				"%s Socket(%d) collect info failed(%d)\n",
+				__func__, sockfd, ret);
+		}
+
+		ret = socket_create_ingress_flow(sockfd, false);
 		if (ret) {
 			PRE_LD_LOG(ERR,
 				"%s Socket(%d) create ingress flow failed(%d)\n",
@@ -6528,7 +6965,7 @@ send(int sockfd, const void *buf, size_t len, int flags)
 	if (likely(is_usr_socket(sockfd))) {
 		if (unlikely((s_fd_desc[sockfd].hdr_init &
 			HDR_INIT_ALL) != HDR_INIT_ALL)) {
-			ret = netwrap_collect_info(sockfd);
+			ret = netwrap_collect_info(sockfd, NULL, 0, false);
 			if (ret) {
 				PRE_LD_LOG(ERR,
 					"%s sockfd(%d) collect info failed(%d)\n",
@@ -6536,7 +6973,7 @@ send(int sockfd, const void *buf, size_t len, int flags)
 				goto send_to_kernel;
 			}
 		}
-		send_value = eal_send(sockfd, buf, len, flags);
+		send_value = eal_send(sockfd, buf, len, flags, NULL);
 		errno = 0;
 
 		return send_value;
@@ -6551,6 +6988,55 @@ send_to_kernel:
 
 		if (libc_send) {
 			send_value = (*libc_send)(sockfd, buf, len, flags);
+		} else {
+			send_value = -EACCES;
+			errno = EACCES;
+		}
+	}
+
+	return send_value;
+}
+
+ssize_t
+sendto(int sockfd, const void *buf, size_t len, int flags,
+	const struct sockaddr *to, socklen_t tolen)
+{
+	ssize_t send_value;
+	int ret;
+
+	if (s_socket_dbg) {
+		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_send:%p\n",
+			__func__, sockfd, libc_sendto);
+		dump_usr_fd(__func__);
+	}
+
+	if (likely(is_usr_socket(sockfd))) {
+		if (unlikely((s_fd_desc[sockfd].hdr_init &
+			LOCAL_HDR_INIT) != LOCAL_HDR_INIT)) {
+			ret = netwrap_collect_info(sockfd, to, tolen, false);
+			if (ret) {
+				PRE_LD_LOG(ERR,
+					"%s sockfd(%d) collect info failed(%d)\n",
+					__func__, sockfd, ret);
+				goto send_to_kernel;
+			}
+		}
+
+		send_value = eal_send(sockfd, buf, len, flags, to);
+		errno = 0;
+
+		return send_value;
+	}
+
+send_to_kernel:
+	if (libc_sendto) {
+		send_value = (*libc_sendto)(sockfd, buf, len, flags,
+			to, tolen);
+	} else {
+		LIBC_FUNCTION(sendto);
+		if (libc_sendto) {
+			send_value = (*libc_sendto)(sockfd, buf, len, flags,
+				to, tolen);
 		} else {
 			send_value = -EACCES;
 			errno = EACCES;
@@ -7112,6 +7598,8 @@ static void setup_wrappers(void)
 	LIBC_FUNCTION(write);
 	LIBC_FUNCTION(recv);
 	LIBC_FUNCTION(send);
+	LIBC_FUNCTION(recvfrom);
+	LIBC_FUNCTION(sendto);
 	LIBC_FUNCTION(select);
 	s_socket_pre_set = 1;
 
