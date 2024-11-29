@@ -505,6 +505,8 @@ struct pre_ld_frame_desc {
 static struct timespec s_ts;
 static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+#define PRE_LD_MAX_ADDR_NUM_PER_IF 4
+
 static void
 _pre_ld_time_log(uint32_t level, uint32_t logtype)
 {
@@ -6116,37 +6118,73 @@ map_ipv4_to_regular_ipv4(char *str)
 
 static int
 _netwrap_get_local_ip(rte_be32_t *local_addr,
-	rte_be16_t *local_port)
+	rte_be16_t *local_port, const void *peer_addr,
+	socklen_t peerlen)
 {
 	struct ifaddrs *interfaces = NULL;
 	struct ifaddrs *addr = NULL;
-	struct sockaddr_in *ip_addr;
+	struct sockaddr_in ip_addr[PRE_LD_MAX_ADDR_NUM_PER_IF];
+	struct sockaddr_in ip_mask[PRE_LD_MAX_ADDR_NUM_PER_IF];
 	char ipl[INET6_ADDRSTRLEN];
-	int ret = getifaddrs(&interfaces), found = 0;
+	const struct sockaddr_in *ia4;
+	int ret = getifaddrs(&interfaces), found = 0, num = 0, i;
+	uint32_t cpu_addr, cpu_mask, cpu_peer;
 
 	if (ret)
 		return ret;
 
+	if (peer_addr && peerlen != sizeof(struct sockaddr_in))
+		return -ENOTSUP;
+	ia4 = peer_addr;
+
 	for (addr = interfaces; addr; addr = addr->ifa_next) {
 		if (!addr->ifa_addr || addr->ifa_addr->sa_family != AF_INET)
 			continue;
-		if (!strcmp(addr->ifa_name, s_slow_if)) {
-			ip_addr = (void *)addr->ifa_addr;
-			if (local_addr)
-				*local_addr = ip_addr->sin_addr.s_addr;
-			if (local_port)
-				*local_port = ip_addr->sin_port;
-			convert_ip_addr_to_str(ipl,
-				&ip_addr->sin_addr.s_addr, 4);
-			PRE_LD_LOG(INFO,
-				"%s: Get local ip(%s), port(%04x) of %s\n",
-				__func__, ipl,
-				ntohs(ip_addr->sin_port), s_slow_if);
-			found = 1;
-			break;
+		if (strcmp(addr->ifa_name, s_slow_if))
+			continue;
+
+		rte_memcpy(&ip_addr[num], addr->ifa_addr,
+			sizeof(struct sockaddr_in));
+		if (addr->ifa_netmask) {
+			rte_memcpy(&ip_mask[num], addr->ifa_netmask,
+				sizeof(struct sockaddr_in));
+		} else {
+			ip_mask[num].sin_family = AF_INET;
+			ip_mask[num].sin_port = 0xffff;
+			ip_mask[num].sin_addr.s_addr =
+				rte_cpu_to_be_32(0xffff0000);
 		}
+		num++;
+		if (num >= PRE_LD_MAX_ADDR_NUM_PER_IF)
+			break;
 	}
 	freeifaddrs(interfaces);
+
+	for (i = 0; i < num; i++) {
+		if (!ia4) {
+			/** We select the first address.*/
+			goto find_local_ip;
+		}
+		cpu_addr = rte_be_to_cpu_32(ip_addr[i].sin_addr.s_addr);
+		cpu_mask = rte_be_to_cpu_32(ip_mask[i].sin_addr.s_addr);
+		cpu_peer = rte_be_to_cpu_32(ia4->sin_addr.s_addr);
+		if ((cpu_addr & cpu_mask) != (cpu_peer & cpu_mask))
+			continue;
+
+find_local_ip:
+		if (local_addr)
+			*local_addr = ip_addr[i].sin_addr.s_addr;
+		if (local_port)
+			*local_port = ip_addr[i].sin_port;
+		convert_ip_addr_to_str(ipl,
+			&ip_addr[i].sin_addr.s_addr, sizeof(__be32));
+		PRE_LD_LOG(INFO,
+			"%s: Get local ip(%s), port(%04x) of %s\n",
+			__func__, ipl,
+			ntohs(ip_addr[i].sin_port), s_slow_if);
+		found = 1;
+		break;
+	}
 
 	if (found)
 		return 0;
@@ -6225,7 +6263,8 @@ netwrap_get_local_ip_connected(int sockfd)
 }
 
 static int
-netwrap_get_local_ip(int sockfd)
+netwrap_get_local_ip(int sockfd, const void *peer_addr,
+	socklen_t peerlen)
 {
 	int ret;
 	struct eth_ipv4_udp_hdr *hdr;
@@ -6242,7 +6281,8 @@ netwrap_get_local_ip(int sockfd)
 
 	hdr = &s_fd_desc[sockfd].hdr;
 
-	ret = _netwrap_get_local_ip(&local_addr, &local_port);
+	ret = _netwrap_get_local_ip(&local_addr, &local_port,
+		peer_addr, peerlen);
 	if (ret)
 		return ret;
 
@@ -6457,7 +6497,7 @@ netwrap_collect_info(int sockfd, const void *peer_addr,
 	if (connected)
 		ret = netwrap_get_local_ip_connected(sockfd);
 	else
-		ret = netwrap_get_local_ip(sockfd);
+		ret = netwrap_get_local_ip(sockfd, peer_addr, peerlen);
 	if (ret) {
 		PRE_LD_LOG(ERR,
 			"%s: User socket(%d) Get local IP failed(%d)\n",
