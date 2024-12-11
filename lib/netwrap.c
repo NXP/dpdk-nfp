@@ -507,6 +507,13 @@ static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define PRE_LD_MAX_ADDR_NUM_PER_IF 4
 
+#define PRE_LD_LOCAL_IP_ADDR "127.0.0.1"
+#define PRE_LD_INVALID_IP_ADDR "255.0.0.0"
+
+#define PRE_LD_LOCAL_IP_MASK 0x000000ff
+static const rte_be32_t s_pre_ld_local_ip = 0x0000007f;
+static const rte_be32_t s_pre_ld_invalid_ip = 0x000000ff;
+
 static void
 _pre_ld_time_log(uint32_t level, uint32_t logtype)
 {
@@ -6662,6 +6669,16 @@ bind(int sockfd, const struct sockaddr *addr,
 	convert_ip_addr_to_str(ipl, &sa->sin_addr.s_addr,
 		sizeof(rte_be32_t));
 
+	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+		s_pre_ld_local_ip && is_usr_socket(sockfd)) {
+		usr_socket_fd_remove(sockfd);
+		ret = usr_socket_fd_release(sockfd);
+		if (ret) {
+			PRE_LD_LOG(ERR, "%s release sockfd(%d) failed\n",
+				__func__, sockfd);
+		}
+	}
+
 	if (is_usr_socket(sockfd)) {
 		if (sa->sin_addr.s_addr != INADDR_ANY) {
 			s_fd_desc[sockfd].hdr.ip_hdr.src_addr =
@@ -6755,6 +6772,16 @@ connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_connect:%p\n",
 			__func__, sockfd, libc_connect);
 		dump_usr_fd(__func__);
+	}
+
+	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+		s_pre_ld_local_ip && is_usr_socket(sockfd)) {
+		usr_socket_fd_remove(sockfd);
+		ret = usr_socket_fd_release(sockfd);
+		if (ret) {
+			PRE_LD_LOG(ERR, "%s release sockfd(%d) failed\n",
+				__func__, sockfd);
+		}
 	}
 
 	if (is_usr_socket(sockfd)) {
@@ -6945,6 +6972,7 @@ recvfrom(int sockfd, void *buf, size_t len, int flags,
 {
 	ssize_t recv_value = 0;
 	int ret;
+	const struct sockaddr_in *sa = (const void *)from;
 
 	if (s_socket_dbg) {
 		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_recvfrom:%p\n",
@@ -6970,8 +6998,19 @@ recvfrom(int sockfd, void *buf, size_t len, int flags,
 		}
 	}
 
+	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+		s_pre_ld_local_ip && is_usr_socket(sockfd)) {
+		usr_socket_fd_remove(sockfd);
+		ret = usr_socket_fd_release(sockfd);
+		if (ret) {
+			PRE_LD_LOG(ERR, "%s release sockfd(%d) failed\n",
+				__func__, sockfd);
+		}
+	}
+
 	if (is_usr_socket(sockfd)) {
-		ret = netwrap_collect_info(sockfd, from,
+		ret = netwrap_collect_info(sockfd,
+			recv_value > 0 ? from : NULL,
 			fromlen ? *fromlen : 0, false);
 		if (ret) {
 			PRE_LD_LOG(ERR,
@@ -7043,12 +7082,26 @@ sendto(int sockfd, const void *buf, size_t len, int flags,
 {
 	ssize_t send_value;
 	int ret;
+	const struct sockaddr_in *sa = (const void *)to;
 
 	if (s_socket_dbg) {
 		PRE_LD_LOG(INFO, "%s starts: sockfd:%d, libc_send:%p\n",
 			__func__, sockfd, libc_sendto);
 		dump_usr_fd(__func__);
 	}
+
+	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+		s_pre_ld_local_ip && is_usr_socket(sockfd)) {
+		usr_socket_fd_remove(sockfd);
+		ret = usr_socket_fd_release(sockfd);
+		if (ret) {
+			PRE_LD_LOG(ERR, "%s release sockfd(%d) failed\n",
+				__func__, sockfd);
+		}
+	}
+	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+		s_pre_ld_invalid_ip)
+		goto send_to_kernel;
 
 	if (likely(is_usr_socket(sockfd))) {
 		if (unlikely((s_fd_desc[sockfd].hdr_init &
