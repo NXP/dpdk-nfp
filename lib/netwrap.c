@@ -2081,7 +2081,7 @@ eal_recv(int sockfd, void *buf, size_t len, int flags,
 	uint32_t nb_rx = 0, i, total_bytes = 0, j;
 	size_t length, remain = len;
 	struct pre_ld_frame_desc *frm_desc;
-	int ret;
+	int ret, recv_cnt;
 	uint8_t *buf_u8 = buf, *pkt;
 	struct fd_desc *desc;
 	struct pre_ld_rx_pool *rx_pool;
@@ -2176,9 +2176,15 @@ eal_recv(int sockfd, void *buf, size_t len, int flags,
 		}
 	} else {
 		hw_desc = &desc->dp_desc.hw_desc;
+		recv_cnt = 0;
+recv_again:
 		nb_rx = rte_eth_rx_burst(hw_desc->rx_flow->src->port_id,
 			hw_desc->rx_flow->src->queue_id, pkts_burst,
 			MAX_PKT_BURST);
+		if (unlikely(!nb_rx && recv_cnt < 3)) {
+			recv_cnt++;
+			goto recv_again;
+		}
 	}
 	for (i = 0; i < nb_rx; i++) {
 		desc->rx_stat.oh_bytes +=
