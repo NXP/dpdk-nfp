@@ -185,6 +185,11 @@ enum fd_access_type {
 
 struct fd_hw_desc {
 	struct pre_ld_port_rx_flow *rx_flow;
+	int dpdmux_access;
+	uint16_t dpdmux_id;
+	uint16_t dpdmux_ep;
+	uint16_t dpdmux_entry;
+
 	uint16_t tx_port;
 };
 
@@ -382,6 +387,12 @@ struct pre_ld_dir_cfg {
 };
 
 #define PRE_LD_MUX_MAX_IF_NUM 8
+
+struct pre_ld_mux_entry {
+	LIST_ENTRY(pre_ld_mux_entry) next;
+	uint16_t entry_id;
+};
+
 struct pre_ld_mux_cfg {
 	uint16_t mux_id;
 	uint16_t def_id;
@@ -390,7 +401,7 @@ struct pre_ld_mux_cfg {
 	uint16_t ep_id[PRE_LD_MUX_MAX_IF_NUM];
 	const char *ep_nm[PRE_LD_MUX_MAX_IF_NUM];
 	uint16_t port_id[PRE_LD_MUX_MAX_IF_NUM];
-	int entry_id[PRE_LD_MUX_MAX_IF_NUM];
+	LIST_HEAD(, pre_ld_mux_entry) entries;
 	uint8_t if_num;
 };
 
@@ -1166,26 +1177,36 @@ again:
 }
 
 static void
-eal_destroy_dpaa2_mux_flow(void)
+eal_usr_fd_destroy_dpaa2_mux_flow(int sockfd)
 {
-	int ret, i, j, entry;
-	uint32_t id;
+	struct fd_desc *desc = &s_fd_desc[sockfd];
+	struct fd_hw_desc *hw_desc;
+	int ret;
+	struct pre_ld_mux_cfg *mux_cfg;
+	struct pre_ld_mux_entry *entry;
 
-	for (i = 0; i < s_mux_num; i++) {
-		for (j = 0; j < PRE_LD_MUX_MAX_IF_NUM; j++) {
-			entry = s_mux_cfg[i].entry_id[j];
-			id = s_mux_cfg[i].mux_id;
-			if (entry < 0)
-				continue;
-			ret = rte_pmd_dpaa2_mux_flow_destroy(id, entry);
-			if (ret) {
-				PRE_LD_LOG(ERR,
-					"Destroy MUX%d's flow entry%d failed(%d)\n",
-					id, entry, ret);
-			}
-			s_mux_cfg[i].entry_id[j] = -1;
-		}
+	if (desc->access_type != FD_HARDWARE_ACCESS)
+		return;
+	hw_desc = &desc->dp_desc.hw_desc;
+	if (!hw_desc->dpdmux_access)
+		return;
+	ret = rte_pmd_dpaa2_mux_flow_destroy(hw_desc->dpdmux_id,
+		hw_desc->dpdmux_entry);
+	if (ret) {
+		PRE_LD_LOG(ERR, "Destroy FD%d mux flow failed(%d)\n",
+			sockfd, ret);
 	}
+	mux_cfg = &s_mux_cfg[s_mux_index];
+	entry = LIST_FIRST(&mux_cfg->entries);
+	while (entry) {
+		if (entry->entry_id == hw_desc->dpdmux_entry) {
+			LIST_REMOVE(entry, next);
+			rte_free(entry);
+			break;
+		}
+		entry = LIST_NEXT(entry, next);
+	}
+	hw_desc->dpdmux_access = false;
 }
 
 static void
@@ -1583,6 +1604,7 @@ usr_socket_fd_release(int sockfd)
 					__func__, port, ret);
 			}
 		}
+		eal_usr_fd_destroy_dpaa2_mux_flow(sockfd);
 	}
 
 	if (pre_ld_tx_ring)
@@ -1716,7 +1738,6 @@ static void eal_quit(void)
 		rte_free(arp_entry);
 	}
 
-	eal_destroy_dpaa2_mux_flow();
 	RTE_ETH_FOREACH_DEV(portid) {
 		PRE_LD_LOG(INFO, "Closing port %d...", portid);
 		ret = rte_eth_dev_stop(portid);
@@ -5183,6 +5204,7 @@ eal_create_flow(int sockfd,
 	char nm[RTE_MEMZONE_NAMESIZE];
 	uint16_t rx_port;
 	struct fd_desc *desc = &s_fd_desc[sockfd];
+	struct pre_ld_mux_entry *mux_entry;
 
 	if (s_mux_index < 0)
 		rx_port = s_rx_port;
@@ -5308,7 +5330,17 @@ eal_create_flow(int sockfd,
 		PRE_LD_LOG(ERR, "MUX%d(id=%d).EP%d's flow create failed(%d)\n",
 			s_mux_index, mux_cfg->mux_id, 0, ret);
 	}
-	mux_cfg->entry_id[0] = ret;
+	if (ret >= 0) {
+		mux_entry = rte_zmalloc(NULL,
+			sizeof(struct pre_ld_mux_entry), 0);
+		mux_entry->entry_id = ret;
+		LIST_INSERT_HEAD(&mux_cfg->entries, mux_entry, next);
+		desc->dp_desc.hw_desc.dpdmux_id = mux_cfg->mux_id;
+		desc->dp_desc.hw_desc.dpdmux_ep = mux_cfg->ep_id[0];
+		desc->dp_desc.hw_desc.tx_port = mux_cfg->port_id[0];
+		desc->dp_desc.hw_desc.dpdmux_entry = ret;
+		desc->dp_desc.hw_desc.dpdmux_access = true;
+	}
 
 skip_mux_flow:
 
@@ -6588,6 +6620,7 @@ socket_create_ingress_flow(int sockfd, int connected)
 			}
 			s_fd_desc[sockfd].dp_desc.hw_desc.rx_flow = NULL;
 		}
+		eal_usr_fd_destroy_dpaa2_mux_flow(sockfd);
 	} else {
 		rx_entry = s_fd_desc[sockfd].dp_desc.entry_desc.rx_entry;
 		if (rx_entry) {
@@ -7499,7 +7532,7 @@ __attribute__((constructor(PRE_LD_CONSTRUCTOR_PRIO)))
 static void setup_wrappers(void)
 {
 	char *env;
-	int i, j, ret;
+	int i, ret;
 	pthread_t pid;
 
 	clock_gettime(CLOCK_REALTIME, &s_ts);
@@ -7663,11 +7696,6 @@ static void setup_wrappers(void)
 	}
 	for (i = 0; i < MAX_USR_FD_NUM; i++)
 		s_fd_desc[i].fd = INVALID_SOCKFD;
-
-	for (i = 0; i < PRE_LD_MUX_MAX_NUM; i++) {
-		for (j = 0; j < PRE_LD_MUX_MAX_IF_NUM; j++)
-			s_mux_cfg[i].entry_id[j] = -1;
-	}
 
 	for (i = 0; i < PRE_LD_DIR_MAX_IF_NUM; i++) {
 		s_dir_ports.pair[i].ul_id = -1;
