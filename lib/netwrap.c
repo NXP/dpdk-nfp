@@ -115,7 +115,6 @@ static int s_flow_control;
 static int s_force_eal_thread;
 
 static int s_fd_rte_ring;
-static int s_fd_mbuf_malloc_direct;
 static int s_fd_mbuf_malloc_hw_pool;
 
 static uint16_t s_fd_mbuf_avail_threshold = 128;
@@ -1464,7 +1463,7 @@ usr_socket_fd_release(int sockfd)
 	desc->tx_enable = false;
 	rte_spinlock_unlock(&desc->tx_lock);
 
-	if (desc->tx_pool) {
+	if (desc->tx_pool && desc->tx_pool != s_pre_ld_rx_pool) {
 		malloc_pool = desc->tx_pool;
 	} else if (desc->access_type == FD_THREAD_ACCESS) {
 		malloc_entry = desc->dp_desc.entry_desc.malloc_entry;
@@ -5036,7 +5035,6 @@ static int eal_main(void)
 		}
 		if (s_mux_index < 0 && s_proc_index < 0)
 			rte_exit(EXIT_FAILURE, "Port toplogy not supported!\n");
-		s_fd_mbuf_malloc_direct = 1;
 	}
 
 	if (s_statistic_print) {
@@ -5745,8 +5743,7 @@ usr_socket_fd_desc_init(int sockfd,
 		sizeof(struct fd_thread_desc) * RTE_MAX_LCORE);
 	for (i = 0; i < RTE_MAX_LCORE; i++)
 		desc->th_desc[i].cpu = LCORE_ID_ANY;
-	if (s_fd_mbuf_malloc_direct ||
-		!s_fd_mbuf_malloc_hw_pool) {
+	if (!s_fd_mbuf_malloc_hw_pool) {
 		sprintf(nm, "tx_pool_fd%d", sockfd);
 		tx_pool = rte_pktmbuf_pool_create_by_ops(nm,
 				MEMPOOL_USR_SIZE, s_mempool_cache_size,
@@ -5760,71 +5757,67 @@ usr_socket_fd_desc_init(int sockfd,
 		rte_mempool_obj_iter(tx_pool, pre_ld_pktmbuf_init, NULL);
 	}
 
-	if (s_fd_mbuf_malloc_direct) {
-		desc->tx_pool = tx_pool;
-	} else {
-		desc->tx_pool = NULL;
-		if (desc->access_type != FD_THREAD_ACCESS) {
-			ret = -EINVAL;
-			PRE_LD_LOG(ERR,
-				"FD[%d] needs data path thread to malloc TX buffer\n",
-				sockfd);
-			goto fd_init_quit;
-		}
-		malloc_entry = rte_zmalloc(NULL,
+	if (desc->access_type == FD_HARDWARE_ACCESS) {
+		if (tx_pool)
+			desc->tx_pool = tx_pool;
+		else
+			desc->tx_pool = s_pre_ld_rx_pool;
+		goto fd_init_quit;
+	}
+
+	malloc_entry = rte_zmalloc(NULL,
 			sizeof(struct pre_ld_direct_entry), 0);
-		if (!malloc_entry) {
+	if (!malloc_entry) {
+		ret = -ENOMEM;
+		goto fd_init_quit;
+	}
+	malloc_entry->poll_type = MBUF_MALLOC_POOL;
+	if (s_fd_mbuf_malloc_hw_pool)
+		malloc_entry->poll.malloc_pool = s_pre_ld_rx_pool;
+	else
+		malloc_entry->poll.malloc_pool = tx_pool;
+
+	if (s_fd_rte_ring) {
+		malloc_entry->dest_type = MALLOC_RING;
+		sprintf(nm, "malloc_ring_fd%d", sockfd);
+		malloc_entry->dest.malloc_ring = rte_ring_create(nm,
+			MEMPOOL_USR_SIZE, 0,
+			RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (!malloc_entry->dest.malloc_ring) {
 			ret = -ENOMEM;
 			goto fd_init_quit;
 		}
-		malloc_entry->poll_type = MBUF_MALLOC_POOL;
-		if (s_fd_mbuf_malloc_hw_pool)
-			malloc_entry->poll.malloc_pool = s_pre_ld_rx_pool;
-		else
-			malloc_entry->poll.malloc_pool = tx_pool;
-
-		if (s_fd_rte_ring) {
-			malloc_entry->dest_type = MALLOC_RING;
-			sprintf(nm, "malloc_ring_fd%d", sockfd);
-			malloc_entry->dest.malloc_ring = rte_ring_create(nm,
-				MEMPOOL_USR_SIZE, 0,
-				RING_F_SP_ENQ | RING_F_SC_DEQ);
-			if (!malloc_entry->dest.malloc_ring) {
-				ret = -ENOMEM;
-				goto fd_init_quit;
-			}
-		} else {
-			malloc_entry->dest_type = PRE_LD_MALLOC_RING;
-			sprintf(nm, "pre_ld_malloc_ring_fd%d", sockfd);
-			malloc_entry->dest.pre_ld_malloc_ring =
-				pre_ld_ring_create(nm, MEMPOOL_USR_SIZE);
-			if (!malloc_entry->dest.pre_ld_malloc_ring) {
-				ret = -ENOMEM;
-				goto fd_init_quit;
-			}
-		}
-		malloc_entry->entry_cb = pre_ld_entry_malloc_mbufs;
-		malloc_entry->poll_prefix = rte_zmalloc(NULL, 1024, 0);
-		if (malloc_entry->poll_prefix) {
-			sprintf(malloc_entry->poll_prefix,
-				"Malloc from %s for TX of user FD%d",
-				malloc_entry->poll.malloc_pool->name, sockfd);
-		}
-		malloc_entry->action_prefix = rte_zmalloc(NULL, 1024, 0);
-		if (malloc_entry->action_prefix) {
-			sprintf(malloc_entry->action_prefix,
-				"-> put into %s", nm);
-		}
-		ret = pre_ld_update_dir_list_safe(malloc_entry,
-			INSERT_ENTRY_REQ);
-		if (ret) {
-			PRE_LD_LOG(INFO,
-				"Insert FD[%d]'s malloc buffer entry failed(%d)\n",
-				sockfd, ret);
+	} else {
+		malloc_entry->dest_type = PRE_LD_MALLOC_RING;
+		sprintf(nm, "pre_ld_malloc_ring_fd%d", sockfd);
+		malloc_entry->dest.pre_ld_malloc_ring =
+			pre_ld_ring_create(nm, MEMPOOL_USR_SIZE);
+		if (!malloc_entry->dest.pre_ld_malloc_ring) {
+			ret = -ENOMEM;
 			goto fd_init_quit;
 		}
-		desc->dp_desc.entry_desc.malloc_entry = malloc_entry;
 	}
+	malloc_entry->entry_cb = pre_ld_entry_malloc_mbufs;
+	malloc_entry->poll_prefix = rte_zmalloc(NULL, 1024, 0);
+	if (malloc_entry->poll_prefix) {
+		sprintf(malloc_entry->poll_prefix,
+			"Malloc from %s for TX of user FD%d",
+			malloc_entry->poll.malloc_pool->name, sockfd);
+	}
+	malloc_entry->action_prefix = rte_zmalloc(NULL, 1024, 0);
+	if (malloc_entry->action_prefix) {
+		sprintf(malloc_entry->action_prefix,
+			"-> put into %s", nm);
+	}
+	ret = pre_ld_update_dir_list_safe(malloc_entry,
+		INSERT_ENTRY_REQ);
+	if (ret) {
+		PRE_LD_LOG(INFO,
+			"Insert FD[%d]'s malloc buffer entry failed(%d)\n",
+			sockfd, ret);
+		goto fd_init_quit;
+	}
+	desc->dp_desc.entry_desc.malloc_entry = malloc_entry;
 
 fd_init_quit:
 	if (!ret) {
@@ -7632,10 +7625,6 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_SELECT_DEBUG");
 	if (env)
 		s_select_dbg = atoi(env);
-
-	env = getenv("PRE_LOAD_USER_FD_MALLOC");
-	if (env)
-		s_fd_mbuf_malloc_direct = atoi(env);
 
 	env = getenv("PRE_LOAD_USER_FD_MALLOC_HW_POOL");
 	if (env)
