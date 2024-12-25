@@ -7030,7 +7030,7 @@ recvfrom(int sockfd, void *buf, size_t len, int flags,
 		}
 	}
 
-	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+	if (sa && (sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
 		s_pre_ld_local_ip && is_usr_socket(sockfd)) {
 		usr_socket_fd_remove(sockfd);
 		ret = usr_socket_fd_release(sockfd);
@@ -7122,7 +7122,7 @@ sendto(int sockfd, const void *buf, size_t len, int flags,
 		dump_usr_fd(__func__);
 	}
 
-	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+	if (sa && (sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
 		s_pre_ld_local_ip && is_usr_socket(sockfd)) {
 		usr_socket_fd_remove(sockfd);
 		ret = usr_socket_fd_release(sockfd);
@@ -7131,7 +7131,7 @@ sendto(int sockfd, const void *buf, size_t len, int flags,
 				__func__, sockfd);
 		}
 	}
-	if ((sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
+	if (sa && (sa->sin_addr.s_addr & PRE_LD_LOCAL_IP_MASK) ==
 		s_pre_ld_invalid_ip)
 		goto send_to_kernel;
 
