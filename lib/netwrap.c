@@ -188,6 +188,7 @@ struct fd_hw_desc {
 	uint16_t dpdmux_id;
 	uint16_t dpdmux_ep;
 	uint16_t dpdmux_entry;
+	uint16_t ep_idx;
 
 	uint16_t tx_port;
 };
@@ -400,6 +401,7 @@ struct pre_ld_mux_cfg {
 	uint16_t ep_id[PRE_LD_MUX_MAX_IF_NUM];
 	const char *ep_nm[PRE_LD_MUX_MAX_IF_NUM];
 	uint16_t port_id[PRE_LD_MUX_MAX_IF_NUM];
+	int used[PRE_LD_MUX_MAX_IF_NUM];
 	LIST_HEAD(, pre_ld_mux_entry) entries;
 	uint8_t if_num;
 };
@@ -523,6 +525,8 @@ static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define PRE_LD_LOCAL_IP_MASK 0x000000ff
 static const rte_be32_t s_pre_ld_local_ip = 0x0000007f;
 static const rte_be32_t s_pre_ld_invalid_ip = 0x000000ff;
+
+static int s_mux_per_fd_per_port;
 
 static void
 _pre_ld_time_log(uint32_t level, uint32_t logtype)
@@ -1205,6 +1209,7 @@ eal_usr_fd_destroy_dpaa2_mux_flow(int sockfd)
 		}
 		entry = LIST_NEXT(entry, next);
 	}
+	mux_cfg->used[hw_desc->ep_idx] = false;
 	hw_desc->dpdmux_access = false;
 }
 
@@ -1415,7 +1420,14 @@ is_usr_socket_connected(int sockfd)
 		desc->dp_desc.entry_desc.rx_entry->poll.rx_flow->flow)
 		return true;
 
-	if (desc->access_type == FD_HARDWARE_ACCESS &&
+	if (s_mux_per_fd_per_port &&
+		desc->access_type == FD_HARDWARE_ACCESS &&
+		desc->dp_desc.hw_desc.dpdmux_access)
+		return true;
+
+	if (!s_mux_per_fd_per_port &&
+		desc->access_type == FD_HARDWARE_ACCESS &&
+		desc->dp_desc.hw_desc.dpdmux_access &&
 		desc->dp_desc.hw_desc.rx_flow &&
 		desc->dp_desc.hw_desc.rx_flow->flow)
 		return true;
@@ -1474,7 +1486,8 @@ usr_socket_fd_release(int sockfd)
 
 	if (desc->access_type == FD_HARDWARE_ACCESS) {
 		rx_flow = desc->dp_desc.hw_desc.rx_flow;
-		rx_port = rx_flow->src->port_id;
+		if (rx_flow)
+			rx_port = rx_flow->src->port_id;
 	} else {
 		rx_entry = desc->dp_desc.entry_desc.rx_entry;
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
@@ -1603,8 +1616,8 @@ usr_socket_fd_release(int sockfd)
 					__func__, port, ret);
 			}
 		}
-		eal_usr_fd_destroy_dpaa2_mux_flow(sockfd);
 	}
+	eal_usr_fd_destroy_dpaa2_mux_flow(sockfd);
 
 	if (pre_ld_tx_ring)
 		pre_ld_ring_free(pre_ld_tx_ring);
@@ -2087,6 +2100,7 @@ eal_recv(int sockfd, void *buf, size_t len, int flags,
 	struct pre_ld_rx_pool *rx_pool;
 	struct pre_ld_direct_entry *rx_entry;
 	struct fd_hw_desc *hw_desc;
+	uint16_t port_id, queue_id;
 
 	RTE_SET_USED(flags);
 
@@ -2177,9 +2191,15 @@ eal_recv(int sockfd, void *buf, size_t len, int flags,
 	} else {
 		hw_desc = &desc->dp_desc.hw_desc;
 		recv_cnt = 0;
+		if (hw_desc->rx_flow) {
+			port_id = hw_desc->rx_flow->src->port_id;
+			queue_id = hw_desc->rx_flow->src->queue_id;
+		} else {
+			port_id = hw_desc->tx_port;
+			queue_id = 0;
+		}
 recv_again:
-		nb_rx = rte_eth_rx_burst(hw_desc->rx_flow->src->port_id,
-			hw_desc->rx_flow->src->queue_id, pkts_burst,
+		nb_rx = rte_eth_rx_burst(port_id, queue_id, pkts_burst,
 			MAX_PKT_BURST);
 		if (unlikely(!nb_rx && recv_cnt < 3)) {
 			recv_cnt++;
@@ -4869,6 +4889,11 @@ static int eal_main(void)
 				"Invalid port[%d] type(%d)\n",
 				portid, port_type[portid]);
 		}
+		if (s_mux_per_fd_per_port &&
+			port_type[portid] == MUX_DOWN_LINK_TYPE) {
+			rxq_num[portid] = 1;
+			txq_num[portid] = 1;
+		}
 		ret = rte_eth_dev_configure(portid, rxq_num[portid],
 			txq_num[portid], &port_conf[portid]);
 		if (ret < 0) {
@@ -5206,14 +5231,16 @@ eal_create_flow(int sockfd,
 	struct rte_flow_item mux_pattern[2];
 	struct pre_ld_port_rx_flow *rx_flow = NULL;
 	char nm[RTE_MEMZONE_NAMESIZE];
-	uint16_t rx_port;
+	uint16_t rx_port = 0, i;
 	struct fd_desc *desc = &s_fd_desc[sockfd];
 	struct pre_ld_mux_entry *mux_entry;
 
 	if (s_mux_index < 0)
 		rx_port = s_rx_port;
-	else
+	else if (!s_mux_per_fd_per_port)
 		rx_port = s_mux_cfg[s_mux_index].port_id[0];
+	else
+		goto skip_port_flow;
 	rx_flow = pre_ld_dev_flow_find_rx_flow(rx_port, pattern);
 	if (rx_flow) {
 		if (desc->access_type == FD_HARDWARE_ACCESS)
@@ -5284,6 +5311,7 @@ eal_create_flow(int sockfd,
 		s_fd_desc[sockfd].dp_desc.hw_desc.rx_flow = rx_flow;
 	}
 
+skip_port_flow:
 	if (pattern->type[0] == RTE_FLOW_ITEM_TYPE_UDP) {
 		prot_name = "udp";
 		udp = &pattern->items[0].udp_spec;
@@ -5328,8 +5356,18 @@ eal_create_flow(int sockfd,
 	mux_cfg = &s_mux_cfg[s_mux_index];
 
 	/** Single EP only.*/
+	if (s_mux_per_fd_per_port) {
+		for (i = 0; i < mux_cfg->if_num; i++) {
+			if (!mux_cfg->used[i])
+				break;
+		}
+		if (i == mux_cfg->if_num)
+			return -ENOENT;
+	} else {
+		i = 0;
+	}
 	ret = eal_create_dpaa2_mux_flow(mux_cfg->mux_id,
-			mux_cfg->ep_id[0], mux_pattern);
+			mux_cfg->ep_id[i], mux_pattern);
 	if (ret < 0) {
 		PRE_LD_LOG(ERR, "MUX%d(id=%d).EP%d's flow create failed(%d)\n",
 			s_mux_index, mux_cfg->mux_id, 0, ret);
@@ -5340,10 +5378,19 @@ eal_create_flow(int sockfd,
 		mux_entry->entry_id = ret;
 		LIST_INSERT_HEAD(&mux_cfg->entries, mux_entry, next);
 		desc->dp_desc.hw_desc.dpdmux_id = mux_cfg->mux_id;
-		desc->dp_desc.hw_desc.dpdmux_ep = mux_cfg->ep_id[0];
-		desc->dp_desc.hw_desc.tx_port = mux_cfg->port_id[0];
+		desc->dp_desc.hw_desc.dpdmux_ep = mux_cfg->ep_id[i];
+		desc->dp_desc.hw_desc.tx_port = mux_cfg->port_id[i];
+		desc->dp_desc.hw_desc.ep_idx = i;
 		desc->dp_desc.hw_desc.dpdmux_entry = ret;
 		desc->dp_desc.hw_desc.dpdmux_access = true;
+
+		mux_cfg->used[i] = true;
+	}
+	if (s_mux_per_fd_per_port) {
+		desc->dp_desc.hw_desc.rx_flow = NULL;
+		if (ret >= 0)
+			return 0;
+		return ret;
 	}
 
 skip_mux_flow:
@@ -7667,6 +7714,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_FLOW_TABLE_DUMP");
 	if (env)
 		s_flow_table_dump = atoi(env);
+
+	env = getenv("PRE_LOAD_MUX_PER_FD_PER_PORT");
+	if (env)
+		s_mux_per_fd_per_port = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
