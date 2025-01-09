@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2011-2013 Freescale Semiconductor, Inc.
- * Copyright 2023-2024 NXP
+ * Copyright 2023-2025 NXP
  */
 
 #ifndef _GNU_SOURCE
@@ -608,7 +608,7 @@ xfm_dump_all_sa_sp(const char *prefix, const char *tail)
 	const struct pre_ld_ipsec_sp_entry *sp;
 	int num = 0, off = 0;
 	const uint8_t *addr;
-	char *info = rte_zmalloc(NULL, 4096, 0);
+	char *info = rte_zmalloc(NULL, 4096 * 10, 0);
 
 	if (!info)
 		return;

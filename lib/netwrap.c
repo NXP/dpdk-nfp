@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright 2024 NXP
+ * Copyright 2024-2025 NXP
  */
 
 #ifndef _GNU_SOURCE
@@ -276,6 +276,7 @@ static struct pre_ld_dev_flow_list s_pre_ld_dev_flow_list =
 
 static uint16_t s_tb_dump_port[RTE_MAX_ETHPORTS];
 static uint16_t s_tb_dump_port_num;
+static int s_port_started[RTE_MAX_ETHPORTS];
 
 static rte_spinlock_t s_fd_list_lock;
 static int s_rte_eal_init_complete;
@@ -471,7 +472,6 @@ static int s_data_verify_err_panic;
 static int s_query_flow_err_panic = 1;
 
 static uint16_t s_mempool_cache_size;
-static int s_pause_traffic_flow_updating;
 static int s_flow_table_dump;
 
 struct pre_ld_default_direction {
@@ -527,6 +527,8 @@ static const rte_be32_t s_pre_ld_local_ip = 0x0000007f;
 static const rte_be32_t s_pre_ld_invalid_ip = 0x000000ff;
 
 static int s_mux_per_fd_per_port;
+
+static int s_flow_update_delay_us = 1000;
 
 static void
 _pre_ld_time_log(uint32_t level, uint32_t logtype)
@@ -1155,6 +1157,7 @@ again:
 	if (ret) {
 		PRE_LD_LOG(ERR, "%s: Destroy flow failed(%d), times=%d\n",
 			__func__, ret, times);
+		rte_panic("Destroy flow failed!\r\n");
 	}
 	if (ret == -EAGAIN && times > 0) {
 		times--;
@@ -1751,6 +1754,8 @@ static void eal_quit(void)
 	}
 
 	RTE_ETH_FOREACH_DEV(portid) {
+		if (!s_port_started[portid])
+			continue;
 		PRE_LD_LOG(INFO, "Closing port %d...", portid);
 		ret = rte_eth_dev_stop(portid);
 		if (ret) {
@@ -3572,213 +3577,6 @@ pre_ld_pktmbuf_init(struct rte_mempool *mp,
 	m->next = NULL;
 }
 
-enum {
-	PRE_LD_PORT_TRAFFIC_PAUSE = 1,
-	PRE_LD_PORT_TRAFFIC_RESUME_RX = 2,
-	PRE_LD_PORT_TRAFFIC_RESUME_REDIR = 3
-};
-
-struct pre_ld_update_flow_action {
-	int type;
-	union {
-		uint16_t dst_port;
-		uint16_t dst_rxq;
-	};
-};
-
-static int
-pre_ld_port_flow_action_update(uint16_t portid,
-	struct pre_ld_update_flow_action *update)
-{
-	char ext_nm[RTE_ETH_NAME_MAX_LEN];
-	uint16_t i;
-	int ret;
-	struct rte_flow *flow;
-	struct rte_flow_action actions[2];
-	struct rte_flow_action_queue rx_queue;
-	struct rte_flow_action_port_id dst_port;
-
-	ret = rte_eth_dev_get_name_by_port(portid, ext_nm);
-	if (ret)
-		return ret;
-
-	for (i = 0; i < MAX_DEF_DIR_NUM; i++) {
-		if (!strcmp(s_def_dir[i].from_name, ext_nm))
-			break;
-	}
-	if (i == MAX_DEF_DIR_NUM)
-		return -ENXIO;
-
-	flow = s_pre_ld_def_dir.flows[i];
-	if (update->type == PRE_LD_PORT_TRAFFIC_PAUSE) {
-		actions[0].type = RTE_FLOW_ACTION_TYPE_DROP;
-		actions[0].conf = NULL;
-		actions[1].type = RTE_FLOW_ACTION_TYPE_END;
-	} else if (update->type == PRE_LD_PORT_TRAFFIC_RESUME_RX) {
-		rx_queue.index = update->dst_rxq;
-		actions[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
-		actions[0].conf = &rx_queue;
-		actions[1].type = RTE_FLOW_ACTION_TYPE_END;
-	} else if (update->type == PRE_LD_PORT_TRAFFIC_RESUME_REDIR) {
-		dst_port.original = 0;
-		dst_port.id = update->dst_port;
-		actions[0].type = RTE_FLOW_ACTION_TYPE_PORT_ID;
-		actions[0].conf = &dst_port;
-		actions[1].type = RTE_FLOW_ACTION_TYPE_END;
-	} else {
-		return -EINVAL;
-	}
-	ret = rte_flow_actions_update(portid, flow, actions, NULL);
-	PRE_LD_LOG(INFO, "Port%d action type(%d) update result(%d)\n",
-		portid, update->type, ret);
-
-	return ret;
-}
-
-static void
-pre_ld_loop_drain_ports(struct pre_ld_lcore_direct_list *list)
-{
-	int ret;
-	struct pre_ld_direct_entry *entry, *tentry;
-	uint16_t id, qid, nb, drain_times, i, total;
-	struct rte_mbuf *mbufs[MAX_PKT_BURST];
-	uint16_t retry;
-	char *env;
-	struct pre_ld_update_flow_action update;
-
-	if (!s_pause_traffic_flow_updating)
-		return;
-
-	env = getenv("PRE_LD_DRAIN_RETRY");
-	if (env)
-		retry = atoi(env);
-	else
-		retry = PRE_LD_DRAIN_RETRY_TIMES;
-
-	for (i = 0; i < s_dir_ports.ext_num; i++) {
-		update.type = PRE_LD_PORT_TRAFFIC_PAUSE;
-		ret = pre_ld_port_flow_action_update(s_dir_ports.ext_id[i],
-			&update);
-		if (ret) {
-			PRE_LD_LOG(ERR, "Pause ext port%d failed(%d)\n",
-				s_dir_ports.ext_id[i], ret);
-		}
-	}
-
-	RTE_TAILQ_FOREACH_SAFE(entry, list, next, tentry) {
-		drain_times = 0;
-		if (entry->dest_type == HW_PORT) {
-			id = entry->dest.dest_port;
-			total = 0;
-clean_tx_again:
-			nb = rte_pmd_dpaa2_clean_tx_conf(id, 0);
-			if (nb) {
-				drain_times = 0;
-				total += nb;
-				goto clean_tx_again;
-			}
-			drain_times++;
-			if (drain_times > retry) {
-				PRE_LD_LOG(INFO,
-					"Clean %d buffer(s) from port%d's TX conf\n",
-					total, id);
-				continue;
-			}
-		}
-	}
-
-	/** Down all poll ports*/
-	RTE_TAILQ_FOREACH_SAFE(entry, list, next, tentry) {
-		drain_times = 0;
-		if (entry->poll_type == RX_QUEUE) {
-			id = entry->poll.rx_flow->src->port_id;
-			ret = rte_eth_dev_set_link_down(id);
-			if (ret) {
-				PRE_LD_LOG(ERR, "DOWN port%d failed(%d)\n",
-					id, ret);
-			}
-		}
-	}
-
-	RTE_TAILQ_FOREACH_SAFE(entry, list, next, tentry) {
-		drain_times = 0;
-		if (entry->poll_type == RX_QUEUE) {
-			id = entry->poll.rx_flow->src->port_id;
-			qid = entry->poll.rx_flow->src->queue_id;
-			total = 0;
-port_rx_again:
-			nb = rte_eth_rx_burst(id, qid, mbufs, MAX_PKT_BURST);
-			if (nb) {
-				rte_pktmbuf_free_bulk(mbufs, nb);
-				drain_times = 0;
-				total += nb;
-				goto port_rx_again;
-			}
-			drain_times++;
-			if (drain_times < retry)
-				goto port_rx_again;
-			PRE_LD_LOG(INFO,
-				"Clean %d frame(s) from port%d's RXQ%d\n",
-				total, id, qid);
-		} else if (entry->poll_type == SEC_IN_COMPLETE ||
-			entry->poll_type == SEC_EG_COMPLETE) {
-			id = entry->poll.poll_sec.sec_id;
-			qid = *entry->poll.poll_sec.queue_id;
-			total = 0;
-sec_dq_again:
-			nb = pre_ld_ipsec_dequeue(mbufs, MAX_PKT_BURST,
-				id, qid);
-			if (nb) {
-				rte_pktmbuf_free_bulk(mbufs, nb);
-				drain_times = 0;
-				total += nb;
-				goto sec_dq_again;
-			}
-			drain_times++;
-			if (drain_times < retry)
-				goto sec_dq_again;
-			PRE_LD_LOG(INFO,
-				"Clean %d frame(s) from SEC%d's %s queue%d\n",
-				total, id, entry->poll_type == SEC_IN_COMPLETE ?
-				"Ingress" : "Egress", qid);
-		}
-	}
-}
-
-static void
-pre_ld_loop_up_ports(struct pre_ld_lcore_direct_list *list)
-{
-	int ret;
-	struct pre_ld_direct_entry *entry, *tentry;
-	uint16_t id, i;
-	struct pre_ld_update_flow_action update;
-
-	if (!s_pause_traffic_flow_updating)
-		return;
-
-	RTE_TAILQ_FOREACH_SAFE(entry, list, next, tentry) {
-		if (entry->poll_type == RX_QUEUE) {
-			id = entry->poll.rx_flow->src->port_id;
-			ret = rte_eth_dev_set_link_up(id);
-			if (ret) {
-				PRE_LD_LOG(ERR, "UP port%d failed(%d)\n",
-					id, ret);
-			}
-		}
-	}
-
-	for (i = 0; i < s_dir_ports.ext_num; i++) {
-		update.type = PRE_LD_PORT_TRAFFIC_RESUME_REDIR;
-		update.dst_port = s_dir_ports.pair[i].ul_id;
-		ret = pre_ld_port_flow_action_update(s_dir_ports.ext_id[i],
-			&update);
-		if (ret) {
-			PRE_LD_LOG(ERR, "Resume ext port%d failed(%d)\n",
-				s_dir_ports.ext_id[i], ret);
-		}
-	}
-}
-
 static int
 pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	enum pre_ld_dir_msg_type msg_type)
@@ -3851,6 +3649,30 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 		rte_panic("Err flow in %s!\n", __func__);
 
 	return 0;
+}
+
+static void
+pre_ld_port_flow_traffic_pause(struct pre_ld_port_rx_flow *rx_flow)
+{
+	uint8_t i;
+
+	for (i = 0; i < s_dir_ports.ext_num; i++)
+		rte_eth_dev_stop(s_dir_ports.ext_id[i]);
+	rte_eth_dev_stop(rx_flow->src->port_id);
+	if (s_flow_update_delay_us > 0)
+		usleep(s_flow_update_delay_us);
+}
+
+static void
+pre_ld_port_flow_traffic_resume(struct pre_ld_port_rx_flow *rx_flow)
+{
+	uint8_t i;
+
+	if (s_flow_update_delay_us > 0)
+		usleep(s_flow_update_delay_us);
+	rte_eth_dev_start(rx_flow->src->port_id);
+	for (i = 0; i < s_dir_ports.ext_num; i++)
+		rte_eth_dev_start(s_dir_ports.ext_id[i]);
 }
 
 static int
@@ -3955,9 +3777,8 @@ for_ever_loop:
 		"Insert" : "Remove", msg->dir, msg->dir->poll_prefix,
 		msg->dir->action_prefix);
 
-	pre_ld_loop_drain_ports(list);
-
 	if (msg->dir->poll_type == RX_QUEUE) {
+		pre_ld_port_flow_traffic_pause(msg->dir->poll.rx_flow);
 		ret = pre_ld_port_rx_flow_update(msg->dir->poll.rx_flow,
 			msg->msg_type);
 		if (msg->msg_type == REMOVE_ENTRY_REQ &&
@@ -3970,11 +3791,10 @@ for_ever_loop:
 	else
 		TAILQ_REMOVE(list, msg->dir, next);
 
-	if (msg->msg_type == REMOVE_ENTRY_REQ)
-		msg->dir->entry_cb(msg->dir, true);
-
 skip_update_list:
-	pre_ld_loop_up_ports(list);
+	if (msg->dir->poll_type == RX_QUEUE)
+		pre_ld_port_flow_traffic_resume(msg->dir->poll.rx_flow);
+
 	if (!ret)
 		msg->msg_type = UPDATE_ENTRY_SUCCESS_RSP;
 	else
@@ -4828,7 +4648,6 @@ static int eal_main(void)
 	PRE_LD_LOG(INFO, "ls-listni dump clean\n");
 
 	RTE_ETH_FOREACH_DEV(portid) {
-		nb_ports_available++;
 		rxq_num[portid] = 0;
 
 		/* init port */
@@ -4885,9 +4704,10 @@ static int eal_main(void)
 			rxq_num[portid] = 1;
 			txq_num[portid] = 1;
 		} else {
-			rte_exit(EXIT_FAILURE,
+			PRE_LD_LOG(WARNING,
 				"Invalid port[%d] type(%d)\n",
 				portid, port_type[portid]);
+			continue;
 		}
 		if (s_mux_per_fd_per_port &&
 			port_type[portid] == MUX_DOWN_LINK_TYPE) {
@@ -4903,13 +4723,16 @@ static int eal_main(void)
 		}
 		if (rte_pmd_dpaa2_dev_is_dpaa2(portid))
 			dpaa2_rxqs += rxq_num[portid];
+		nb_ports_available++;
 		rte_log(RTE_LOG_INFO, RTE_LOGTYPE_pre_ld,
 			"%d rxq(s) and %d txq(s) setup done.\n",
 			rxq_num[portid], txq_num[portid]);
 	}
 
-	if (!nb_ports_available)
-		rte_exit(EXIT_FAILURE, "no port available\n");
+	if (!nb_ports_available) {
+		PRE_LD_LOG(WARNING, "no port available\n");
+		return 0;
+	}
 
 	if (dpaa2_rxqs &&
 		s_dpaa2_nb_rxd >= RTE_DPAA2_RX_DESC_MAX / dpaa2_rxqs)
@@ -4992,6 +4815,7 @@ static int eal_main(void)
 				"rte_eth_dev_start:err=%d, port=%u\n",
 				ret, portid);
 		}
+		s_port_started[portid] = true;
 
 		rte_log(RTE_LOG_INFO, RTE_LOGTYPE_pre_ld, "done.\n");
 
@@ -7707,10 +7531,6 @@ static void setup_wrappers(void)
 		}
 	}
 
-	env = getenv("PRE_LOAD_PAUSE_TRAFFIC_FLOW_UPDATING");
-	if (env)
-		s_pause_traffic_flow_updating = atoi(env);
-
 	env = getenv("PRE_LOAD_FLOW_TABLE_DUMP");
 	if (env)
 		s_flow_table_dump = atoi(env);
@@ -7718,6 +7538,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_MUX_PER_FD_PER_PORT");
 	if (env)
 		s_mux_per_fd_per_port = atoi(env);
+
+	env = getenv("PRE_LOAD_FLOW_UPDATE_DELAY_US");
+	if (env)
+		s_flow_update_delay_us = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
