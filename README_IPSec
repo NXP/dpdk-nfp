@@ -86,3 +86,27 @@ Client on gateway:
   $ iperf3 -c 2.1.1.2 -i 1 -t 100 -u -b 10G -l 64 [--bidir] [-P 2]
 
 3) Run network tools based on TCP protocol between gateway and EP while running iperf(udp or tcp) test.
+
+6. Conection-less traffic test:
+--------------------------------------------
+
+1) Build simple_perf by simple_perf.c on target board or gateway:
+   gcc simple_perf.c -o simple_perf
+
+2) server mode on gateway and client mode on EP:
+----------
+
+Server on gateway:
+  $ ./simple_perf -a 2.1.1.1 -s
+
+Client on EP:
+  $ LD_PRELOAD=./libnfp.so ./simple_perf -a 2.1.1.1 -c
+
+3) server mode on EP and client mmode on gateway:
+---------
+
+Server on EP:
+  $ LD_PRELOAD=./libnfp.so ./simple_perf -a 2.1.1.2 -s
+
+Client on gateway:
+  $ ./simple_perf -a 2.1.1.2 -c
