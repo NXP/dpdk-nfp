@@ -112,10 +112,10 @@ static const char *s_slow_if;
 
 static int s_manual_restart_ipsec;
 static int s_flow_control;
-static int s_force_eal_thread;
+static int s_force_eal_thread = 1;
 
 static int s_fd_rte_ring;
-static int s_fd_mbuf_malloc_hw_pool;
+static int s_fd_mbuf_malloc_hw_pool = 1;
 
 static uint16_t s_fd_mbuf_avail_threshold = 128;
 
@@ -7422,17 +7422,8 @@ static void setup_wrappers(void)
 	signal(SIGINT, pre_ld_signal_handler);
 	signal(SIGTERM, pre_ld_signal_handler);
 
-	if (!getenv("DPAA2_TX_CONF"))
-		setenv("DPAA2_TX_CONF", "1", 1);
-
-	if (!getenv("DPAA2_TX_DYNAMIC_CONF"))
-		setenv("DPAA2_TX_DYNAMIC_CONF", "1", 1);
-
 	if (!getenv("DPAA2_RX_GET_PROTOCOL_OFFSET"))
 		setenv("DPAA2_RX_GET_PROTOCOL_OFFSET", "1", 1);
-
-	if (!getenv("DPAA2_TX_CONF_FD_OVERFLOW"))
-		setenv("DPAA2_TX_CONF_FD_OVERFLOW", "64", 1);
 
 	if (!getenv("PRE_LOAD_IPSEC_BUF_SWAP"))
 		setenv("PRE_LOAD_IPSEC_BUF_SWAP", "1", 1);
