@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright 2024 NXP
+ * Copyright 2024-2025 NXP
  */
 
 #ifndef __NETWRAP_COMMON_H__
@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <rte_log.h>
 #include <errno.h>
+#include <rte_ip_frag.h>
 
 #include "usr_sec.h"
 
@@ -159,6 +160,8 @@ struct pre_ld_direct_entry {
 	union pre_ld_dir_dest dest;
 	struct pre_ld_dir_statistic tx_stat;
 	struct pre_ld_dir_statistic rx_stat;
+	struct rte_ip_frag_tbl *frag_tbl;
+	struct rte_ip_frag_death_row dr;
 	char *poll_prefix;
 	char *action_prefix;
 	void (*entry_cb)(struct pre_ld_direct_entry *entry, int drain);

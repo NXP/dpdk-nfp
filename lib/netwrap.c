@@ -81,6 +81,7 @@ static char *s_usr_app_nm;
 
 #define PRE_LD_DRAIN_RETRY_TIMES 10000
 
+static int s_ip_reassemble_enable = 1;
 static int s_socket_pre_set;
 static int s_in_pre_loading;
 
@@ -335,6 +336,7 @@ static uint16_t s_nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 #define MAX_QUEUES_PER_PORT 16
 static struct rte_ring *s_port_flow_r[RTE_MAX_ETHPORTS];
 static struct pre_ld_port_rx_flow *s_def_flow[RTE_MAX_ETHPORTS];
+static struct pre_ld_port_rx_flow *s_top_prio_flow[RTE_MAX_ETHPORTS];
 
 static struct rte_ring *s_crypt_queue_ring[CRYPT_DEV_MAX_NUM];
 static uint16_t *s_crypt_queue_ids[CRYPT_DEV_MAX_NUM];
@@ -343,6 +345,7 @@ static struct rte_eth_conf s_port_conf = {
 	.rxmode = {0},
 	.txmode = {
 		.mq_mode = RTE_ETH_MQ_TX_NONE,
+		.offloads = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM
 	},
 };
 
@@ -463,7 +466,7 @@ static int s_data_path_core = -1;
 static int s_ipsec_buf_swap;
 
 #define MAX_HUGE_FRAME_SIZE 9600
-static uint16_t s_mtu_set;
+static uint16_t s_mtu_set = MAX_HUGE_FRAME_SIZE;
 static int s_dump_traffic_flow;
 static int s_select_dbg;
 
@@ -504,9 +507,11 @@ struct pre_ld_frame_desc {
 
 #define PRE_LD_MBUF_OFFSET 512
 
+#define PRE_LD_MBUF_MAX_DATAROOM 9000
+
 #define PRE_LD_MBUF_MAX_SIZE \
 	(PRE_LD_MP_PRIV_SIZE + PRE_LD_MBUF_OFFSET + \
-	RTE_MBUF_DEFAULT_DATAROOM)
+	PRE_LD_MBUF_MAX_DATAROOM)
 
 #define NS_PER_US 1000
 #define NS_PER_MS (NS_PER_US * 1000)
@@ -1741,6 +1746,12 @@ static void eal_quit(void)
 					}
 				}
 			}
+			if (entry->frag_tbl)
+				rte_free(entry->frag_tbl);
+			if (entry->poll_prefix)
+				rte_free(entry->poll_prefix);
+			if (entry->action_prefix)
+				rte_free(entry->action_prefix);
 			rte_free(entry);
 		}
 	}
@@ -1766,6 +1777,7 @@ static void eal_quit(void)
 		rte_ring_free(s_port_flow_r[portid]);
 		s_port_flow_r[portid] = NULL;
 		s_def_flow[portid] = NULL;
+		s_top_prio_flow[portid] = NULL;
 		rte_free(s_pre_ld_rx_flows[portid]);
 		s_pre_ld_rx_flows[portid] = NULL;
 		rte_free(s_pre_ld_rx_src[portid]);
@@ -2212,8 +2224,7 @@ recv_again:
 		}
 	}
 	for (i = 0; i < nb_rx; i++) {
-		desc->rx_stat.oh_bytes +=
-			pkts_burst[i]->pkt_len +
+		desc->rx_stat.oh_bytes += pkts_burst[i]->pkt_len +
 			RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
 	}
 	desc->rx_stat.pkts += nb_rx;
@@ -2756,6 +2767,8 @@ pre_ld_adjust_ipv4(struct rte_mbuf *pkt,
 		pkt->data_off -= sizeof(struct rte_ether_hdr);
 		pkt->pkt_len += sizeof(struct rte_ether_hdr);
 		pkt->data_len += sizeof(struct rte_ether_hdr);
+		pkt->l2_len = sizeof(struct rte_ether_hdr);
+		pkt->l3_len = sizeof(struct rte_ipv4_hdr);
 	} else {
 		PRE_LD_LOG(ERR, "Invalid IPSec dir(%d)\n", dir);
 	}
@@ -2979,6 +2992,121 @@ drain_again:
 
 	if (unlikely(nb_tx < nb_rx))
 		rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_rx - nb_tx);
+}
+
+static void
+pre_ld_entry_reassemble_process(struct pre_ld_direct_entry *entry,
+	int drain)
+{
+	uint16_t nb_rx, nb_tx, drain_times = 0, i, mo_count = 0;
+	struct rte_mbuf *mbufs[MAX_PKT_BURST], *mo[MAX_PKT_BURST];
+	uint64_t lens[MAX_PKT_BURST];
+	struct rte_ipv4_hdr *ip_hdr;
+	struct rte_ip_frag_tbl *tbl = entry->frag_tbl;
+	struct rte_ip_frag_death_row *dr = &entry->dr;
+	uint8_t ip_offset = 0;
+	int ret;
+	uint8_t *pay_load;
+
+drain_again:
+	nb_rx = pre_ld_entry_port_recv(entry, mbufs, lens);
+	if (unlikely(drain)) {
+		if (pre_ld_drain_traffic_again(mbufs, nb_rx, &drain_times))
+			goto drain_again;
+		return;
+	}
+	if (!nb_rx)
+		return;
+
+	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
+
+	for (i = 0; i < nb_rx; i++) {
+		ip_offset = 0;
+		ret = rte_pmd_dpaa2_rx_get_offset(RTE_MAX_ETHPORTS,
+			mbufs[i], &ip_offset, NULL, NULL);
+		if (ret)
+			continue;
+		pay_load = rte_pktmbuf_mtod(mbufs[i], void *);
+		ip_hdr = (void *)(pay_load + ip_offset);
+		mbufs[i]->l2_len = sizeof(struct rte_ether_hdr);
+		mbufs[i]->l3_len = sizeof(struct rte_ipv4_hdr);
+		mo[mo_count] = rte_ipv4_frag_reassemble_packet(tbl,
+			dr, mbufs[i], rte_rdtsc(), ip_hdr);
+		if (!mo[mo_count])
+			continue;
+
+		lens[mo_count] = mo[mo_count]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+		mo_count++;
+	}
+
+	if (dr->cnt >= RTE_IP_FRAG_DEATH_ROW_MBUF_LEN) {
+		rte_panic("%s: Mbuf count in frag death row overflows\n",
+			__func__);
+	}
+	rte_ip_frag_free_death_row(dr, 3);
+	if (!mo_count)
+		return;
+
+	nb_tx = rte_eth_tx_burst(entry->dest.dest_port, 0, mo, mo_count);
+
+	pre_ld_entry_stat_update(&entry->tx_stat, lens, nb_tx, false);
+	if (unlikely(nb_tx < mo_count))
+		rte_pktmbuf_free_bulk(&mo[nb_tx], mo_count - nb_tx);
+}
+
+static int
+pre_ld_frag_ip_flow_create(uint16_t from_id, uint16_t to_id)
+{
+	struct pre_ld_direct_entry *entry;
+	struct pre_ld_port_rx_flow_pattern *flow_pattern;
+	uint64_t frag_cycles;
+	uint32_t bucket_num = 0x1000, bucket_entries = 16, max_entries = 0x1000;
+
+	frag_cycles = (rte_get_tsc_hz() + MS_PER_S - 1) / MS_PER_S * MS_PER_S;
+
+	entry = rte_zmalloc(NULL, sizeof(struct pre_ld_direct_entry), 0);
+	if (!entry)
+		rte_panic("Data path alloc failed\n");
+
+	flow_pattern = &s_top_prio_flow[from_id]->flow_pattern;
+
+	flow_pattern->type[0] = RTE_FLOW_ITEM_TYPE_IPV4;
+	flow_pattern->type[1] = RTE_FLOW_ITEM_TYPE_END;
+	memset(&flow_pattern->items[0], 0, sizeof(union pre_ld_flow_item));
+	memset(&flow_pattern->masks[0], 0, sizeof(union pre_ld_flow_item));
+	flow_pattern->items[0].ipv4_spec.hdr.fragment_offset = 1;
+	flow_pattern->masks[0].ipv4_spec.hdr.fragment_offset = 1;
+
+	entry->poll_type = RX_QUEUE;
+	entry->poll.rx_flow = s_top_prio_flow[from_id];
+	entry->dest_type = HW_PORT;
+	entry->dest.dest_port = to_id;
+	entry->entry_cb = pre_ld_entry_reassemble_process;
+	entry->frag_tbl = rte_ip_frag_table_create(bucket_num,
+			bucket_entries, max_entries, frag_cycles,
+			rte_socket_id());
+	if (!entry->frag_tbl) {
+		rte_panic("%s, line %d: Create fragment table failed\n",
+			__func__, __LINE__);
+	}
+	entry->poll_prefix = rte_zmalloc(NULL, 1024, 0);
+	if (entry->poll_prefix) {
+		sprintf(entry->poll_prefix,
+			"Receive from port%d/queue%d",
+			s_top_prio_flow[from_id]->src->port_id,
+			s_top_prio_flow[from_id]->src->queue_id);
+	}
+	entry->action_prefix = rte_zmalloc(NULL, 1024, 0);
+	if (entry->action_prefix) {
+		sprintf(entry->action_prefix,
+			"-> send to port%d", to_id);
+	}
+	if (pre_ld_update_dir_list_safe(entry, INSERT_ENTRY_REQ)) {
+		rte_panic("%s, line %d: Insert entry failed\n",
+			__func__, __LINE__);
+	}
+
+	return 0;
 }
 
 int
@@ -3589,11 +3717,11 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	struct rte_flow_item flow_item[PRE_LD_FLOW_MAX_ITEM];
 	struct rte_flow_action flow_action[2];
 	struct rte_flow_action_queue rxq;
-	union pre_ld_flow_item zero_mask;
+	union pre_ld_flow_item zero_item;
 	int i = 0, ret, err = 0;
 	struct pre_ld_port_rx_flow_pattern *pattern;
 
-	memset(&zero_mask, 0, sizeof(union pre_ld_flow_item));
+	memset(&zero_item, 0, sizeof(union pre_ld_flow_item));
 
 	if (msg_type == REMOVE_ENTRY_REQ) {
 		return pre_ld_flow_destroy(rx_flow->src->port_id,
@@ -3609,10 +3737,14 @@ pre_ld_port_rx_flow_update(struct pre_ld_port_rx_flow *rx_flow,
 	pattern = &rx_flow->flow_pattern;
 	while (pattern->type[i] != RTE_FLOW_ITEM_TYPE_END) {
 		flow_item[i].type = pattern->type[i];
-		if (!memcmp(&zero_mask, &pattern->masks[i],
+		if (!memcmp(&zero_item, &pattern->masks[i],
 			sizeof(union pre_ld_flow_item))) {
 			flow_item[i].spec = NULL;
 			flow_item[i].mask = NULL;
+		} else if (!memcmp(&zero_item, &pattern->items[i],
+			sizeof(union pre_ld_flow_item))) {
+			flow_item[i].spec = NULL;
+			flow_item[i].mask = &pattern->masks[i];
 		} else {
 			flow_item[i].spec = &pattern->items[i];
 			flow_item[i].mask = &pattern->masks[i];
@@ -4293,6 +4425,45 @@ usr_fd_statistics:
 }
 
 static struct pre_ld_port_rx_flow *
+pre_ld_port_top_prio_flow(uint16_t portid, uint16_t num)
+{
+	uint16_t i, top_prio_flow = 0xffff;
+	uint8_t top_prio_tc = 0xff;
+	int idx = -1;
+	const struct pre_ld_port_rx_source *src;
+
+	/** Flow with min TC ID and min flow ID is top priority.*/
+	for (i = 0; i < num; i++) {
+		if (!s_pre_ld_rx_flows[portid][i].src)
+			continue;
+		src = s_pre_ld_rx_flows[portid][i].src;
+		if (src->tc_id < top_prio_tc)
+			top_prio_tc = src->tc_id;
+	}
+
+	for (i = 0; i < num; i++) {
+		if (!s_pre_ld_rx_flows[portid][i].src)
+			continue;
+		src = s_pre_ld_rx_flows[portid][i].src;
+		if (src->tc_id != top_prio_tc)
+			continue;
+		if (idx < 0) {
+			top_prio_flow = src->flow_id;
+			idx = i;
+		}
+		if (src->flow_id < top_prio_flow) {
+			top_prio_flow = src->flow_id;
+			idx = i;
+		}
+	}
+	src = s_pre_ld_rx_flows[portid][idx].src;
+	PRE_LD_LOG(INFO, "Port%d's top priority flow: TC%d.flow%d: rxq%d\n",
+		portid, src->tc_id, src->flow_id, src->queue_id);
+
+	return &s_pre_ld_rx_flows[portid][idx];
+}
+
+static struct pre_ld_port_rx_flow *
 pre_ld_port_default_flow(uint16_t portid, uint16_t num)
 {
 	uint16_t i, def_flow = 0;
@@ -4397,6 +4568,8 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 
 	s_def_flow[portid] = pre_ld_port_default_flow(portid, total_num);
 	s_def_flow[portid]->cmp_offset_type = PRE_LD_NO_CMP;
+	s_top_prio_flow[portid] = pre_ld_port_top_prio_flow(portid, total_num);
+	s_top_prio_flow[portid]->cmp_offset_type = PRE_LD_NO_CMP;
 	sprintf(ring_nm, "port%d_flow_r", portid);
 	s_port_flow_r[portid] = rte_ring_create(ring_nm, num * 2, 0,
 		RING_F_EXACT_SZ);
@@ -4407,6 +4580,8 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 		if (!s_pre_ld_rx_flows[portid][i].src)
 			continue;
 		if (&s_pre_ld_rx_flows[portid][i] == s_def_flow[portid])
+			continue;
+		if (&s_pre_ld_rx_flows[portid][i] == s_top_prio_flow[portid])
 			continue;
 		ret = rte_ring_enqueue(s_port_flow_r[portid],
 			&s_pre_ld_rx_flows[portid][i]);
@@ -4429,6 +4604,7 @@ fail_return:
 		s_pre_ld_rx_src[portid] = NULL;
 	}
 	s_def_flow[portid] = NULL;
+	s_top_prio_flow[portid] = NULL;
 
 	return ret;
 }
@@ -4552,7 +4728,7 @@ skip_mux_dump:
 static int eal_main(void)
 {
 	int ret;
-	uint16_t nb_ports, i;
+	uint16_t nb_ports, i, ul_port;
 	uint16_t nb_ports_available = 0;
 	uint16_t portid, dpaa2_rxqs = 0;
 	uint16_t rxq_num[RTE_MAX_ETHPORTS];
@@ -4854,9 +5030,11 @@ static int eal_main(void)
 		if (s_dir_ports.pair_num > 0) {
 			s_rx_port = s_dir_ports.pair[0].dl_id;
 			s_tx_port = s_dir_ports.pair[0].dl_id;
+			ul_port = s_dir_ports.pair[0].ul_id;
 		} else {
 			s_rx_port = s_dir_ports.recyc_pair[0].dl_id;
 			s_tx_port = s_dir_ports.recyc_pair[0].ul_id;
+			ul_port = s_dir_ports.recyc_pair[0].ul_id;
 			s_dir_recyc = 1;
 		}
 		s_slow_if = s_dir_ports.kif[0].kernel_nm;
@@ -4869,6 +5047,14 @@ static int eal_main(void)
 		while (s_data_path_core < 0) {
 			/** Wait for data path thread running.*/
 			usleep(1);
+		}
+		if (s_ip_reassemble_enable) {
+			ret = pre_ld_frag_ip_flow_create(s_rx_port, ul_port);
+			if (ret) {
+				rte_exit(EXIT_FAILURE,
+					"Ingress IP fragment flow create failed(%d)\n",
+					ret);
+			}
 		}
 	} else {
 		for (i = 0; i < s_mux_num; i++) {
@@ -7437,6 +7623,10 @@ static void setup_wrappers(void)
 
 	s_in_pre_loading = 1;
 	s_eal_file_prefix = getenv("file_prefix");
+
+	env = getenv("PRE_LOAD_IP_REASSEMBLE");
+	if (env)
+		s_ip_reassemble_enable = atoi(env);
 
 	env = getenv("PRE_LOAD_WRAP_LOG");
 	if (env)
