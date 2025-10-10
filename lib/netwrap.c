@@ -1870,7 +1870,7 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 	struct pre_ld_frame_desc *desc;
 	struct rte_udp_hdr *flow_hdr = &s_fd_desc[sockfd].hdr.udp_hdr;
 
-	ret = rte_pmd_dpaa2_rx_get_offset(mbuf,
+	ret = rte_pmd_dpaa2_rx_get_offset(RTE_MAX_ETHPORTS, mbuf,
 			&l3_offset, &l4_offset, &l5_offset);
 	if (unlikely(ret))
 		return ret;
@@ -2604,14 +2604,18 @@ pre_ld_entry_rx_flow_verify(struct rte_mbuf *mbuf,
 	char cmp1[64], cmp2[64];
 
 	rx_flow = entry->poll.rx_flow;
-	if (rx_flow->cmp_offset_type == PRE_LD_CMP_L3_OFFSET)
-		ret = rte_pmd_dpaa2_rx_get_offset(mbuf, &offset, NULL, NULL);
-	else if (rx_flow->cmp_offset_type == PRE_LD_CMP_L4_OFFSET)
-		ret = rte_pmd_dpaa2_rx_get_offset(mbuf, NULL, &offset, NULL);
-	else if (rx_flow->cmp_offset_type == PRE_LD_CMP_L5_OFFSET)
-		ret = rte_pmd_dpaa2_rx_get_offset(mbuf, NULL, NULL, &offset);
-	else
+	if (rx_flow->cmp_offset_type == PRE_LD_CMP_L3_OFFSET) {
+		ret = rte_pmd_dpaa2_rx_get_offset(RTE_MAX_ETHPORTS, mbuf,
+			&offset, NULL, NULL);
+	} else if (rx_flow->cmp_offset_type == PRE_LD_CMP_L4_OFFSET) {
+		ret = rte_pmd_dpaa2_rx_get_offset(RTE_MAX_ETHPORTS, mbuf,
+			NULL, &offset, NULL);
+	} else if (rx_flow->cmp_offset_type == PRE_LD_CMP_L5_OFFSET) {
+		ret = rte_pmd_dpaa2_rx_get_offset(RTE_MAX_ETHPORTS, mbuf,
+			NULL, NULL, &offset);
+	} else {
 		return 0;
+	}
 
 	if (unlikely(ret) || offset == 0xff) {
 		PRE_LD_LOG(WARNING, "%s parse %s %s failed\n",
