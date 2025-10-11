@@ -2556,8 +2556,24 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 			s_crypt_queue_ring[sec_id]->name, ret);
 	}
 
-	rte_free(entry_to_sec);
-	rte_free(entry_from_sec);
+	if (entry_to_sec) {
+		if (entry_to_sec->frag_tbl)
+			rte_free(entry_to_sec->frag_tbl);
+		if (entry_to_sec->poll_prefix)
+			rte_free(entry_to_sec->poll_prefix);
+		if (entry_to_sec->action_prefix)
+			rte_free(entry_to_sec->action_prefix);
+		rte_free(entry_to_sec);
+	}
+	if (entry_from_sec) {
+		if (entry_from_sec->frag_tbl)
+			rte_free(entry_from_sec->frag_tbl);
+		if (entry_from_sec->poll_prefix)
+			rte_free(entry_from_sec->poll_prefix);
+		if (entry_from_sec->action_prefix)
+			rte_free(entry_from_sec->action_prefix);
+		rte_free(entry_from_sec);
+	}
 
 	PRE_LD_LOG(INFO, "Remove %s -> %s -> %s\n",
 		src_info, sec_info, dst_info);
@@ -2949,12 +2965,66 @@ pre_ld_ipsec_dequeue(struct rte_mbuf *pkts[], uint16_t max_pkts,
 }
 
 static void
+pre_ld_entry_frag_sec_start(struct pre_ld_direct_entry *entry,
+	struct rte_mbuf *mbufs[], uint16_t nb_rx)
+{
+	uint16_t nb_tx, i;
+	uint64_t len;
+	uint8_t ip_offset;
+	struct rte_mbuf *mo;
+	int ret;
+	struct rte_ipv4_hdr *ip_hdr;
+	struct rte_ip_frag_tbl *tbl = entry->frag_tbl;
+	struct rte_ip_frag_death_row *dr = &entry->dr;
+	uint8_t *pay_load;
+
+	for (i = 0; i < nb_rx; i++) {
+		if ((mbufs[i]->packet_type & RTE_PTYPE_L4_MASK) !=
+			RTE_PTYPE_L4_FRAG) {
+			mo = mbufs[i];
+			goto tx_to_sec;
+		}
+		ip_offset = 0;
+		ret = rte_pmd_dpaa2_rx_get_offset(RTE_MAX_ETHPORTS,
+			mbufs[i], &ip_offset, NULL, NULL);
+		if (ret)
+			continue;
+		pay_load = rte_pktmbuf_mtod(mbufs[i], void *);
+		ip_hdr = (void *)(pay_load + ip_offset);
+		mbufs[i]->l2_len = sizeof(struct rte_ether_hdr);
+		mbufs[i]->l3_len = sizeof(struct rte_ipv4_hdr);
+		len = mbufs[i]->pkt_len;
+		mo = rte_ipv4_frag_reassemble_packet(tbl,
+			dr, mbufs[i], rte_rdtsc(), ip_hdr);
+		if (!mo)
+			continue;
+
+tx_to_sec:
+		len = mo->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+
+		nb_tx = pre_ld_direct_to_crypto(entry, &mo, 1);
+		if (nb_tx == 1)
+			pre_ld_entry_stat_update(&entry->tx_stat, &len, 1, true);
+		else
+			rte_pktmbuf_free(mo);
+		mo = NULL;
+	}
+
+	if (dr->cnt >= RTE_IP_FRAG_DEATH_ROW_MBUF_LEN) {
+		rte_panic("%s: Mbuf count in frag death row overflows\n",
+			__func__);
+	}
+	rte_ip_frag_free_death_row(dr, 3);
+}
+
+static void
 pre_ld_entry_sec_start(struct pre_ld_direct_entry *entry,
 	int drain)
 {
 	uint16_t nb_rx, nb_tx, i, drain_times = 0;
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint64_t lens[MAX_PKT_BURST];
+	int frag_flag = 0;
 
 	RTE_ASSERT(entry->poll_type == RX_QUEUE &&
 		(entry->dest_type == SEC_EGRESS ||
@@ -2967,8 +3037,21 @@ drain_again:
 			goto drain_again;
 		return;
 	}
+	if (!nb_rx)
+		return;
 
 	pre_ld_entry_stat_update(&entry->rx_stat, lens, nb_rx, false);
+	for (i = 0; i < nb_rx; i++) {
+		if ((mbufs[i]->packet_type & RTE_PTYPE_L4_MASK) ==
+			RTE_PTYPE_L4_FRAG) {
+			frag_flag = 1;
+			break;
+		}
+	}
+	if (frag_flag) {
+		pre_ld_entry_frag_sec_start(entry, mbufs, nb_rx);
+		return;
+	}
 
 	for (i = 0; i < nb_rx; i++)
 		lens[i] = mbufs[i]->pkt_len - sizeof(struct rte_ether_hdr);
@@ -2982,6 +3065,57 @@ drain_again:
 }
 
 static void
+pre_ld_entry_frag_sec_complete(struct pre_ld_direct_entry *entry,
+	struct rte_mbuf *mbufs[], uint16_t nb_rx)
+{
+	uint16_t portid, nb_tx, i, tx_frag, count;
+	struct rte_mbuf *frag_mbufs[MAX_PKT_BURST];
+	uint64_t lens[MAX_PKT_BURST];
+	int ret;
+	uint8_t ip_offset, hdr[256];
+
+	portid = entry->dest.dest_port;
+
+	for (i = 0; i < nb_rx; i++) {
+		if ((mbufs[i]->pkt_len + RTE_ETHER_CRC_LEN) >= RTE_ETHER_MAX_LEN) {
+			ip_offset = mbufs[i]->l2_len;
+			rte_memcpy(hdr, rte_pktmbuf_mtod(mbufs[i], void *), ip_offset);
+			rte_pktmbuf_adj(mbufs[i], ip_offset);
+			ret = rte_ipv4_fragment_packet(mbufs[i],
+				frag_mbufs, MAX_PKT_BURST,
+				RTE_ETHER_MAX_LEN - RTE_ETHER_CRC_LEN - ip_offset,
+				s_pre_ld_frag_pool, s_pre_ld_frag_pool);
+			if (ret <= 0) {
+				PRE_LD_LOG(ERR, "%s: Failed(%d) to fragment frame\n",
+					__func__, ret);
+				rte_pktmbuf_free(mbufs[i]);
+				continue;
+			}
+			count = ret;
+			for (tx_frag = 0; tx_frag < count; tx_frag++) {
+				rte_pktmbuf_prepend(frag_mbufs[tx_frag], ip_offset);
+				rte_memcpy(rte_pktmbuf_mtod(frag_mbufs[tx_frag], void *),
+					hdr, ip_offset);
+				frag_mbufs[tx_frag]->l2_len = mbufs[i]->l2_len;
+				frag_mbufs[tx_frag]->l3_len = mbufs[i]->l3_len;
+				frag_mbufs[tx_frag]->ol_flags = mbufs[i]->ol_flags;
+				lens[tx_frag] = frag_mbufs[tx_frag]->pkt_len +
+					RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+			}
+			rte_pktmbuf_free(mbufs[i]);
+		} else {
+			lens[0] = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+			frag_mbufs[0] = mbufs[i];
+			count = 1;
+		}
+		nb_tx = rte_eth_tx_burst(portid, 0, frag_mbufs, count);
+		if (unlikely(nb_tx < count))
+			rte_pktmbuf_free_bulk(&frag_mbufs[nb_tx], count - nb_tx);
+		pre_ld_entry_stat_update(&entry->tx_stat, lens, nb_tx, false);
+	}
+}
+
+static void
 pre_ld_entry_sec_complete(struct pre_ld_direct_entry *entry,
 	int drain)
 {
@@ -2989,6 +3123,7 @@ pre_ld_entry_sec_complete(struct pre_ld_direct_entry *entry,
 	struct rte_mbuf *mbufs[MAX_PKT_BURST];
 	uint64_t lens[MAX_PKT_BURST];
 	uint16_t drain_times = 0;
+	int need_frag = false;
 
 	RTE_ASSERT((entry->poll_type == SEC_IN_COMPLETE ||
 		entry->poll_type == SEC_EG_COMPLETE) &&
@@ -3020,6 +3155,18 @@ drain_again:
 		lens[i] = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
 
 	portid = entry->dest.dest_port;
+	if (entry->poll_type == SEC_EG_COMPLETE) {
+		for (i = 0; i < nb_rx; i++) {
+			if ((mbufs[i]->pkt_len + RTE_ETHER_CRC_LEN) >= RTE_ETHER_MAX_LEN) {
+				need_frag = true;
+				break;
+			}
+		}
+		if (need_frag) {
+			pre_ld_entry_frag_sec_complete(entry, mbufs, nb_rx);
+			return;
+		}
+	}
 	nb_tx = rte_eth_tx_burst(portid, 0, mbufs, nb_rx);
 
 	pre_ld_entry_stat_update(&entry->tx_stat, lens, nb_tx, false);
@@ -3158,6 +3305,10 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	enum pre_ld_dir_poll_type poll_type;
 	enum pre_ld_dir_dest_type dest_type;
 	struct pre_ld_port_rx_flow_pattern *pattern;
+	uint64_t frag_cycles;
+	uint32_t bucket_num = 0x1000, bucket_entries = 16, max_entries = 0x1000;
+
+	frag_cycles = (rte_get_tsc_hz() + MS_PER_S - 1) / MS_PER_S * MS_PER_S;
 
 	if (s_data_path_core < 0) {
 		rte_exit(EXIT_FAILURE,
@@ -3289,6 +3440,13 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	dir_to_sec->dest.dest_sec.queue_id = crypt_qid;
 	dir_to_sec->dest.dest_sec.sec_id = sp->crypt_id;
 	dir_to_sec->dest.dest_sec.sp_list = sp_node;
+	dir_to_sec->frag_tbl = rte_ip_frag_table_create(bucket_num,
+			bucket_entries, max_entries, frag_cycles,
+			rte_socket_id());
+	if (!dir_to_sec->frag_tbl) {
+		rte_panic("%s, line %d: Create fragment table failed\n",
+			__func__, __LINE__);
+	}
 	dir_to_sec->entry_cb = pre_ld_entry_sec_start;
 	dir_to_sec->poll_prefix = rte_zmalloc(NULL, 1024, 0);
 	if (dir_to_sec->poll_prefix) {
@@ -4111,6 +4269,7 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 	struct pre_ld_dir_ul_dl_pair *recyc_pair;
 	struct pre_ld_dir_kif *kif;
 	struct rte_remote_query_rsp rsp;
+	char exec_cmd[1024];
 
 	for (port_num = 0; port_num < size; port_num++)
 		port_type[port_num] = NULL_TYPE;
@@ -4204,6 +4363,17 @@ pre_ld_set_port_type(enum pre_ld_port_type port_type[],
 			kif->kernel_nm = eth_nm;
 			port_type[portid1] = KERNEL_TAP_TYPE;
 			s_dir_ports.kif_num++;
+			if (s_ip_reassemble_enable) {
+				memset(exec_cmd, 0, sizeof(exec_cmd));
+				sprintf(exec_cmd, "ip link set %s mtu %d",
+					eth_nm, s_mtu_set);
+				ret = system(exec_cmd);
+				if (ret) {
+					PRE_LD_LOG(WARNING,
+						"Line %d: %s: %s execute error(%d)\n",
+						__LINE__, __func__, exec_cmd, ret);
+				}
+			}
 		}
 	}
 
