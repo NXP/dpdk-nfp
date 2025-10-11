@@ -365,6 +365,7 @@ static struct rte_ring *s_dir_msg_req_r[RTE_MAX_LCORE];
 static struct rte_ring *s_dir_msg_rsp_r[RTE_MAX_LCORE];
 
 static struct rte_mempool *s_pre_ld_rx_pool;
+static struct rte_mempool *s_pre_ld_frag_pool;
 
 static double s_pre_ld_cycs_per_us;
 
@@ -2294,16 +2295,13 @@ finsh_recv:
 }
 
 static int
-eal_send_fill_mbufs(int fd, const uint8_t *buf, uint16_t lens[],
-	struct rte_mbuf *mbufs[], uint16_t count,
-	const struct sockaddr *to)
+eal_send_fill_mbuf(int fd, const uint8_t *buf, uint16_t len,
+	struct rte_mbuf *m, const struct sockaddr *to)
 {
 	void *udp_data;
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ip_hdr;
 	struct rte_udp_hdr *udp_hdr;
-	uint16_t i;
-	struct rte_mbuf *m;
 	uint8_t hwaddr[RTE_ETHER_ADDR_LEN];
 	int ret;
 	const struct sockaddr_in *ia4 = (const void *)to;
@@ -2315,56 +2313,89 @@ eal_send_fill_mbufs(int fd, const uint8_t *buf, uint16_t lens[],
 			return ret;
 	}
 
-	for (i = 0; i < count; i++) {
-		m = mbufs[i];
-		m->data_off = PRE_LD_MBUF_OFFSET;
+	m->data_off = PRE_LD_MBUF_OFFSET;
 
-		/* Initialize the Ethernet header */
-		eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+	/* Initialize the Ethernet header */
+	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
-		rte_memcpy(eth_hdr, &s_fd_desc[fd].hdr,
+	rte_memcpy(eth_hdr, &s_fd_desc[fd].hdr,
 			sizeof(struct eth_ipv4_udp_hdr));
-		if (ia4) {
-			rte_memcpy(&eth_hdr->dst_addr, hwaddr,
-				RTE_ETHER_ADDR_LEN);
-		}
-		/* Set IP header length then calculate checksum.*/
-		ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
-		if (ia4)
-			ip_hdr->dst_addr = ia4->sin_addr.s_addr;
-		ip_hdr->total_length = rte_cpu_to_be_16(lens[i] + IPv4_HDR_LEN);
-		ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+	if (ia4)
+		rte_memcpy(&eth_hdr->dst_addr, hwaddr, RTE_ETHER_ADDR_LEN);
 
-		/* Set UDP header length only*/
-		udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
-		if (ia4)
-			udp_hdr->dst_port = ia4->sin_port;
-		udp_hdr->dgram_len = rte_cpu_to_be_16(lens[i] + UDP_HDR_LEN);
+	/* Set IP header length then calculate checksum.*/
+	ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+	if (ia4)
+		ip_hdr->dst_addr = ia4->sin_addr.s_addr;
+	ip_hdr->total_length = rte_cpu_to_be_16(len + IPv4_HDR_LEN);
+	ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
-		udp_data = (void *)(udp_hdr + 1);
-		rte_memcpy(udp_data, buf, lens[i]);
-		m->nb_segs = 1;
-		m->next = NULL;
-		m->data_len = lens[i] + RTE_ETHER_HDR_LEN + IPv4_HDR_LEN;
-		if (m->data_len < (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN))
-			m->data_len = (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN);
-		m->pkt_len = m->data_len;
-		m->packet_type = RTE_PTYPE_L2_ETHER |
-			RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
-		buf += lens[i];
-	}
+	/* Set UDP header length only*/
+	udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+	if (ia4)
+		udp_hdr->dst_port = ia4->sin_port;
+	udp_hdr->dgram_len = rte_cpu_to_be_16(len + UDP_HDR_LEN);
+
+	udp_data = (void *)(udp_hdr + 1);
+	rte_memcpy(udp_data, buf, len);
+	m->nb_segs = 1;
+	m->next = NULL;
+	m->data_len = len + RTE_ETHER_HDR_LEN + IPv4_HDR_LEN;
+	if (m->data_len < (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN))
+		m->data_len = (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN);
+	m->pkt_len = m->data_len;
+	m->packet_type = RTE_PTYPE_L2_ETHER | RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
 
 	return 0;
+}
+
+static rte_atomic16_t s_packet_id;
+static int
+usr_socket_ipv4_tx_frag(struct rte_mbuf *mbuf,
+	struct rte_mbuf *frag_mbufs[], uint16_t max_payload)
+{
+	int count, i;
+	struct rte_ether_hdr eth_hdr;
+	struct rte_ipv4_hdr *ip_hdr;
+	uint16_t packet_id;
+
+	rte_memcpy(&eth_hdr, rte_pktmbuf_mtod(mbuf, void *),
+		sizeof(struct rte_ether_hdr));
+	rte_pktmbuf_adj(mbuf, sizeof(struct rte_ether_hdr));
+frag_again:
+	count = rte_ipv4_fragment_packet(mbuf,
+		frag_mbufs, MAX_PKT_BURST, max_payload,
+		s_pre_ld_frag_pool, s_pre_ld_frag_pool);
+	if (count <= 0) {
+		if (count == (-ENOMEM))
+			goto frag_again;
+		return -ENOMEM;
+	}
+
+	packet_id = rte_atomic16_read(&s_packet_id);
+	for (i = 0; i < count; i++) {
+		ip_hdr = rte_pktmbuf_mtod(frag_mbufs[i], void *);
+		ip_hdr->packet_id = rte_cpu_to_be_16(packet_id);
+		ip_hdr->hdr_checksum = 0;
+		rte_pktmbuf_prepend(frag_mbufs[i], sizeof(struct rte_ether_hdr));
+		rte_memcpy(rte_pktmbuf_mtod(frag_mbufs[i], void *),
+			&eth_hdr, sizeof(struct rte_ether_hdr));
+		frag_mbufs[i]->ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM);
+		frag_mbufs[i]->l2_len = sizeof(struct rte_ether_hdr);
+	}
+	rte_atomic16_add(&s_packet_id, 1);
+
+	return count;
 }
 
 static int
 eal_send(int sockfd, const void *buf, size_t len, int flags,
 	const struct sockaddr *to)
 {
-	struct rte_mbuf *mbufs[MAX_PKT_BURST];
+	struct rte_mbuf *frag_mbufs[MAX_PKT_BURST], *mbuf;
 	uint16_t lens[MAX_PKT_BURST];
-	int sent = 0, i, ret;
-	uint16_t mtu, max_len, hdr_len, count = 0;
+	int sent = 0, i, ret, frag = 0;
+	uint16_t hdr_len, count = 0;
 	struct pre_ld_direct_entry *tx_entry;
 	struct fd_hw_desc *hw_desc;
 	struct fd_desc *desc;
@@ -2388,62 +2419,65 @@ eal_send(int sockfd, const void *buf, size_t len, int flags,
 	if (unlikely(!desc->tx_enable))
 		goto quit_send;
 
-	ret = 0;
-	mtu = desc->tx_port_mtu;
-	max_len = mtu + RTE_ETHER_HDR_LEN;
 	hdr_len = RTE_ETHER_HDR_LEN + IPv4_HDR_LEN;
 	if (pre_ld_sp_out_ready())
 		hdr_len += IPv4_ESP_HDR_LEN + ESP_TAIL_MAX_LEN;
-	if (to && (len + hdr_len) > max_len) {
+
+	if ((len + hdr_len) >= PRE_LD_MBUF_MAX_DATAROOM) {
+		ret = -EINVAL;
 		goto quit_send;
-	} else if (to) {
-		lens[count] = len;
-		len = 0;
-		count++;
-		goto start_send;
-	}
-	while ((len + hdr_len) > max_len) {
-		if (unlikely(count >= MAX_PKT_BURST))
-			break;
-
-		lens[count] = (max_len - hdr_len);
-		len -= lens[count];
-		count++;
-	}
-	if (len > 0 && count < MAX_PKT_BURST) {
-		lens[count] = len;
-		count++;
 	}
 
-start_send:
-	ret = usr_data_path_malloc_mbuf(desc, mbufs, count);
+	if ((len + hdr_len + RTE_ETHER_CRC_LEN) >= RTE_ETHER_MAX_LEN)
+		frag = 1;
+
+	ret = usr_data_path_malloc_mbuf(desc, &mbuf, 1);
 	if (unlikely(ret)) {
 		ret = 0;
 		count = 0;
 		goto quit_send;
 	}
 
-	ret = eal_send_fill_mbufs(sockfd, buf, lens, mbufs, count, to);
+	ret = eal_send_fill_mbuf(sockfd, buf, len, mbuf, to);
 	if (unlikely(ret)) {
 		ret = 0;
 		count = 0;
-		rte_pktmbuf_free_bulk(mbufs, count);
+		rte_pktmbuf_free(mbuf);
 		goto quit_send;
+	}
+
+	if (frag) {
+		ret = usr_socket_ipv4_tx_frag(mbuf, frag_mbufs,
+			RTE_ETHER_MAX_LEN - RTE_ETHER_CRC_LEN - hdr_len);
+		usr_data_path_free_mbuf(desc, &mbuf, 1);
+		if (ret > 0) {
+			count = ret;
+			for (i = 0; i < count; i++) {
+				lens[i] = frag_mbufs[i]->pkt_len;
+				lens[i] -= (RTE_ETHER_HDR_LEN + IPv4_HDR_LEN);
+			}
+		} else {
+			return ret;
+		}
+	} else {
+		frag_mbufs[0] = mbuf;
+		lens[0] = len;
+		count = 1;
 	}
 
 	if (desc->access_type == FD_THREAD_ACCESS) {
 		tx_entry = desc->dp_desc.entry_desc.tx_entry;
 		if (tx_entry->poll_type == TX_RING) {
 			sent = rte_ring_enqueue_bulk(tx_entry->poll.tx_ring,
-				(void * const *)mbufs, count, NULL);
+				(void * const *)frag_mbufs, count, NULL);
 		} else {
 			sent = pre_ld_ring_eq(tx_entry->poll.pre_ld_tx_ring,
-				(void **)mbufs, count);
+				(void **)frag_mbufs, count);
 		}
 	} else {
 		hw_desc = &desc->dp_desc.hw_desc;
 		sent = rte_eth_tx_burst(hw_desc->tx_port,
-			0, mbufs, count);
+			0, frag_mbufs, count);
 	}
 	ret = 0;
 	for (i = 0; i < sent; i++) {
@@ -2457,7 +2491,7 @@ start_send:
 
 quit_send:
 	if (sent < count)
-		rte_pktmbuf_free_bulk(&mbufs[sent], count - sent);
+		usr_data_path_free_mbuf(desc, &frag_mbufs[sent], count - sent);
 
 	rte_spinlock_unlock(&desc->tx_lock);
 
@@ -4796,6 +4830,12 @@ static int eal_main(void)
 		PRE_LD_MBUF_MAX_SIZE, rte_socket_id());
 	if (!s_pre_ld_rx_pool)
 		rte_exit(EXIT_FAILURE, "Cannot init rx pool\n");
+	s_pre_ld_frag_pool = rte_pktmbuf_pool_create("frag_pool",
+		MEMPOOL_ELEM_SIZE, s_mempool_cache_size,
+		PRE_LD_MP_PRIV_SIZE,
+		PRE_LD_MBUF_MAX_SIZE, rte_socket_id());
+	if (!s_pre_ld_frag_pool)
+		rte_exit(EXIT_FAILURE, "Cannot init frag pool\n");
 
 	port_conf = rte_zmalloc(NULL,
 		sizeof(struct rte_eth_conf) * RTE_MAX_ETHPORTS, 0);
