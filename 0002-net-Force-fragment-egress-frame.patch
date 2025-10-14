@@ -1,0 +1,84 @@
+From 1986270eff6699b770fcc61f6c8a461b933f8e29 Mon Sep 17 00:00:00 2001
+From: Jun Yang <jun.yang@nxp.com>
+Date: Tue, 14 Oct 2025 10:28:14 +0800
+Subject: [PATCH 2/2] net: Force fragment egress frame
+
+Force fragment egress frame even with MTU size > 1500 bytes.
+echo 1 > /proc/sys/net/core/force_egress_frag
+
+Signed-off-by: Jun Yang <jun.yang@nxp.com>
+---
+ include/net/ip.h           | 18 ++++++++++++++++--
+ net/core/sysctl_net_core.c |  9 +++++++++
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/include/net/ip.h b/include/net/ip.h
+index 8462ced0c21e..4450cc55e432 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -467,19 +467,33 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
+ 	return mtu - lwtunnel_headroom(dst->lwtstate, mtu);
+ }
+ 
++extern unsigned int force_egress_frag;
++
+ static inline unsigned int ip_skb_dst_mtu(struct sock *sk,
+ 					  const struct sk_buff *skb)
+ {
++	/** Always frag in TX direction.*/
++	#define MTU_SIZE_1500 1500
+ 	unsigned int mtu;
+ 
+ 	if (!sk || !sk_fullsock(sk) || ip_sk_use_pmtu(sk)) {
+ 		bool forwarding = IPCB(skb)->flags & IPSKB_FORWARDED;
+ 
+-		return ip_dst_mtu_maybe_forward(skb_dst(skb), forwarding);
++		mtu = ip_dst_mtu_maybe_forward(skb_dst(skb), forwarding);
++
++		if (!force_egress_frag)
++			return mtu;
++		goto quit;
+ 	}
+ 
+ 	mtu = min(READ_ONCE(skb_dst(skb)->dev->mtu), IP_MAX_MTU);
+-	return mtu - lwtunnel_headroom(skb_dst(skb)->lwtstate, mtu);
++	mtu = mtu - lwtunnel_headroom(skb_dst(skb)->lwtstate, mtu);
++	if (!force_egress_frag)
++		return mtu;
++quit:
++	if (mtu > MTU_SIZE_1500)
++		return MTU_SIZE_1500;
++	return mtu;
+ }
+ 
+ struct dst_metrics *ip_fib_metrics_init(struct net *net, struct nlattr *fc_mx,
+diff --git a/net/core/sysctl_net_core.c b/net/core/sysctl_net_core.c
+index ed20cbdd1931..5f52ae8ec07c 100644
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -312,6 +312,8 @@ proc_dolongvec_minmax_bpf_restricted(struct ctl_table *table, int write,
+ }
+ #endif
+ 
++unsigned int force_egress_frag;
++
+ static struct ctl_table net_core_table[] = {
+ 	{
+ 		.procname	= "wmem_max",
+@@ -583,6 +585,13 @@ static struct ctl_table net_core_table[] = {
+ 		.extra1		= SYSCTL_ONE,
+ 		.extra2		= &int_3600,
+ 	},
++	{
++		.procname	= "force_egress_frag",
++		.data           = &force_egress_frag,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
+ 	{ }
+ };
+ 
+-- 
+2.34.1
+
