@@ -1350,7 +1350,7 @@ xfm_insert_new_policy(struct pre_ld_ipsec_sp_entry *sp)
 	sp->head = head;
 }
 
-static struct rte_flow *
+struct rte_flow *
 xfm_find_policy_flow_by_rule(uint32_t spi,
 	xfrm_address_t *src, xfrm_address_t *dst, int af)
 {

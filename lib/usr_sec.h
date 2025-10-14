@@ -142,6 +142,10 @@ xfm_find_sa_addrs_by_sp_addrs(const xfrm_address_t *src,
 	const xfrm_address_t *dst, uint16_t family, int dir,
 	xfrm_address_t *sa_src, xfrm_address_t *sa_dst);
 
+struct rte_flow *
+xfm_find_policy_flow_by_rule(uint32_t spi,
+	xfrm_address_t *src, xfrm_address_t *dst, int af);
+
 int
 do_spdget(int spid, xfrm_address_t *saddr,
 	xfrm_address_t *daddr, int *sa_af);

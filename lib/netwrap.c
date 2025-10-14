@@ -82,6 +82,8 @@ static char *s_usr_app_nm;
 #define PRE_LD_DRAIN_RETRY_TIMES 10000
 
 static int s_ip_reassemble_enable = 1;
+static int s_egress_reassemble_en;
+
 static int s_socket_pre_set;
 static int s_in_pre_loading;
 
@@ -468,6 +470,8 @@ static int s_ipsec_buf_swap;
 
 #define MAX_HUGE_FRAME_SIZE 9600
 static uint16_t s_mtu_set = MAX_HUGE_FRAME_SIZE;
+static uint16_t s_kernel_egress_frag = 1;
+
 static int s_dump_traffic_flow;
 static int s_select_dbg;
 
@@ -535,6 +539,7 @@ static const rte_be32_t s_pre_ld_invalid_ip = 0x000000ff;
 static int s_mux_per_fd_per_port;
 
 static int s_flow_update_delay_us = 1000;
+static int s_egress_frag_flow;
 
 static void
 _pre_ld_time_log(uint32_t level, uint32_t logtype)
@@ -3181,13 +3186,19 @@ pre_ld_entry_reassemble_process(struct pre_ld_direct_entry *entry,
 {
 	uint16_t nb_rx, nb_tx, drain_times = 0, i, mo_count = 0;
 	struct rte_mbuf *mbufs[MAX_PKT_BURST], *mo[MAX_PKT_BURST];
-	uint64_t lens[MAX_PKT_BURST];
+	uint64_t lens[MAX_PKT_BURST], tx_len;
 	struct rte_ipv4_hdr *ip_hdr;
 	struct rte_ip_frag_tbl *tbl = entry->frag_tbl;
 	struct rte_ip_frag_death_row *dr = &entry->dr;
 	uint8_t ip_offset = 0;
 	int ret;
 	uint8_t *pay_load;
+	xfrm_address_t src, dst;
+	void *flow;
+
+	RTE_ASSERT(entry->poll_type == RX_QUEUE &&
+		(entry->dest_type == RX_RING ||
+		entry->dest_type == PRE_LD_RX_RING));
 
 drain_again:
 	nb_rx = pre_ld_entry_port_recv(entry, mbufs, lens);
@@ -3205,10 +3216,30 @@ drain_again:
 		ip_offset = 0;
 		ret = rte_pmd_dpaa2_rx_get_offset(RTE_MAX_ETHPORTS,
 			mbufs[i], &ip_offset, NULL, NULL);
-		if (ret)
+		if (ret || !ip_offset)
 			continue;
 		pay_load = rte_pktmbuf_mtod(mbufs[i], void *);
 		ip_hdr = (void *)(pay_load + ip_offset);
+		if (entry->poll.rx_flow->src->port_id ==
+			s_dir_ports.pair[0].ul_id ||
+			entry->poll.rx_flow->src->port_id ==
+			s_dir_ports.recyc_pair[0].ul_id) {
+			memset(&src, 0, sizeof(xfrm_address_t));
+			memset(&dst, 0, sizeof(xfrm_address_t));
+			rte_memcpy(&src, &ip_hdr->src_addr, sizeof(rte_be32_t));
+			rte_memcpy(&dst, &ip_hdr->dst_addr, sizeof(rte_be32_t));
+			flow = xfm_find_policy_flow_by_rule(INVALID_ESP_SPI,
+				&src, &dst, AF_INET);
+			if (!flow) {
+				tx_len = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+				nb_tx = rte_eth_tx_burst(s_dir_ports.ext_id[0], 0, &mbufs[i], 1);
+				if (unlikely(nb_tx < 1))
+					rte_pktmbuf_free(mbufs[i]);
+
+				pre_ld_entry_stat_update(&entry->tx_stat, &tx_len, nb_tx, false);
+				continue;
+			}
+		}
 		mbufs[i]->l2_len = sizeof(struct rte_ether_hdr);
 		mbufs[i]->l3_len = sizeof(struct rte_ipv4_hdr);
 		mo[mo_count] = rte_ipv4_frag_reassemble_packet(tbl,
@@ -3236,7 +3267,9 @@ drain_again:
 }
 
 static int
-pre_ld_frag_ip_flow_create(uint16_t from_id, uint16_t to_id)
+pre_ld_frag_ip_flow_create(uint16_t from_id, uint16_t to_id,
+	void (*entry_cb)(struct pre_ld_direct_entry *entry, int drain),
+	struct pre_ld_port_rx_flow *rx_flow)
 {
 	struct pre_ld_direct_entry *entry;
 	struct pre_ld_port_rx_flow_pattern *flow_pattern;
@@ -3259,10 +3292,10 @@ pre_ld_frag_ip_flow_create(uint16_t from_id, uint16_t to_id)
 	flow_pattern->masks[0].ipv4_spec.hdr.fragment_offset = 1;
 
 	entry->poll_type = RX_QUEUE;
-	entry->poll.rx_flow = s_top_prio_flow[from_id];
+	entry->poll.rx_flow = rx_flow;
 	entry->dest_type = HW_PORT;
 	entry->dest.dest_port = to_id;
-	entry->entry_cb = pre_ld_entry_reassemble_process;
+	entry->entry_cb = entry_cb;
 	entry->frag_tbl = rte_ip_frag_table_create(bucket_num,
 			bucket_entries, max_entries, frag_cycles,
 			rte_socket_id());
@@ -3511,6 +3544,22 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 	}
 	sp->flow = dir_to_sec->poll.rx_flow->flow;
 	to_sec_inserted = 1;
+
+	if (s_ip_reassemble_enable && sp->dir == XFRM_POLICY_OUT &&
+		!s_egress_reassemble_en && s_kernel_egress_frag &&
+		s_egress_frag_flow) {
+		if (s_dir_recyc)
+			tx_port = s_dir_ports.recyc_pair[0].dl_id;
+		else
+			tx_port = s_dir_ports.pair[0].dl_id;
+		ret = pre_ld_frag_ip_flow_create(rx_port, tx_port,
+				pre_ld_entry_reassemble_process, s_top_prio_flow[rx_port]);
+		if (ret) {
+			rte_exit(EXIT_FAILURE,
+				"Egress IP fragment flow create failed(%d)\n", ret);
+		}
+		s_egress_reassemble_en = true;
+	}
 
 	return 0;
 
@@ -5259,7 +5308,8 @@ static int eal_main(void)
 			usleep(1);
 		}
 		if (s_ip_reassemble_enable) {
-			ret = pre_ld_frag_ip_flow_create(s_rx_port, ul_port);
+			ret = pre_ld_frag_ip_flow_create(s_rx_port, ul_port,
+				pre_ld_entry_reassemble_process, s_top_prio_flow[s_rx_port]);
 			if (ret) {
 				rte_exit(EXIT_FAILURE,
 					"Ingress IP fragment flow create failed(%d)\n",
@@ -7870,6 +7920,18 @@ static void setup_wrappers(void)
 		}
 	}
 
+	env = getenv("PRE_LOAD_FORCE_KERNEL_EGRESS_FRAGMENT");
+	if (env)
+		s_kernel_egress_frag = atoi(env);
+	if (s_kernel_egress_frag) {
+		ret = system("echo 1 > /proc/sys/net/core/force_egress_frag");
+		if (ret) {
+			PRE_LD_LOG(WARNING,
+				"Force egress fragment patch was not applied on kernel?\n");
+			s_kernel_egress_frag = 0;
+		}
+	}
+
 	env = getenv("PRE_LOAD_DUMP_TRAFFIC_FLOW");
 	if (env)
 		s_dump_traffic_flow = atoi(env);
@@ -7937,6 +7999,10 @@ static void setup_wrappers(void)
 	env = getenv("PRE_LOAD_FLOW_UPDATE_DELAY_US");
 	if (env)
 		s_flow_update_delay_us = atoi(env);
+
+	env = getenv("PRE_LOAD_EGRESS_FRAG_FLOW");
+	if (env)
+		s_egress_frag_flow = atoi(env);
 
 	if (!is_cpu_detected(s_cpu_start) ||
 		!is_cpu_detected(s_cpu_start + 1)) {
