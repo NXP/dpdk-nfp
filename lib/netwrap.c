@@ -1753,7 +1753,7 @@ static void eal_quit(void)
 				}
 			}
 			if (entry->frag_tbl)
-				rte_free(entry->frag_tbl);
+				rte_ip_frag_table_destroy(entry->frag_tbl);
 			if (entry->poll_prefix)
 				rte_free(entry->poll_prefix);
 			if (entry->action_prefix)
@@ -2563,7 +2563,7 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 
 	if (entry_to_sec) {
 		if (entry_to_sec->frag_tbl)
-			rte_free(entry_to_sec->frag_tbl);
+			rte_ip_frag_table_destroy(entry_to_sec->frag_tbl);
 		if (entry_to_sec->poll_prefix)
 			rte_free(entry_to_sec->poll_prefix);
 		if (entry_to_sec->action_prefix)
@@ -2572,7 +2572,7 @@ pre_ld_deconfigure_sec_path(struct pre_ld_ipsec_sp_entry *sp)
 	}
 	if (entry_from_sec) {
 		if (entry_from_sec->frag_tbl)
-			rte_free(entry_from_sec->frag_tbl);
+			rte_ip_frag_table_destroy(entry_from_sec->frag_tbl);
 		if (entry_from_sec->poll_prefix)
 			rte_free(entry_from_sec->poll_prefix);
 		if (entry_from_sec->action_prefix)
