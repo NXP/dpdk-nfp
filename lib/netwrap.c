@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright 2024-2025 NXP
+ * Copyright 2024-2026 NXP
  */
 
 #ifndef _GNU_SOURCE
@@ -31,6 +31,8 @@
 #include <sys/ioctl.h>
 #include <dirent.h>
 #include <ifaddrs.h>
+#include <pthread.h>
+#include <sched.h>
 
 #include <rte_common.h>
 #include <rte_log.h>
@@ -138,7 +140,7 @@ struct eth_ipv4_udp_hdr {
 	struct rte_ether_hdr eth_hdr;
 	struct rte_ipv4_hdr ip_hdr;
 	struct rte_udp_hdr udp_hdr;
-} __rte_packed;
+} __attribute__((__packed__));
 
 struct pre_ld_rx_pool {
 	struct rte_mbuf **rx_bufs;
@@ -505,7 +507,7 @@ struct pre_ld_frame_desc {
 		uint8_t  src_ipv6[16];
 		rte_be32_t src_ipv4;
 	};
-} __rte_packed;
+} __attribute__((__packed__));
 
 #define PRE_LD_MP_PRIV_SIZE \
 	sizeof(struct pre_ld_ipsec_priv)
@@ -1918,7 +1920,7 @@ pre_ld_adjust_rx_l4_info(int sockfd, struct rte_mbuf *mbuf)
 		ipv6_hdr = rte_pktmbuf_mtod_offset(mbuf, void *,
 			l3_offset);
 		desc->family = AF_INET6;
-		rte_memcpy(desc->src_ipv6, ipv6_hdr->dst_addr, 16);
+		rte_memcpy(desc->src_ipv6, ipv6_hdr->dst_addr.a, 16);
 	} else {
 		return -EINVAL;
 	}
@@ -3403,16 +3405,16 @@ pre_ld_configure_sec_path(struct pre_ld_ipsec_sp_entry *sp,
 		(sp->dir == XFRM_POLICY_OUT ||
 		s_ipsec_ib_flow_ip_addr_extract)) {
 		pattern->type[idx] = RTE_FLOW_ITEM_TYPE_IPV6;
-		rte_memcpy(&pattern->items[idx].ipv6_spec.hdr.src_addr,
+		rte_memcpy(&pattern->items[idx].ipv6_spec.hdr.src_addr.a,
 			&sp->src, 16);
-		rte_memcpy(&pattern->items[idx].ipv6_spec.hdr.dst_addr,
+		rte_memcpy(&pattern->items[idx].ipv6_spec.hdr.dst_addr.a,
 			&sp->dst, 16);
-		memset(&pattern->masks[idx].ipv6_spec.hdr.src_addr,
+		memset(&pattern->masks[idx].ipv6_spec.hdr.src_addr.a,
 			0xff, 16);
-		memset(&pattern->masks[idx].ipv6_spec.hdr.dst_addr,
+		memset(&pattern->masks[idx].ipv6_spec.hdr.dst_addr.a,
 			0xff, 16);
 
-		cmp_data = pattern->items[idx].ipv6_spec.hdr.src_addr;
+		cmp_data = pattern->items[idx].ipv6_spec.hdr.src_addr.a;
 		offset = offsetof(struct rte_ipv6_hdr, src_addr);
 		size = 16 * 2;
 		idx++;
@@ -4757,14 +4759,14 @@ pre_ld_port_default_flow(uint16_t portid, uint16_t num)
 
 static int
 pre_ld_port_rx_flow_init(uint16_t portid,
-	const struct rte_eth_dev_info *dev_info, uint16_t num)
+	const struct rte_eth_dev_info *dev_info __rte_unused, uint16_t num)
 {
-	uint16_t i, flow_id, fs_entries, total_num = 0, dist_size;
-	uint8_t tc_index;
+	uint16_t i, total_num = 0, dist_size;
 	int ret;
 	char ring_nm[RTE_MEMZONE_NAMESIZE];
 	struct pre_ld_port_rx_source *src;
-	struct rte_eth_rxq_info qinfo;
+	struct rte_pmd_dpaa2_rxq_info qinfo;
+	struct rte_pmd_dpaa2_dev_info dpaa2_dev_info;
 	struct pre_ld_port_rx_flow *rx_flow;
 
 	if (portid >= RTE_MAX_ETHPORTS)
@@ -4786,11 +4788,14 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 			goto fail_return;
 		}
 	}
-	fs_entries = 0;
-	dist_size = 0;
-	rte_pmd_dpaa2_dev_parse_tc_info(dev_info, NULL, NULL,
-		&fs_entries, &dist_size);
-	dist_size = RTE_MIN(fs_entries, dist_size);
+	memset(&dpaa2_dev_info, 0, sizeof(struct rte_pmd_dpaa2_dev_info));
+	ret = rte_pmd_dpaa2_dev_info_get(portid, &dpaa2_dev_info);
+	if (ret) {
+		rte_exit(EXIT_FAILURE,
+			"Error during getting device info: %s\n",
+			strerror(-ret));
+	}
+	dist_size = RTE_MIN(dpaa2_dev_info.fs_entries, dpaa2_dev_info.dist_queues);
 	if (!dist_size) {
 		PRE_LD_LOG(ERR, "No distribution size of port%d\n",
 			portid);
@@ -4798,23 +4803,22 @@ pre_ld_port_rx_flow_init(uint16_t portid,
 	}
 
 	for (i = 0; i < num; i++) {
-		ret = rte_eth_rx_queue_info_get(portid, i, &qinfo);
+		ret = rte_pmd_dpaa2_rx_queue_info_get(portid, i, &qinfo);
 		if (ret) {
 			PRE_LD_LOG(ERR,
 				"Get info of port%d-rxq%d failed(%d)\n",
 				portid, i, ret);
 			return ret;
 		}
-		rte_pmd_dpaa2_rxq_parse_tc_info(&qinfo, &tc_index, &flow_id);
-		if (flow_id >= dist_size)
+		if (qinfo.flow_id >= dist_size)
 			continue;
 		src = &s_pre_ld_rx_src[portid][i];
 		rx_flow = &s_pre_ld_rx_flows[portid][total_num];
 		rte_spinlock_init(&rx_flow->flow_lock);
 		rx_flow->src = src;
 		src->port_id = portid;
-		src->tc_id = tc_index;
-		src->flow_id = flow_id;
+		src->tc_id = qinfo.tc_id;
+		src->flow_id = qinfo.flow_id;
 		src->queue_id = i;
 		total_num++;
 	}
