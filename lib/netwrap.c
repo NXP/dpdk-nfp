@@ -1083,12 +1083,13 @@ netwrap_get_current_process_name(char *nm)
 	f = fopen(file_nm, "r");
 	if (f) {
 		size = fread(ps_nm, sizeof(char), 1024, f);
+		fclose(f);
 		if (size > 0) {
 			PRE_LD_LOG(DEBUG,
 				"This process: PID = %d, name: %s\n",
 				pid, ps_nm);
 			strcpy(nm, ps_nm);
-
+			
 			return 0;
 		}
 	}
@@ -1814,14 +1815,17 @@ eal_data_path_thread_register(struct fd_desc *desc)
 
 	thread = pthread_self();
 	cpu = sched_getcpu();
+	pthread_mutex_lock(&s_fd_mutex);
 	for (i = 0; i < desc->eal_thread_nb; i++) {
 		th_desc = &desc->th_desc[i];
 		if (likely((th_desc->cpu == cpu &&
 			thread == th_desc->thread) ||
-			thread == s_main_td))
+			thread == s_main_td)) {
+			pthread_mutex_unlock(&s_fd_mutex);
 			return 0;
+		}
 	}
-
+	pthread_mutex_unlock(&s_fd_mutex);
 register_again:
 	ret = rte_thread_register();
 	if (ret) {
@@ -3188,7 +3192,7 @@ pre_ld_entry_reassemble_process(struct pre_ld_direct_entry *entry,
 {
 	uint16_t nb_rx, nb_tx, drain_times = 0, i, mo_count = 0;
 	struct rte_mbuf *mbufs[MAX_PKT_BURST], *mo[MAX_PKT_BURST];
-	uint64_t lens[MAX_PKT_BURST], tx_len;
+	uint64_t lens[MAX_PKT_BURST];
 	struct rte_ipv4_hdr *ip_hdr;
 	struct rte_ip_frag_tbl *tbl = entry->frag_tbl;
 	struct rte_ip_frag_death_row *dr = &entry->dr;
@@ -3233,12 +3237,12 @@ drain_again:
 			flow = xfm_find_policy_flow_by_rule(INVALID_ESP_SPI,
 				&src, &dst, AF_INET);
 			if (!flow) {
-				tx_len = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+				//tx_len = mbufs[i]->pkt_len + RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
 				nb_tx = rte_eth_tx_burst(s_dir_ports.ext_id[0], 0, &mbufs[i], 1);
 				if (unlikely(nb_tx < 1))
 					rte_pktmbuf_free(mbufs[i]);
 
-				pre_ld_entry_stat_update(&entry->tx_stat, &tx_len, nb_tx, false);
+				pre_ld_entry_stat_update(&entry->tx_stat, NULL, nb_tx, false);
 				continue;
 			}
 		}
@@ -4089,6 +4093,7 @@ pre_ld_main_loop(void *dummy)
 	pre_ld_configure_direct_traffic(s_dir_ports.ext_id[0],
 		ul_id, dl_id, s_dir_ports.kif[0].tap_id,
 		s_dir_recyc);
+	s_data_path_core = lcore_id;
 
 	pthread_mutex_unlock(&s_dp_init_mutex);
 
@@ -4105,8 +4110,6 @@ pre_ld_main_loop(void *dummy)
 	s_dir_msg_req_r[lcore_id] = rte_ring_create(nm, 128, 0, 0);
 	sprintf(nm, "dir_core%d_flow_rsp", lcore_id);
 	s_dir_msg_rsp_r[lcore_id] = rte_ring_create(nm, 128, 0, 0);
-
-	s_data_path_core = lcore_id;
 
 for_ever_loop:
 	if (s_pre_ld_quit)
@@ -4221,10 +4224,13 @@ pre_ld_ls_listni_dump(void)
 		return 0;
 
 	env = getenv("LISTNI_RESULT");
-	if (env)
-		sprintf(rst, "/tmp/%s", env);
-	else
-		sprintf(rst, "/tmp/listni_rst");
+	if (env) {
+		int n = snprintf(rst, sizeof(rst), "/tmp/%s", env);
+		if (n < 0 || (size_t)n >= sizeof(rst))
+		        return -EINVAL;   /* or other appropriate error */
+	} else {
+		snprintf(rst, sizeof(rst), "/tmp/listni_rst");
+	}
 	sprintf(cmd, "ls-listni > %s", rst);
 	ret = system(cmd);
 	if (ret)
@@ -5562,7 +5568,7 @@ eal_create_flow(int sockfd,
 				goto create_flow_failed;
 			}
 		} else {
-			sprintf(nm, "pre_ld_rx_dst_ring_%p", rx_entry);
+			snprintf(nm, sizeof(nm), "pre_ld_rx_dst_ring_%p", rx_entry);
 			rx_entry->dest_type = PRE_LD_RX_RING;
 			rx_entry->dest.pre_ld_rx_ring = pre_ld_ring_create(nm,
 				MEMPOOL_USR_SIZE);
